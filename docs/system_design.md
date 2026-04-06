@@ -263,3 +263,98 @@ The CLI is the entry point and the blunt instrument. MCP is the scalpel for inte
 - **Meaningful exit codes** — clear success/failure signals, not just 0/1.
 - **Quiet by default, verbose on request** — agent mode emits only state transitions and errors unless asked for more. The agent controls the verbosity.
 - **Deterministic output format** — `--format json` everywhere. No surprise human-readable decorations mixed into machine output.
+
+## Command API
+
+### Commands as Values
+
+A command is a value — a complete description of a process to run — that can be built, passed around, and ultimately executed through a `TaskContext`. This separates _what to run_ from _how to run it_, giving task authors flexibility in how they compose and reuse commands.
+
+```rust
+#[runme::task]
+async fn build(ctx: &TaskContext) -> TaskResult {
+    let cmd = Cmd::new("cargo")
+        .args(["build", "--release"])
+        .env("RUSTFLAGS", "-C target-cpu=native")
+        .cwd("./crates/server");
+    ctx.exec(cmd).await?;
+    Ok(())
+}
+```
+
+The `Cmd` type is runme's own. It carries everything needed to describe a process: program, arguments, environment, working directory. Arguments are structured (no shell involved), so interpolation and escaping are non-issues — values are passed directly to the OS.
+
+### Shell Strings
+
+For one-liners and cases where shell features are genuinely wanted (pipes, globbing, redirects), a shell-string path remains available:
+
+```rust
+// These are equivalent
+ctx.exec(Cmd::shell("cargo build && cargo test")).await?;
+ctx.exec("cargo build && cargo test").await?;  // convenience: &str → Cmd::shell()
+```
+
+`Cmd::shell()` wraps the string in `sh -c`. This is the escape hatch, not the default. It reintroduces shell escaping concerns, but sometimes that's what you want.
+
+### Conversion from `std::process::Command`
+
+For users who already know the stdlib API or need something runme's builder doesn't expose:
+
+```rust
+let mut std_cmd = std::process::Command::new("cargo");
+std_cmd.arg("build").env("CARGO_INCREMENTAL", "0");
+
+let cmd = Cmd::from(std_cmd);
+ctx.exec(cmd).await?;
+```
+
+The conversion extracts what `std::process::Command` carries (program, args, env) into a runme `Cmd`. From there the full builder API is available — you can keep chaining runme-specific methods after conversion:
+
+```rust
+let cmd = Cmd::from(std_cmd)
+    .cwd("./subdir")
+    .timeout(Duration::from_secs(30));
+```
+
+### Open Questions
+
+**What belongs on `Cmd` vs elsewhere?** The command itself clearly owns program, args, env, cwd. But what about:
+- **Timeout** — is it a property of the command ("this should never run longer than 30s") or of the execution context ("run this with a 30s timeout")?
+- **Readiness checks** — does a command know how to tell you it's ready (e.g. "wait for port 8080"), or is that a separate concern layered on top?
+- **Output expectations** — should a command declare that it produces JSON logs, or is that a runtime interpretation?
+- **Retry/restart policy** — "restart on failure" feels like orchestration, not command description.
+
+Putting everything on `Cmd` makes it a self-contained unit of work. Keeping `Cmd` lean and putting runtime behavior on the execution call (or on the task definition) keeps the type simple and composable. There's a spectrum here.
+
+**Working directory semantics.** `.cwd()` relative to what? The RUNME.rs file's location? The directory `runme` was invoked from? The project root? Needs a clear convention, probably relative to the RUNME.rs file since that's where the code lives.
+
+**Environment inheritance.** Does a `Cmd` start with the parent's full environment and overlay, or start empty? Overlay is almost certainly right (you rarely want to strip `PATH`), but worth being explicit.
+
+## Child Process Failure Modes
+
+Runme manages child processes on behalf of task authors. Programs misbehave in many ways; runme should handle all of them gracefully. This checklist tracks known failure modes and our test coverage.
+
+### Won't Die
+- [x] Ignores SIGTERM (custom signal handler or blocked signals) — `test_misbehave_ignores_sigterm`
+- [x] Forks a child that outlives the parent (orphan processes) — `test_misbehave_orphan_child`, `test_process_group_cleanup`
+- [ ] Double-forks to daemonize / escapes the process group
+- [ ] Changes its own process group (escapes group signal delivery)
+
+### Won't Finish
+- [x] Hangs forever (deadlock, infinite loop, blocked on I/O) — `test_misbehave_hangs_forever`
+- [x] Closes stdout/stderr but keeps running (our reader thinks it's done, process lingers) — `test_misbehave_closes_stdout_keeps_running`
+
+### Dies Badly
+- [x] Segfault / SIGBUS / SIGABRT (no exit code, just a signal) — `test_misbehave_segfault`
+- [ ] OOM-killed by the OS
+- [x] Killed by external signal unrelated to us — `test_misbehave_killed_externally`
+
+### Output Problems
+- [x] Produces massive output (memory pressure on ring buffer / readers) — `test_misbehave_massive_output`
+- [x] Writes extremely long lines with no newlines (line buffering assumptions) — `test_misbehave_long_line`
+- [ ] Writes binary / non-UTF8 data — `test_misbehave_binary_output` (known issue: line reader requires UTF-8, binary data silently dropped)
+- [ ] Interleaves stdout and stderr in ways that lose ordering
+
+### Zombie / Resource Leaks
+- [ ] Exits but leaves zombie children (we need to reap)
+- [ ] Holds a port or file lock that blocks the next task

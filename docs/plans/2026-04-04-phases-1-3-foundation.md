@@ -50,18 +50,16 @@ Phase 1: Workspace & Core Types ─── single implementor (tightly coupled)
 
 ## Status
 
-- [ ] Draft
-- [ ] Approved
-- [ ] Phase 1: In Progress
-- [ ] Phase 1: Complete
-- [ ] Phase 2 + 3: In Progress
-- [ ] Phase 2 + 3: Complete
-- [ ] Integration: Complete
+- [x] Draft
+- [x] Approved
+- [x] Phase 1: Complete
+- [x] Phase 2 + 3: Complete
+- [x] Integration: Complete
 
 ## Context
 
 - **Repo:** `/Users/dgrijalva/Code/runme`
-- **Current state:** Fresh repo — single `Cargo.toml` with `edition = "2024"`, hello world `src/main.rs`
+- **Current state:** Workspace with 3 crates, 62+ tests passing, working CLI
 - **Design docs:** `docs/system_design.md`, `docs/01-implementation-plan.md`
 - **Key constraint:** The existing `Cargo.toml` and `src/main.rs` need to be replaced by the workspace structure
 - **Rust edition:** 2024 (keep this across all crates)
@@ -797,12 +795,34 @@ validation:
 
 ## Findings
 
-_(populated during execution)_
+- `inventory` crate requires `&'static str` fields on `TaskDef` (not `String`) for `Send + Sync + 'static` compliance
+- Blanket `impl<T: Serialize> From<T> for TaskError` works alongside specific `From<ProcessError>` as long as `ProcessError` doesn't implement `Serialize`
+- Coherence prevents `TaskError` from implementing `Serialize` (would conflict with the blanket From)
+- Binary/non-UTF8 process output is silently dropped by tokio's UTF-8 line reader — test exists as `#[ignore]` TODO
+- Debug build mode is ~10% faster than release for RUNME.rs compilation with negligible runtime impact — switched to debug as default
+- Phase 2's compile integration test needed manual updating when TaskFn signature changed — fragile because it uses raw `inventory::submit!` instead of the macro
 
 ## Decisions Log
 
-_(populated during execution)_
+- **TaskError design**: struct with `serde_json::Value` output + `ExitHint` enum. Blanket `From<Serialize>` for easy construction, `ResultExt::task_err()` for std error types. TaskError intentionally never implements Serialize or std::error::Error.
+- **ExecResult → ExecOutput**: Renamed, dropped exit_code field. Non-zero exit is now `ProcessError::ExitCode { code, output }`. `ExecOutputExt` trait provides `.output()` on `Result<ExecOutput, ProcessError>` to access captured output regardless of success/failure.
+- **Doc comments as descriptions**: `#[runme::task]` extracts `///` doc comments as task description, falling back to `desc = "..."` attribute.
+- **RUNME.rs build mode**: Debug (not release) — task runner scripts don't need runtime optimization.
+- **Output streaming**: Not yet implemented. `ctx.exec()` captures into buffers but nothing streams to terminal. This is the bridge to Phase 5 (log engine). The `install` task currently produces no visible output.
+- **Command API**: New section added to system_design.md — `Cmd` type as a value describing a process, with shell string convenience path and `std::process::Command` conversion.
 
 ## Blockers
 
-_(populated during execution)_
+None — Phases 1-3 complete. Next work is Phase 4 (config/args) or Phase 5 (log engine/output streaming).
+
+## Post-Plan Work (same thread)
+
+After plan completion, additional work was done directly with the user:
+
+- **TaskError/ExitHint system** — new error module with structured JSON output and exit hints
+- **Proc macro updates** — supports both void and Result return types, doc comment extraction
+- **Process management refinements** — exec() auto-errors on non-zero exit, ExecResult→ExecOutput rename
+- **Misbehaving process test suite** — 9 tests covering SIGTERM ignoring, orphan children, hangs, segfaults, massive output, binary data, etc.
+- **Child Process Failure Modes checklist** — added to system_design.md, partially checked off
+- **Command API section** — added to system_design.md by user
+- **Project RUNME.rs** — created at repo root with `install` task using ctx.exec()

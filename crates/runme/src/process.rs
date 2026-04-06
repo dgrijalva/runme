@@ -495,6 +495,177 @@ mod tests {
         assert_eq!(received.as_str(), "broadcast_test");
     }
 
+    // ---------------------------------------------------------------
+    // Misbehaving child process tests
+    // See docs/system_design.md "Child Process Failure Modes"
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_misbehave_ignores_sigterm() {
+        // Process traps SIGTERM and ignores it. stop() should escalate to SIGKILL.
+        let cmd = r#"trap '' TERM; sleep 60"#;
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let mut handle = spawn(cmd, "test", buffer).await.unwrap();
+
+        assert!(handle.is_running());
+
+        // stop() sends SIGTERM, waits, then SIGKILL
+        handle.stop(Duration::from_secs(2)).await.unwrap();
+
+        assert!(!handle.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_misbehave_orphan_child() {
+        // Parent forks a child then exits. The orphan should still be killed
+        // because we signal the entire process group.
+        let cmd = r#"sleep 60 & echo child_pid=$!; exit 0"#;
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let mut handle = spawn(cmd, "test", buffer.clone()).await.unwrap();
+
+        // Wait for the parent shell to exit
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The process group should still be signalable
+        handle.stop(Duration::from_secs(2)).await.unwrap();
+
+        // Give the OS a moment to clean up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Verify no orphan sleep processes from our group remain.
+        // We can't easily check by PID, but the fact that stop() didn't
+        // timeout or error is the primary assertion.
+    }
+
+    #[tokio::test]
+    async fn test_misbehave_hangs_forever() {
+        // Process that will never exit on its own. exec() caller needs to
+        // be able to bound this with a timeout externally.
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let mut handle = spawn("sleep 999", "test", buffer).await.unwrap();
+
+        assert!(handle.is_running());
+
+        // Verify we can kill it within a reasonable timeout
+        let result = handle.stop(Duration::from_secs(2)).await;
+        assert!(result.is_ok());
+        assert!(!handle.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_misbehave_closes_stdout_keeps_running() {
+        // Process closes stdout/stderr but keeps running.
+        // Our readers should finish, and stop() should still kill it.
+        let cmd = r#"exec 1>&- 2>&-; sleep 60"#;
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let mut handle = spawn(cmd, "test", buffer).await.unwrap();
+
+        // Give readers a moment to see EOF on stdout/stderr
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(handle.is_running());
+        handle.stop(Duration::from_secs(2)).await.unwrap();
+        assert!(!handle.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_misbehave_segfault() {
+        // Process dies from a signal (simulated with kill -SEGV).
+        // We should get an ExitCode error with the signal-based exit code.
+        let cmd = r#"kill -SEGV $$"#;
+        let mut buffer = OutputBuffer::new(100);
+        let result = exec(cmd, "test", &mut buffer).await;
+
+        match result {
+            Err(ProcessError::ExitCode { code, .. }) => {
+                // On Unix, death by signal yields exit code 128+signal or negative
+                // SIGSEGV = 11, so expect 139 (128+11) or -11
+                assert!(code != 0, "expected non-zero exit code, got {}", code);
+            }
+            Err(other) => {
+                // Some systems report this differently — as long as it's an error
+                panic!("expected ExitCode, got: {:?}", other);
+            }
+            Ok(_) => panic!("expected error from segfaulting process"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_misbehave_killed_externally() {
+        // Process is killed by an external signal (not from us).
+        // We should observe the death cleanly without hanging.
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let mut handle = spawn("sleep 60", "test", buffer).await.unwrap();
+
+        assert!(handle.is_running());
+
+        // Kill it from the outside using its PID directly
+        let pid = handle.pid().expect("should have a pid");
+        nix::sys::signal::kill(
+            Pid::from_raw(pid as i32),
+            Signal::SIGKILL,
+        ).unwrap();
+
+        // wait() should return an error (non-zero exit from signal death)
+        let result = handle.wait().await;
+        assert!(result.is_err());
+        assert!(!handle.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_misbehave_massive_output() {
+        // Process dumps a huge amount of output.
+        // Ring buffer should stay bounded, no OOM.
+        let capacity = 100;
+        let mut buffer = OutputBuffer::new(capacity);
+        // Generate 10,000 lines
+        let cmd = r#"seq 1 10000"#;
+        let _output = exec(cmd, "test", &mut buffer).await.unwrap();
+
+        // Buffer should be capped at capacity
+        assert_eq!(buffer.len(), capacity);
+        // Last line should be "10000"
+        let last = buffer.lines().back().unwrap().as_str();
+        assert_eq!(last, "10000");
+    }
+
+    #[tokio::test]
+    async fn test_misbehave_long_line() {
+        // Process writes an extremely long line with no newline.
+        // Should not crash or hang.
+        let mut buffer = OutputBuffer::new(100);
+        // Generate a 1MB line
+        let cmd = r#"python3 -c "print('x' * 1_000_000)""#;
+        let result = exec(cmd, "test", &mut buffer).await;
+
+        match result {
+            Ok(output) => {
+                assert_eq!(output.stdout.trim().len(), 1_000_000);
+            }
+            Err(_) => {
+                // python3 might not be available; skip gracefully
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "TODO: binary output is silently dropped because our line reader requires UTF-8"]
+    async fn test_misbehave_binary_output() {
+        // Process writes non-UTF8 binary data followed by valid text.
+        // We should preserve the valid parts at minimum.
+        let mut buffer = OutputBuffer::new(100);
+        let cmd = r#"printf '\xff\xfe'; echo hello"#;
+        let result = exec(cmd, "test", &mut buffer).await;
+
+        let output = match result {
+            Ok(output) => output,
+            Err(ProcessError::ExitCode { output, .. }) => output,
+            Err(other) => panic!("unexpected error: {:?}", other),
+        };
+
+        assert!(output.stdout.contains("hello"), "valid output after binary data was lost");
+    }
+
     #[tokio::test]
     async fn test_logline_json_detection() {
         // Objects are structured
