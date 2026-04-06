@@ -13,6 +13,7 @@ pub struct CompileResult {
     /// Path to the compiled binary.
     pub binary_path: PathBuf,
     /// Whether the binary was served from cache (true) or freshly compiled (false).
+    #[allow(dead_code)]
     pub was_cached: bool,
 }
 
@@ -184,18 +185,18 @@ fn find_runme_lib_path(runme_file: &Path) -> Result<PathBuf, CompileError> {
     // First, try to find it relative to the runme-cli binary's location.
     // When installed via `cargo install`, the source crate path won't work,
     // but during development the crates are in the repo.
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            // Walk up from the exe to find the workspace root
-            let mut search = exe_dir.to_path_buf();
-            loop {
-                let candidate = search.join("crates").join("runme");
-                if candidate.join("Cargo.toml").is_file() {
-                    return Ok(candidate);
-                }
-                if !search.pop() {
-                    break;
-                }
+    if let Ok(exe_path) = std::env::current_exe()
+        && let Some(exe_dir) = exe_path.parent()
+    {
+        // Walk up from the exe to find the workspace root
+        let mut search = exe_dir.to_path_buf();
+        loop {
+            let candidate = search.join("crates").join("runme");
+            if candidate.join("Cargo.toml").is_file() {
+                return Ok(candidate);
+            }
+            if !search.pop() {
+                break;
             }
         }
     }

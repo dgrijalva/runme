@@ -1,5 +1,6 @@
 pub mod cmd;
 pub mod error;
+pub mod log;
 pub mod task;
 pub mod process;
 pub mod signal;

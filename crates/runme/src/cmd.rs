@@ -2,6 +2,9 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::log::parse::RecordParser;
+use crate::log::extract::FieldExtractor;
+
 /// A command to execute.
 ///
 /// Pure value describing what to run: program, arguments, environment overlays,
@@ -12,11 +15,15 @@ use std::path::{Path, PathBuf};
 /// - **Shell**: `Cmd::shell("cargo build && cargo test")` — wrapped in `sh -c`
 ///
 /// `&str` converts to `Cmd::shell()` so `ctx.exec("echo hi")` still works.
-#[derive(Clone, Debug)]
+///
+/// Optionally carries a `RecordParser` and `FieldExtractor` for overriding
+/// the default autodetection pipeline.
 pub struct Cmd {
     inner: CmdKind,
     envs: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
+    pub(crate) parser: Option<Box<dyn RecordParser>>,
+    pub(crate) extractor: Option<Box<dyn FieldExtractor>>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +47,8 @@ impl Cmd {
             },
             envs: Vec::new(),
             cwd: None,
+            parser: None,
+            extractor: None,
         }
     }
 
@@ -51,7 +60,21 @@ impl Cmd {
             inner: CmdKind::Shell(command.into()),
             envs: Vec::new(),
             cwd: None,
+            parser: None,
+            extractor: None,
         }
+    }
+
+    /// Override the default parser chain for this command's output.
+    pub fn record_parser(mut self, parser: impl RecordParser + 'static) -> Self {
+        self.parser = Some(Box::new(parser));
+        self
+    }
+
+    /// Override the default field extractor for this command's output.
+    pub fn field_extractor(mut self, extractor: impl FieldExtractor + 'static) -> Self {
+        self.extractor = Some(Box::new(extractor));
+        self
     }
 
     /// Add a single argument. Panics if called on a shell command.
@@ -146,6 +169,18 @@ impl Cmd {
     }
 }
 
+impl fmt::Debug for Cmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cmd")
+            .field("inner", &self.inner)
+            .field("envs", &self.envs)
+            .field("cwd", &self.cwd)
+            .field("parser", &self.parser.as_ref().map(|_| "..."))
+            .field("extractor", &self.extractor.as_ref().map(|_| "..."))
+            .finish()
+    }
+}
+
 impl fmt::Display for Cmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
@@ -176,6 +211,7 @@ impl From<String> for Cmd {
 }
 
 /// Convert from `std::process::Command`, extracting program, args, env, and cwd.
+/// Parser and extractor are set to None (autodetect defaults).
 impl From<std::process::Command> for Cmd {
     fn from(std_cmd: std::process::Command) -> Self {
         let program = std_cmd.get_program().to_owned();
@@ -190,6 +226,8 @@ impl From<std::process::Command> for Cmd {
             inner: CmdKind::Structured { program, args },
             envs,
             cwd,
+            parser: None,
+            extractor: None,
         }
     }
 }
@@ -291,11 +329,21 @@ mod tests {
     }
 
     #[test]
-    fn test_clone() {
-        let cmd = Cmd::new("cargo").args(["build"]).env("K", "V").cwd("/tmp");
-        let clone = cmd.clone();
-        assert_eq!(clone.to_string(), "cargo build");
-        assert_eq!(clone.envs().len(), 1);
-        assert_eq!(clone.get_cwd(), Some(Path::new("/tmp")));
+    fn test_record_parser_and_field_extractor() {
+        use crate::log::parse::PlainLineParser;
+        use crate::log::extract::CommonJsonFieldExtractor;
+
+        let cmd = Cmd::new("my-app")
+            .record_parser(PlainLineParser)
+            .field_extractor(CommonJsonFieldExtractor::new());
+        assert!(cmd.parser.is_some());
+        assert!(cmd.extractor.is_some());
+    }
+
+    #[test]
+    fn test_from_str_has_no_parser() {
+        let cmd: Cmd = "echo hi".into();
+        assert!(cmd.parser.is_none());
+        assert!(cmd.extractor.is_none());
     }
 }

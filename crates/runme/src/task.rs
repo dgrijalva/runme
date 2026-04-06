@@ -7,7 +7,8 @@ use tokio::task::JoinSet;
 
 use crate::cmd::Cmd;
 use crate::error::TaskError;
-use crate::process::{self, ExecOutput, LogLine, OutputBuffer, ProcessError, ProcessHandle};
+use crate::log::LogEntry;
+use crate::process::{self, ExecOutput, OutputBuffer, ProcessError, ProcessHandle};
 
 /// The type of async task functions.
 ///
@@ -77,8 +78,8 @@ impl TaskContext {
         process::spawn(command, &self.name, buffer).await
     }
 
-    /// Access the output buffer (read the captured lines).
-    pub async fn output_lines(&self) -> Vec<LogLine> {
+    /// Access the output buffer (read the captured log entries).
+    pub async fn output_lines(&self) -> Vec<LogEntry> {
         let buffer = self.output.lock().await;
         buffer.lines().iter().cloned().collect()
     }

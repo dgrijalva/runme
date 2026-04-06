@@ -80,10 +80,10 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             .attrs
             .iter()
             .filter_map(|attr| {
-                if attr.path().is_ident("doc") {
-                    if let Meta::NameValue(MetaNameValue { value: Expr::Lit(ExprLit { lit: Lit::Str(s), .. }), .. }) = &attr.meta {
-                        return Some(s.value().trim().to_string());
-                    }
+                if attr.path().is_ident("doc")
+                    && let Meta::NameValue(MetaNameValue { value: Expr::Lit(ExprLit { lit: Lit::Str(s), .. }), .. }) = &attr.meta
+                {
+                    return Some(s.value().trim().to_string());
                 }
                 None
             })

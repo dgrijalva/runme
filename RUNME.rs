@@ -13,6 +13,6 @@ fn main() {}
 /// Test task
 #[runme::task]
 fn test(_ctx: &TaskContext) -> TaskResult {
-    eprintln!("test2333");
+    eprintln!("test233");
     Ok(())
 }

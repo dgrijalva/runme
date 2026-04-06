@@ -8,37 +8,15 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::broadcast;
 
 use crate::cmd::Cmd;
+use crate::log::extract::{self, FieldExtractor};
+use crate::log::parse::{self, RecordParser};
+use crate::log::{LogEntry, ParseResult};
 
 /// Captured output from a process execution.
 #[derive(Debug, Clone)]
 pub struct ExecOutput {
     pub stdout: String,
     pub stderr: String,
-}
-
-/// A line of captured output, possibly structured JSON.
-#[derive(Debug, Clone)]
-pub enum LogLine {
-    Raw(String),
-    Structured(serde_json::Value),
-}
-
-impl LogLine {
-    /// Parse a line, detecting JSON.
-    pub fn from_line(line: &str) -> Self {
-        match serde_json::from_str::<serde_json::Value>(line) {
-            Ok(val) if val.is_object() || val.is_array() => LogLine::Structured(val),
-            _ => LogLine::Raw(line.to_string()),
-        }
-    }
-
-    /// Get the raw string representation.
-    pub fn as_str(&self) -> String {
-        match self {
-            LogLine::Raw(s) => s.clone(),
-            LogLine::Structured(v) => v.to_string(),
-        }
-    }
 }
 
 /// Errors that can occur during process management.
@@ -86,12 +64,12 @@ impl ExecOutputExt for Result<ExecOutput, ProcessError> {
 
 /// Output ring buffer for a task.
 ///
-/// Stores lines with bounded capacity. When full, oldest lines are dropped.
-/// Also broadcasts new lines to subscribers.
+/// Stores log entries with bounded capacity. When full, oldest entries are dropped.
+/// Also broadcasts new entries to subscribers.
 pub struct OutputBuffer {
-    lines: VecDeque<LogLine>,
+    lines: VecDeque<LogEntry>,
     capacity: usize,
-    tx: broadcast::Sender<LogLine>,
+    tx: broadcast::Sender<LogEntry>,
 }
 
 impl OutputBuffer {
@@ -105,27 +83,27 @@ impl OutputBuffer {
         }
     }
 
-    /// Push a line into the buffer. Drops the oldest if at capacity.
-    pub fn push(&mut self, line: LogLine) {
+    /// Push a log entry into the buffer. Drops the oldest if at capacity.
+    pub fn push(&mut self, entry: LogEntry) {
         if self.lines.len() >= self.capacity {
             self.lines.pop_front();
         }
         // Broadcast to subscribers (ignore errors — no receivers is OK)
-        let _ = self.tx.send(line.clone());
-        self.lines.push_back(line);
+        let _ = self.tx.send(entry.clone());
+        self.lines.push_back(entry);
     }
 
-    /// Get all buffered lines.
-    pub fn lines(&self) -> &VecDeque<LogLine> {
+    /// Get all buffered entries.
+    pub fn lines(&self) -> &VecDeque<LogEntry> {
         &self.lines
     }
 
-    /// Get a broadcast receiver for new lines.
-    pub fn subscribe(&self) -> broadcast::Receiver<LogLine> {
+    /// Get a broadcast receiver for new entries.
+    pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
         self.tx.subscribe()
     }
 
-    /// Number of lines currently in the buffer.
+    /// Number of entries currently in the buffer.
     pub fn len(&self) -> usize {
         self.lines.len()
     }
@@ -141,6 +119,42 @@ impl OutputBuffer {
     }
 }
 
+/// Feed a line through the parsing pipeline, producing a LogEntry.
+fn process_line(
+    line: &str,
+    parser: &mut dyn RecordParser,
+    extractor: &dyn FieldExtractor,
+    source: &str,
+    seq: &mut u64,
+) -> Option<LogEntry> {
+    let raw_record = match parser.feed(line) {
+        ParseResult::Record(rec) => rec,
+        ParseResult::Rejection => {
+            // Should not happen if PlainLineParser is terminal in the chain,
+            // but handle gracefully.
+            return None;
+        }
+        ParseResult::Incomplete => {
+            // Multiline record in progress — no entry yet.
+            return None;
+        }
+    };
+
+    let extracted = extractor.extract(&raw_record);
+    let entry = LogEntry {
+        raw: raw_record.raw,
+        parsed: raw_record.parsed,
+        source: source.to_string(),
+        seq: *seq,
+        timestamp: extracted.timestamp,
+        level: extracted.level,
+        message: extracted.message,
+        fields: extracted.fields,
+    };
+    *seq += 1;
+    Some(entry)
+}
+
 /// Handle to a running child process.
 ///
 /// The child is spawned in its own process group, allowing group-wide
@@ -149,6 +163,8 @@ pub struct ProcessHandle {
     child: tokio::process::Child,
     task_name: String,
     pgid: Option<i32>,
+    /// The output buffer for this process.
+    pub buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
     /// Background tasks reading stdout/stderr
     _stdout_task: Option<tokio::task::JoinHandle<()>>,
     _stderr_task: Option<tokio::task::JoinHandle<()>>,
@@ -234,7 +250,7 @@ fn build_command(cmd: Cmd) -> tokio::process::Command {
     unsafe {
         command.pre_exec(|| {
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             Ok(())
         });
     }
@@ -244,14 +260,23 @@ fn build_command(cmd: Cmd) -> tokio::process::Command {
 
 /// Execute a command synchronously (wait for completion), capturing all output.
 ///
-/// Lines are parsed for JSON structure and pushed into the provided OutputBuffer.
+/// Lines are fed through the parsing pipeline (RecordParser -> FieldExtractor -> LogEntry)
+/// and pushed into the provided OutputBuffer.
 /// Accepts anything that converts to `Cmd`: a `&str`/`String` (shell mode) or a `Cmd` value.
 pub async fn exec(
     command: impl Into<Cmd>,
     task_name: &str,
     buffer: &mut OutputBuffer,
 ) -> Result<ExecOutput, ProcessError> {
-    let mut child = build_command(command.into()).spawn().map_err(ProcessError::Spawn)?;
+    let mut cmd = command.into();
+
+    // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
+    let mut parser: Box<dyn RecordParser> = cmd.parser.take()
+        .unwrap_or_else(|| Box::new(parse::default_parser()));
+    let extractor: Box<dyn FieldExtractor> = cmd.extractor.take()
+        .unwrap_or_else(|| Box::new(extract::default_extractor()));
+
+    let mut child = build_command(cmd).spawn().map_err(ProcessError::Spawn)?;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -261,6 +286,7 @@ pub async fn exec(
 
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
+    let mut seq: u64 = 0;
 
     // Read stdout and stderr concurrently
     loop {
@@ -270,14 +296,18 @@ pub async fn exec(
                     Ok(Some(l)) => {
                         stdout_text.push_str(&l);
                         stdout_text.push('\n');
-                        buffer.push(LogLine::from_line(&l));
+                        if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
+                            buffer.push(entry);
+                        }
                     }
                     Ok(None) => {
                         // stdout closed, drain stderr
                         while let Ok(Some(l)) = stderr_reader.next_line().await {
                             stderr_text.push_str(&l);
                             stderr_text.push('\n');
-                            buffer.push(LogLine::from_line(&l));
+                            if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
+                                buffer.push(entry);
+                            }
                         }
                         break;
                     }
@@ -289,14 +319,18 @@ pub async fn exec(
                     Ok(Some(l)) => {
                         stderr_text.push_str(&l);
                         stderr_text.push('\n');
-                        buffer.push(LogLine::from_line(&l));
+                        if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
+                            buffer.push(entry);
+                        }
                     }
                     Ok(None) => {
                         // stderr closed, drain stdout
                         while let Ok(Some(l)) = stdout_reader.next_line().await {
                             stdout_text.push_str(&l);
                             stdout_text.push('\n');
-                            buffer.push(LogLine::from_line(&l));
+                            if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
+                                buffer.push(entry);
+                            }
                         }
                         break;
                     }
@@ -306,9 +340,23 @@ pub async fn exec(
         }
     }
 
-    let status = child.wait().await.map_err(ProcessError::Wait)?;
+    // Flush any buffered partial records from the parser.
+    if let Some(raw_record) = parser.flush() {
+        let extracted = extractor.extract(&raw_record);
+        let entry = LogEntry {
+            raw: raw_record.raw,
+            parsed: raw_record.parsed,
+            source: task_name.to_string(),
+            seq,
+            timestamp: extracted.timestamp,
+            level: extracted.level,
+            message: extracted.message,
+            fields: extracted.fields,
+        };
+        buffer.push(entry);
+    }
 
-    let _ = task_name; // used for future logging context
+    let status = child.wait().await.map_err(ProcessError::Wait)?;
 
     let exit_code = status.code().unwrap_or(-1);
     let output = ExecOutput {
@@ -326,36 +374,70 @@ pub async fn exec(
 /// Spawn a command in the background, returning a handle for monitoring and control.
 ///
 /// Output is continuously read into the provided OutputBuffer by background tasks.
+/// Lines are fed through the parsing pipeline.
 /// Accepts anything that converts to `Cmd`: a `&str`/`String` (shell mode) or a `Cmd` value.
 pub async fn spawn(
     command: impl Into<Cmd>,
     task_name: &str,
     buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
 ) -> Result<ProcessHandle, ProcessError> {
-    let mut child = build_command(command.into()).spawn().map_err(ProcessError::Spawn)?;
+    let mut cmd = command.into();
+
+    // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
+    let parser: Box<dyn RecordParser> = cmd.parser.take()
+        .unwrap_or_else(|| Box::new(parse::default_parser()));
+    let extractor: Box<dyn FieldExtractor> = cmd.extractor.take()
+        .unwrap_or_else(|| Box::new(extract::default_extractor()));
+
+    let mut child = build_command(cmd).spawn().map_err(ProcessError::Spawn)?;
 
     let pgid = child.id().map(|id| id as i32);
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
 
+    let task_name_owned = task_name.to_string();
+
+    // We need the parser and extractor in the background tasks. Since parsers
+    // are stateful and not Clone, we share them via Arc<Mutex>. Each stream
+    // (stdout/stderr) feeds into the same parser so multiline detection works
+    // across both streams. In practice, stdout and stderr lines interleave
+    // nondeterministically anyway, so sharing a parser is correct.
+    let parser = std::sync::Arc::new(tokio::sync::Mutex::new(parser));
+    let extractor = std::sync::Arc::new(extractor);
+    let seq = std::sync::Arc::new(tokio::sync::Mutex::new(0u64));
+
     // Background task: read stdout lines into buffer
     let buf_clone = buffer.clone();
+    let parser_clone = parser.clone();
+    let extractor_clone = extractor.clone();
+    let seq_clone = seq.clone();
+    let source_clone = task_name_owned.clone();
     let stdout_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            let log_line = LogLine::from_line(&line);
-            buf_clone.lock().await.push(log_line);
+            let mut p = parser_clone.lock().await;
+            let mut s = seq_clone.lock().await;
+            if let Some(entry) = process_line(&line, p.as_mut(), extractor_clone.as_ref(), &source_clone, &mut s) {
+                buf_clone.lock().await.push(entry);
+            }
         }
     });
 
     // Background task: read stderr lines into buffer
     let buf_clone = buffer.clone();
+    let parser_clone = parser.clone();
+    let extractor_clone = extractor.clone();
+    let seq_clone = seq;
+    let source_clone = task_name_owned;
     let stderr_task = tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
-            let log_line = LogLine::from_line(&line);
-            buf_clone.lock().await.push(log_line);
+            let mut p = parser_clone.lock().await;
+            let mut s = seq_clone.lock().await;
+            if let Some(entry) = process_line(&line, p.as_mut(), extractor_clone.as_ref(), &source_clone, &mut s) {
+                buf_clone.lock().await.push(entry);
+            }
         }
     });
 
@@ -363,6 +445,7 @@ pub async fn spawn(
         child,
         task_name: task_name.to_string(),
         pgid,
+        buffer,
         _stdout_task: Some(stdout_task),
         _stderr_task: Some(stderr_task),
     })
@@ -371,6 +454,8 @@ pub async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::ParsedContent;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn test_exec_captures_stdout() {
@@ -393,13 +478,18 @@ mod tests {
         let _result = exec(cmd, "test", &mut buffer).await.unwrap();
 
         assert!(!buffer.is_empty());
-        match &buffer.lines()[0] {
-            LogLine::Structured(val) => {
+        let entry = &buffer.lines()[0];
+        // Should be parsed as JSON
+        match &entry.parsed {
+            ParsedContent::Json(val) => {
                 assert_eq!(val["level"], "info");
                 assert_eq!(val["message"], "hello");
             }
-            LogLine::Raw(s) => panic!("Expected Structured, got Raw: {}", s),
+            other => panic!("Expected Json, got {:?}", other),
         }
+        // Fields should be extracted
+        assert_eq!(entry.level.as_deref(), Some("info"));
+        assert_eq!(entry.message.as_deref(), Some("hello"));
     }
 
     #[tokio::test]
@@ -408,10 +498,9 @@ mod tests {
         let _result = exec("echo 'just plain text'", "test", &mut buffer).await.unwrap();
 
         assert!(!buffer.is_empty());
-        match &buffer.lines()[0] {
-            LogLine::Raw(s) => assert_eq!(s, "just plain text"),
-            LogLine::Structured(_) => panic!("Expected Raw, got Structured"),
-        }
+        let entry = &buffer.lines()[0];
+        assert!(matches!(&entry.parsed, ParsedContent::PlainText));
+        assert_eq!(entry.raw, "just plain text");
     }
 
     #[tokio::test]
@@ -450,10 +539,9 @@ mod tests {
 
         let buf = buffer.lock().await;
         assert!(!buf.is_empty());
-        match &buf.lines()[0] {
-            LogLine::Raw(s) => assert_eq!(s, "spawned_output"),
-            LogLine::Structured(_) => panic!("Expected Raw"),
-        }
+        let entry = &buf.lines()[0];
+        assert_eq!(entry.raw, "spawned_output");
+        assert!(matches!(&entry.parsed, ParsedContent::PlainText));
     }
 
     #[tokio::test]
@@ -472,13 +560,23 @@ mod tests {
     #[tokio::test]
     async fn test_output_buffer_ring() {
         let mut buffer = OutputBuffer::new(3);
-        buffer.push(LogLine::Raw("line1".to_string()));
-        buffer.push(LogLine::Raw("line2".to_string()));
-        buffer.push(LogLine::Raw("line3".to_string()));
+        let make_entry = |raw: &str, seq: u64| LogEntry {
+            raw: raw.to_string(),
+            parsed: ParsedContent::PlainText,
+            source: "test".to_string(),
+            seq,
+            timestamp: None,
+            level: None,
+            message: None,
+            fields: HashMap::new(),
+        };
+        buffer.push(make_entry("line1", 0));
+        buffer.push(make_entry("line2", 1));
+        buffer.push(make_entry("line3", 2));
         assert_eq!(buffer.len(), 3);
 
         // Push one more, oldest should be dropped
-        buffer.push(LogLine::Raw("line4".to_string()));
+        buffer.push(make_entry("line4", 3));
         assert_eq!(buffer.len(), 3);
 
         let lines: Vec<String> = buffer.lines().iter().map(|l| l.as_str()).collect();
@@ -490,7 +588,16 @@ mod tests {
         let mut buffer = OutputBuffer::new(100);
         let mut rx = buffer.subscribe();
 
-        buffer.push(LogLine::Raw("broadcast_test".to_string()));
+        buffer.push(LogEntry {
+            raw: "broadcast_test".to_string(),
+            parsed: ParsedContent::PlainText,
+            source: "test".to_string(),
+            seq: 0,
+            timestamp: None,
+            level: None,
+            message: None,
+            fields: HashMap::new(),
+        });
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.as_str(), "broadcast_test");
@@ -668,25 +775,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_logline_json_detection() {
-        // Objects are structured
-        let obj = LogLine::from_line(r#"{"key": "value"}"#);
-        assert!(matches!(obj, LogLine::Structured(_)));
+    async fn test_log_entry_source_and_seq() {
+        let mut buffer = OutputBuffer::new(100);
+        let cmd = r#"echo first; echo second; echo third"#;
+        let _result = exec(cmd, "my_task", &mut buffer).await.unwrap();
 
-        // Arrays are structured
-        let arr = LogLine::from_line(r#"[1, 2, 3]"#);
-        assert!(matches!(arr, LogLine::Structured(_)));
+        assert_eq!(buffer.len(), 3);
 
-        // Plain strings are raw even if valid JSON
-        let plain = LogLine::from_line(r#""just a string""#);
-        assert!(matches!(plain, LogLine::Raw(_)));
+        let entries: Vec<_> = buffer.lines().iter().collect();
+        // All entries should have the correct source
+        for entry in &entries {
+            assert_eq!(entry.source, "my_task");
+        }
+        // Seq should be monotonically increasing
+        assert_eq!(entries[0].seq, 0);
+        assert_eq!(entries[1].seq, 1);
+        assert_eq!(entries[2].seq, 2);
+    }
 
-        // Numbers are raw
-        let num = LogLine::from_line("42");
-        assert!(matches!(num, LogLine::Raw(_)));
+    #[tokio::test]
+    async fn test_exec_json_field_extraction() {
+        let mut buffer = OutputBuffer::new(100);
+        let cmd = r#"echo '{"level":"error","msg":"connection failed","timestamp":"2024-01-01T00:00:00Z","service":"auth"}'"#;
+        let _result = exec(cmd, "test", &mut buffer).await.unwrap();
 
-        // Non-JSON is raw
-        let text = LogLine::from_line("hello world");
-        assert!(matches!(text, LogLine::Raw(_)));
+        let entry = &buffer.lines()[0];
+        assert_eq!(entry.level.as_deref(), Some("error"));
+        assert_eq!(entry.message.as_deref(), Some("connection failed"));
+        assert_eq!(entry.timestamp.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(
+            entry.fields.get("service"),
+            Some(&serde_json::Value::String("auth".to_string()))
+        );
     }
 }
