@@ -307,6 +307,23 @@ pub struct LogEntry {
 
 Currently `raw` is an owned `String`. With hundreds of thousands of entries, this means hundreds of thousands of small allocations. A future optimization could store raw output in a contiguous backing buffer and use byte-range references instead of owned strings. Not worth pursuing until it's a measured bottleneck -- noting it here so the API doesn't preclude it.
 
+### Unsolved: Binary Data Handling
+
+The RecordParser trait accepts `&[u8]`, which supports binary data at the trait boundary. However, the current built-in parsers and `RawRecord.raw: String` assume UTF-8 text. Binary data is an unsolved problem.
+
+**Scenarios to consider:**
+- **Fully binary stream** (tar, compiled output) — every chunk fails UTF-8. Should be detected early (null bytes in first N bytes is the classic heuristic) and handled as a distinct mode.
+- **Text stream with a binary burst** (process dumps a struct to stdout, then resumes logging) — need to find where text resumes. Heuristic: scan forward for a run of valid UTF-8 ending in `\n`. Fragile.
+- **Binary framed protocol** (BSON, protobuf) — needs a format-specific parser, not a heuristic. The byte-oriented trait already supports this.
+
+**Open questions:**
+- Can we recover from binary? Once non-UTF8 bytes appear, is the rest of the stream assumed binary, or do we try to find the next text boundary?
+- Should `RawRecord` / `LogEntry` support raw bytes (e.g., `ParsedContent::Binary(Vec<u8>)`)? Or is lossy UTF-8 conversion always sufficient for display?
+- Should there be a stream-level binary detection (before the parser) or is it the parser's responsibility?
+- What should PlainLineParser do with non-UTF8 bytes? Currently uses `from_utf8_lossy`, which keeps things working but loses data.
+
+**Current behavior:** `PlainLineParser` uses `from_utf8_lossy` as the terminal fallback. Binary data shows up as `�` in log entries. Nothing breaks, but data is mangled. This is acceptable for v1 — proper binary handling is future work.
+
 ---
 
 ## Filter Expression Engine (Wave 2)
