@@ -1,6 +1,6 @@
 # Log Engine Design
 
-Status: **Draft** — captures decisions from design discussion, open questions for research to resolve.
+Status: **Final** — all research questions resolved, ready for human review.
 
 ## Core Architecture
 
@@ -8,18 +8,18 @@ The log engine is a pipeline with user-extensible stages:
 
 ```
 stdout/stderr bytes
-       │
-       ▼
-  RecordParser  (trait — splitting + parsing fused)
-       │         FallbackParser tries parsers in priority order
-       │         emits: Record | Rejection | Incomplete
-       ▼
-  FieldExtractor  (trait — stateless, per-record)
-       │            LayeredExtractor runs all extractors, merges results
-       ▼
-  LogEntry  (struct — the universal log record)
-       │
-       ▼
+       |
+       v
+  RecordParser  (trait -- splitting + parsing fused)
+       |         FallbackParser tries parsers in priority order
+       |         emits: Record | Rejection | Incomplete
+       v
+  FieldExtractor  (trait -- stateless, per-record)
+       |            LayeredExtractor runs all extractors, merges results
+       v
+  LogEntry  (struct -- the universal log record)
+       |
+       v
   Storage / Querying / Presentation (downstream consumers)
 ```
 
@@ -28,7 +28,7 @@ stdout/stderr bytes
 - **Autodetection by default.** The engine figures out the format. RUNME.rs files stay lean.
 - **User-extensible via traits.** Built-in implementations for common formats, but users can supply their own `RecordParser` and `FieldExtractor` implementations.
 - **Override via Cmd.** The `Cmd` builder carries optional hints when autodetection isn't enough. Hints live on Cmd (not on the task) because a single task may run multiple commands with different output formats.
-- **Graceful degradation.** If parsing fails, you get a raw text entry with no extracted fields. Everything still works — filtering, search, display.
+- **Graceful degradation.** If parsing fails, you get a raw text entry with no extracted fields. Everything still works -- filtering, search, display.
 
 ---
 
@@ -40,9 +40,9 @@ Fuses record splitting and parsing. These are coupled because you can't split re
 pub enum ParseResult {
     /// Successfully parsed a complete record
     Record(RawRecord),
-    /// This parser doesn't handle this input — try the next one
+    /// This parser doesn't handle this input -- try the next one
     Rejection,
-    /// Input could be a partial record in this format — need more data
+    /// Input could be a partial record in this format -- need more data
     Incomplete,
 }
 
@@ -54,7 +54,7 @@ pub struct RawRecord {
 
 pub enum ParsedContent {
     Json(serde_json::Value),
-    // Future: Logfmt(Vec<(String, String)>), etc.
+    Logfmt(Vec<(String, String)>),
     PlainText,
 }
 
@@ -88,24 +88,24 @@ impl FallbackParser {
 impl RecordParser for FallbackParser { ... }
 ```
 
-### Built-in Parsers
+### Built-in Parsers (Wave 1)
 
-- **JsonlParser** — Detects JSON objects and arrays. Single-line by default. Handles the common case of structured log output.
-- **PlainLineParser** — Always succeeds. One line = one record. Terminal fallback.
+- **JsonlParser** -- Detects JSON objects and arrays. Single-line by default. Handles the common case of structured log output. When the parser has seen >3 JSON lines and encounters non-JSON, it flags the resulting record with `{"_anomalous": true, "_anomaly_reason": "plain_text_in_json_stream"}` in the fields HashMap. No multiline/pretty-printed JSON parser needed for wave 1 -- pretty-printed JSON in log streams is rare.
+- **RustPanicParser** -- Recognizes Rust panic output and captures the full backtrace as one record. Start pattern: `^thread\s+'[^']*'\s+panicked\s+at\s+`. Continuation: `^(stack backtrace:|note:\s|\s+\d+:\s|\s+at\s)`. End: first non-matching line.
+- **CargoDiagnosticParser** -- Recognizes cargo compiler errors/warnings and captures the full diagnostic (including `-->` file references and help text) as one record. Start pattern: `^(error|warning)(\[E\d{4}\])?:\s`. Continuation: `^(\s*-->|\s*\||\s*=\s*(note|help|warning):|\s*$)`. End: next diagnostic start or non-matching line.
+- **LogfmtParser** -- Parses `key=value` format. Prevalent in Go (slog TextHandler), Heroku/12-factor, cloud-native tooling. Parser implementation: split on spaces, split on `=`, handle quoted values. Emits `ParsedContent::Logfmt(Vec<(String, String)>)`. Same field name mapping table used by `CommonJsonFieldExtractor` works for extraction.
+- **PlainLineParser** -- Always succeeds. One line = one record. Terminal fallback.
 
-**Open for research:**
-- Do we need a multiline JSON parser (pretty-printed JSON)?
-- Should we have a RustPanicParser that recognizes `thread 'main' panicked at ...` and captures the full backtrace as one record?
-- Logfmt parser — how common is this in practice? Worth building for wave 1?
-- What other patterns are worth recognizing? (Python tracebacks, cargo diagnostics, etc.)
+**Deferred to wave 2:** Python tracebacks, Java stack traces, Go panics, Node.js multi-line errors. All have been cataloged with heuristics by research but are lower priority than the Rust-ecosystem patterns above.
 
 ### Default Parser Chain
 
 ```rust
 FallbackParser::new(vec![
-    Box::new(JsonlParser),
-    // Future: Box::new(RustPanicParser),
-    // Future: Box::new(LogfmtParser),
+    Box::new(JsonlParser::new()),
+    Box::new(RustPanicParser::new()),
+    Box::new(CargoDiagnosticParser::new()),
+    Box::new(LogfmtParser::new()),
     Box::new(PlainLineParser),  // always succeeds, terminal
 ])
 ```
@@ -133,7 +133,7 @@ pub struct ExtractedFields {
 
 ### Composition: LayeredExtractor
 
-Unlike parsers (where one wins), extractors accumulate. All run, results merge. This is because different extractors look at different parts of the data — one finds `level`/`message`, another finds `trace_id`/`span_id`.
+Unlike parsers (where one wins), extractors accumulate. All run, results merge. This is because different extractors look at different parts of the data -- one finds `level`/`message`, another finds `trace_id`/`span_id`.
 
 ```rust
 pub struct LayeredExtractor {
@@ -151,20 +151,69 @@ Merge strategy: later extractors do not overwrite fields set by earlier ones (fi
 
 ### Built-in Extractors
 
-- **CommonJsonFieldExtractor** — Maps common JSON field names to well-known fields. Handles the `level`/`severity`/`lvl` and `msg`/`message` and `ts`/`timestamp`/`time` variations.
+- **CommonJsonFieldExtractor** -- Maps common JSON field names to well-known fields. Works with both `ParsedContent::Json` and `ParsedContent::Logfmt` (same field naming conventions apply). No separate logfmt extractor needed.
 
-**Open for research:**
-- What field name mappings are most common across ecosystems? (Node, Go, Python, Rust/tracing, Java/SLF4J)
-- Are there other well-known fields beyond timestamp/level/message worth extracting into the struct? (service, trace_id, request_id?)
-- Should there be a logfmt-specific extractor or does the generic JSON one cover it once logfmt is parsed into key-value pairs?
+### Field Name Mapping Table
+
+The `CommonJsonFieldExtractor` checks field names in priority order (first match wins). This table covers 12+ logging libraries across Node.js, Go, Python, Rust, and Java ecosystems.
+
+**Level field** (checked in this order):
+| Priority | Field Name | Libraries |
+|----------|-----------|-----------|
+| 1 | `level` | pino, bunyan, zap, zerolog, structlog, tracing-subscriber |
+| 2 | `severity` | Google Cloud Logging, GCP-oriented libraries |
+| 3 | `levelname` | Python stdlib logging |
+| 4 | `lvl` | zerolog (compact mode) |
+| 5 | `log_level` | occasional custom usage |
+| 6 | `loglevel` | occasional custom usage |
+| 7 | `log.level` | ECS (Elastic Common Schema) |
+| 8 | `levelno` | Python stdlib (integer -- needs conversion: 10=DEBUG, 20=INFO, 30=WARNING, 40=ERROR, 50=CRITICAL) |
+
+**Message field** (checked in this order):
+| Priority | Field Name | Libraries |
+|----------|-----------|-----------|
+| 1 | `msg` | zap, zerolog, logrus, pino, bunyan |
+| 2 | `message` | winston, structlog, SLF4J/Logback, Log4j2 |
+| 3 | `event` | structlog (when used as event name) |
+| 4 | `text` | occasional custom usage |
+| 5 | `body` | occasional custom usage |
+
+**Timestamp field** (checked in this order):
+| Priority | Field Name | Libraries |
+|----------|-----------|-----------|
+| 1 | `timestamp` | structlog, logrus |
+| 2 | `time` | zap, zerolog, bunyan |
+| 3 | `ts` | zap (short form -- may be epoch float) |
+| 4 | `@timestamp` | Elasticsearch/ECS, Logstash |
+| 5 | `datetime` | occasional custom usage |
+| 6 | `asctime` | Python stdlib logging |
+| 7 | `created` | Python stdlib (epoch float) |
+| 8 | `timeMillis` | Log4j2 (epoch millis integer) |
+
+### Additional Well-Known Fields
+
+These are not promoted to `LogEntry` struct fields but are extracted into the `fields` HashMap when present. The extractor checks each group in priority order.
+
+| Semantic Field | Candidate Names (priority order) |
+|---------------|----------------------------------|
+| caller/source | `caller`, `source`, `logger`, `logger_name`, `name` |
+| error | `error`, `err`, `exception`, `error.message` |
+| stack trace | `stack_trace`, `stacktrace`, `stack`, `error.stack_trace`, `exception.stacktrace` |
+| hostname | `hostname`, `host`, `host.name` |
+| PID | `pid`, `process`, `process.pid` |
+| service | `service`, `service.name`, `app`, `application` |
+| trace ID | `trace_id`, `traceId`, `trace.id`, `dd.trace_id` |
+| span ID | `span_id`, `spanId`, `span.id`, `dd.span_id` |
+| request ID | `request_id`, `requestId`, `req_id`, `x-request-id` |
 
 ---
 
 ## LogEntry Struct
 
-The universal log record. Everything downstream (filtering, search, display, export) works with this type.
+The universal log record. Everything downstream (filtering, search, display, export) works with this type. Must implement `Clone` (required by `tokio::broadcast`).
 
 ```rust
+#[derive(Clone, Debug)]
 pub struct LogEntry {
     /// The raw text of the record, exactly as captured from the process
     pub raw: String,
@@ -191,10 +240,95 @@ pub struct LogEntry {
 - **Timestamp is a raw string.** Parsing into DateTime is a future concern. Capture accurately first.
 - **`source` identifies the producing command.** Set by the execution layer, not by the parser/extractor.
 - **`seq` provides ordering.** Monotonic per source. Combined with source, gives a total order for composition.
+- **`Clone` is derived.** Required by `tokio::broadcast::Sender`. All fields (String, Option<String>, HashMap, ParsedContent) are Clone-able. `ParsedContent` must also derive Clone (serde_json::Value is Clone).
 
 ### Future: String Storage Optimization
 
-Currently `raw` is an owned `String`. With hundreds of thousands of entries, this means hundreds of thousands of small allocations. A future optimization could store raw output in a contiguous backing buffer and use byte-range references instead of owned strings. Not worth pursuing until it's a measured bottleneck — noting it here so the API doesn't preclude it.
+Currently `raw` is an owned `String`. With hundreds of thousands of entries, this means hundreds of thousands of small allocations. A future optimization could store raw output in a contiguous backing buffer and use byte-range references instead of owned strings. Not worth pursuing until it's a measured bottleneck -- noting it here so the API doesn't preclude it.
+
+---
+
+## Filter Expression Engine (Wave 2)
+
+### Syntax: Lucene/Datadog-style `key:value`
+
+Chosen for CLI ergonomics: colon is not a shell metacharacter, so simple queries need zero quoting. Only OR/AND with spaces need quoting.
+
+### Grammar
+
+```
+query       = expr (bool_op expr)*
+expr        = NOT expr | '(' query ')' | term
+bool_op     = AND | OR
+term        = '-'? field ':' value | '-'? bare_text
+field       = identifier ('.' identifier)*
+value       = comparison_value | regex_value | quoted_string | wildcard_string | bare_word
+```
+
+Where:
+- `comparison_value` = `>`, `>=`, `<`, `<=` followed by a number (e.g., `status:>400`)
+- `regex_value` = `/pattern/` (e.g., `message:/connect.*refused/`)
+- `quoted_string` = `"..."` for values containing spaces
+- `wildcard_string` = bare word containing `*` or `?`
+- `bare_text` without a field prefix is a full-text search across `raw` and `message`
+
+### Examples
+
+| Query | Meaning |
+|-------|---------|
+| `level:error` | Level equals "error" |
+| `level:error service:auth` | Implicit AND -- level is error AND service is auth |
+| `"level:error OR level:warn"` | Shell-quoted to allow OR |
+| `-level:debug` | Negation -- exclude debug level |
+| `message:/connect.*refused/` | Regex match on message field |
+| `status:>400` | Numeric comparison on status field |
+| `service:auth*` | Wildcard match |
+| `connection refused` | Full-text search (bare text, no field prefix) |
+| `level:error AND (service:auth OR service:api)` | Grouped boolean logic |
+
+### Field Resolution
+
+1. Well-known fields first: `level`, `message`, `timestamp`, `source`, `raw`
+2. Then `fields` HashMap lookup
+3. Dotted keys (e.g., `error.message`) traverse into nested `serde_json::Value` within the HashMap
+
+### AST Types
+
+```rust
+pub enum FilterExpr {
+    And(Box<FilterExpr>, Box<FilterExpr>),
+    Or(Box<FilterExpr>, Box<FilterExpr>),
+    Not(Box<FilterExpr>),
+    Term(FilterTerm),
+}
+
+pub struct FilterTerm {
+    pub negated: bool,
+    pub field: Option<FieldPath>,
+    pub matcher: Matcher,
+}
+
+pub struct FieldPath(pub Vec<String>);  // e.g., ["error", "message"]
+
+pub enum Matcher {
+    Exact(String),
+    Substring(String),
+    Regex(regex::Regex),
+    Comparison(CmpOp, f64),
+    Wildcard(String),  // compiled to regex internally
+}
+
+pub enum CmpOp { Gt, Gte, Lt, Lte }
+```
+
+### Parser: winnow v0.7
+
+Chosen over alternatives:
+- **chumsky** -- overkill for this grammar size, heavier dependency
+- **pest** -- requires separate grammar file, harder to iterate
+- **hand-rolled** -- more boilerplate for worse error messages
+
+winnow provides zero extra dependencies (it's self-contained), good error messages via `ContextError`, and is right-sized for this grammar (~200 lines of parser code).
 
 ---
 
@@ -203,6 +337,10 @@ Currently `raw` is an owned `String`. With hundreds of thousands of entries, thi
 The `Cmd` type (from Phase 3b) gains optional log engine configuration:
 
 ```rust
+// Internal storage on Cmd struct:
+// parser: Option<Box<dyn RecordParser>>,
+// extractor: Option<Box<dyn FieldExtractor>>,
+
 impl Cmd {
     /// Override the default parser chain for this command's output
     pub fn record_parser(self, parser: impl RecordParser + 'static) -> Self;
@@ -227,55 +365,106 @@ async fn run_weird_app(ctx: &TaskContext) -> TaskResult {
 }
 ```
 
+### Clone Handling
+
+Adding `Box<dyn RecordParser>` and `Box<dyn FieldExtractor>` to Cmd breaks `derive(Clone)`. Research confirms `Cmd` is only cloned in tests, never in production code (`exec`/`spawn` take `impl Into<Cmd>` and move). Two options:
+
+- **Option A (recommended):** Remove `derive(Clone)` from Cmd entirely. Fix the few test sites that clone.
+- **Option B:** Implement Clone manually, setting parser/extractor to None on clone.
+
+Decision: **Option A** -- removing derive(Clone). It's cleaner and the test impact is minimal.
+
+`From<&str>` and `From<Command>` conversions set parser and extractor to `None` (autodetect defaults).
+
+---
+
+## Integration Plan
+
+### Parser Lifecycle
+
+Each `exec()` / `spawn()` call gets its own parser instance. The parser is sourced from `Cmd` or falls back to the default chain.
+
+- `Cmd` carries `Option<Box<dyn RecordParser>>` and `Option<Box<dyn FieldExtractor>>`
+- In `exec()` / `spawn()`: extract the parser from Cmd (if present) or construct the default `FallbackParser`
+- Parser is constructed after `command.into()` but before spawning
+- Each call gets a fresh parser instance -- no sharing across calls
+
+### Field Extractor Lifecycle
+
+One per `exec()` / `spawn()` call. Sourced from `Cmd` or default `LayeredExtractor` with `CommonJsonFieldExtractor`.
+
+### OutputBuffer Migration
+
+`OutputBuffer` changes from `VecDeque<LogLine>` to `VecDeque<LogEntry>` and `broadcast::Sender<LogLine>` to `broadcast::Sender<LogEntry>`.
+
+**Complete use-site inventory:**
+
+| Location | Current Usage | Migration |
+|----------|--------------|-----------|
+| `process.rs:21-24` | `LogLine` enum definition | Replace with `use log::LogEntry` |
+| `process.rs:26-42` | `LogLine` impl | Remove (functionality moves to log module) |
+| `process.rs:91-142` | `OutputBuffer` (VecDeque + broadcast) | Change to `LogEntry` |
+| `process.rs:273,280` | `exec()` uses `LogLine::from_line()` for stdout | Use parser pipeline to produce `LogEntry` |
+| `process.rs:292,299` | `exec()` uses `LogLine::from_line()` for stderr | Use parser pipeline to produce `LogEntry` |
+| `process.rs:347,357` | `spawn()` uses `LogLine::from_line()` | Use parser pipeline to produce `LogEntry` |
+| `process.rs` tests | ~15 test functions reference LogLine | Update to use `LogEntry` |
+| `task.rs:81` | Returns `Vec<LogLine>` | Returns `Vec<LogEntry>` |
+| `prelude.rs:3` | Re-exports LogLine, OutputBuffer | Re-export LogEntry, OutputBuffer |
+| `signal.rs:108+` | Uses OutputBuffer in tests | No direct LogLine refs -- works after OutputBuffer change |
+
+### spawn() Buffer Isolation
+
+Current behavior: `spawn()` creates a separate buffer not connected to TaskContext (the buffer ref is dropped -- this is an existing bug). The separation is architecturally correct, but `ProcessHandle` should carry `Arc<Mutex<OutputBuffer>>` for access. Composition across sources is a log store concern (wave 2).
+
+### Migration Checklist
+
+1. Create `crates/runme/src/log/` module directory
+2. Create `log/mod.rs` -- shared types: `LogEntry`, `ParsedContent`, `RawRecord`, `ParseResult`, `ExtractedFields`
+3. Create `log/parse.rs` -- `RecordParser` trait, `FallbackParser`, `JsonlParser`, `RustPanicParser`, `CargoDiagnosticParser`, `LogfmtParser`, `PlainLineParser`
+4. Create `log/extract.rs` -- `FieldExtractor` trait, `LayeredExtractor`, `CommonJsonFieldExtractor`
+5. Add `mod log;` to `lib.rs`
+6. Add `Cmd` fields: `parser: Option<Box<dyn RecordParser>>`, `extractor: Option<Box<dyn FieldExtractor>>`
+7. Add `Cmd::record_parser()` and `Cmd::field_extractor()` builder methods
+8. Remove `derive(Clone)` from `Cmd`, fix affected test sites
+9. Update `From<&str>` and `From<Command>` impls to set parser/extractor to `None`
+10. Remove `LogLine` enum and its impl from `process.rs`
+11. Update `OutputBuffer` to use `LogEntry` instead of `LogLine`
+12. Update `exec()` to construct parser chain from Cmd, feed lines through pipeline, produce `LogEntry`
+13. Update `spawn()` similarly, ensure `ProcessHandle` carries `Arc<Mutex<OutputBuffer>>`
+14. Update `task.rs` return type from `Vec<LogLine>` to `Vec<LogEntry>`
+15. Update `prelude.rs` re-exports
+16. Migrate all existing tests to use `LogEntry`
+17. Add new tests for each parser, extractor, and combinator
+18. `cargo test --workspace` passes
+
 ---
 
 ## Presentation (Future Work)
 
-Multiple traits will be needed for presenting log data. Not designed yet — waiting until the data model is solid. Known concerns:
+Multiple traits will be needed for presenting log data. Not designed yet -- waiting until the data model is solid. Known concerns:
 
 - Rendering a single entry as text (terminal, export, JSON lines)
 - Rendering a stream/view (headers, separators, color, interleaving markers)
-- Summarizing (counts by level, by source — what agent mode would want)
+- Summarizing (counts by level, by source -- what agent mode would want)
 - Diffing/highlighting (what changed between runs)
 
 The `LogEntry` struct should carry enough information to support all of these. If we discover it doesn't, that's a signal to revisit the struct.
 
 ---
 
-## Open Questions for Research
-
-### For log-format-researcher:
-1. What JSON field name mappings are most common? Build a table across Node, Go, Python, Rust/tracing, Java ecosystems.
-2. How common is logfmt in practice? Worth a wave 1 parser?
-3. What multiline patterns are worth recognizing? (Rust panics, Python tracebacks, Java stack traces, cargo diagnostics)
-4. Are there formats beyond JSON/logfmt/plain-text that a dev tool encounters regularly?
-
-### For filter-syntax-researcher:
-1. Given that filters operate on `LogEntry` (well-known fields + arbitrary `fields` map), what syntax is most ergonomic for CLI usage?
-2. How should nested field access work for the `fields` HashMap? (dot notation? bracket notation?)
-3. What Rust parsing crate (if any) is appropriate, or is hand-rolled better for this scope?
-
-### For codebase-researcher:
-1. How should `RecordParser` state be managed per-command within a task? (Each `exec()` call gets its own parser instance? Shared across the task?)
-2. Where does the parser chain get constructed? In `exec()`/`spawn()` from the Cmd's hints + defaults?
-3. How does the spawn() buffer isolation map to this new architecture? Does `spawn()` feed into the same log store as `exec()`?
-4. What's the minimal change to `OutputBuffer` to store `LogEntry` instead of `LogLine`?
-
----
-
-## Module Layout (Proposed)
+## Module Layout
 
 ```
 crates/runme/src/
-├── log/
-│   ├── mod.rs          — re-exports, LogEntry struct
-│   ├── parse.rs        — RecordParser trait, FallbackParser, built-in parsers
-│   ├── extract.rs      — FieldExtractor trait, LayeredExtractor, built-in extractors
-│   ├── filter.rs       — filter expression engine (wave 2)
-│   ├── store.rs        — log store, multi-source composition (wave 2)
-│   ├── search.rs       — full-text search, context windows (wave 2)
-│   └── stream.rs       — re-streaming, export (wave 3)
-├── ...existing files...
++-- log/
+|   +-- mod.rs          -- LogEntry, ParsedContent, RawRecord, ParseResult, ExtractedFields
+|   +-- parse.rs        -- RecordParser trait, FallbackParser, built-in parsers
+|   +-- extract.rs      -- FieldExtractor trait, LayeredExtractor, CommonJsonFieldExtractor
+|   +-- filter.rs       -- filter expression engine (wave 2)
+|   +-- store.rs        -- log store, multi-source composition (wave 2)
+|   +-- search.rs       -- full-text search, context windows (wave 2)
+|   +-- stream.rs       -- re-streaming, export (wave 3)
++-- ...existing files...
 ```
 
-`LogLine` in process.rs is replaced by the new `LogEntry` type. `OutputBuffer` either evolves to hold `LogEntry` or is wrapped by the log store.
+`LogLine` in process.rs is replaced by the new `LogEntry` type. `OutputBuffer` evolves to hold `LogEntry`.

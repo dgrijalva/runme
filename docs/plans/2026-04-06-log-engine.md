@@ -79,7 +79,7 @@ Research (parallel)
 
 - [ ] Draft
 - [ ] Approved
-- [ ] Research complete
+- [x] Research complete
 - [ ] Design synthesis complete
 - [ ] Wave 1: Parsing pipeline
 - [ ] Wave 2: Filter engine, log store, search
@@ -428,10 +428,53 @@ validation:
 | String storage optimization deferred | Owned strings for now. Arena/range-reference approach noted for future if allocation pressure becomes measurable. | 2026-04-06 |
 | Presentation traits are future work | Multiple concerns (rendering, summarizing, diffing). Design once data model is proven. | 2026-04-06 |
 | Simple data structures, optimize later | Linear scans for filter/search. Dev tool session volume (~100k lines) doesn't warrant upfront indexing. | 2026-04-06 |
+| Wave 1 parsers: JsonlParser, RustPanicParser, CargoDiagnosticParser, LogfmtParser, PlainLineParser | Research confirmed logfmt is second most common structured format. Rust panic and cargo diagnostic patterns are well-defined. Python/Java/Go/Node multiline deferred to wave 2. | 2026-04-06 |
+| Filter syntax: Lucene/Datadog-style key:value | Colon not a shell metacharacter, zero quoting for simple queries. Matches muscle memory from Datadog, Kibana, Grafana. | 2026-04-06 |
+| Filter parser: winnow v0.7 | Zero extra dependencies, good error messages, right-sized (~200 lines). Preferred over chumsky (overkill), pest (grammar file), hand-rolled (worse errors). | 2026-04-06 |
+| ParsedContent gains Logfmt variant | Logfmt is common enough to warrant first-class representation. Same field extractor works for both JSON and logfmt. | 2026-04-06 |
+| Remove derive(Clone) from Cmd | Box<dyn RecordParser> and Box<dyn FieldExtractor> are not Clone. Cmd is only cloned in tests. Cleaner than manual Clone impl. | 2026-04-06 |
+| LogEntry derives Clone | Required by tokio::broadcast::Sender. All fields are Clone-able. | 2026-04-06 |
+| Additional well-known fields go in HashMap, not struct | caller, error, stack_trace, hostname, pid, service, trace_id, span_id, request_id are useful but not universal enough for struct fields. | 2026-04-06 |
+| Anomaly detection in JsonlParser | Non-JSON in an otherwise-JSON stream is flagged with _anomalous field. Signals panics, misconfigurations, or debug output. | 2026-04-06 |
+| spawn() ProcessHandle carries Arc<Mutex<OutputBuffer>> | Fixes existing bug where buffer ref is dropped. Composition across sources is wave 2 (log store). | 2026-04-06 |
 
 ## Findings
 
-(Populated during research phase)
+### Log Format Research (log-format-researcher)
+
+**JSON field name mappings:** Comprehensive priority-ordered lookup tables built for level (8 candidates), message (5 candidates), and timestamp (8 candidates), covering 12+ libraries: pino, winston, bunyan, zap, zerolog, logrus, structlog, Python stdlib, tracing-subscriber, SLF4J/Logback, Log4j2. Full tables are in the design doc under "Field Name Mapping Table."
+
+**Logfmt prevalence:** Second most common structured format after JSON. Heavily used in Go (slog TextHandler), Heroku/12-factor apps, and cloud-native tooling. Parser is simple (split on spaces, split on `=`, handle quoted values). Same field name mapping table works for extraction. Recommended for wave 1.
+
+**Multiline patterns:** Rust panic and cargo diagnostic patterns are well-defined with clear start/continuation/end heuristics -- recommended for wave 1. Python tracebacks, Java stack traces, Go panics, and Node.js errors were cataloged but deferred to wave 2.
+
+**Anomaly detection:** When JsonlParser has seen >3 JSON lines and encounters non-JSON, flag with `_anomalous: true` and `_anomaly_reason` in the fields HashMap.
+
+**Additional well-known fields:** Nine semantic field groups identified for extraction into the fields HashMap (not as struct fields): caller/source, error, stack_trace, hostname, PID, service, trace_id, span_id, request_id -- each with multiple common name variations.
+
+### Filter Syntax Research (filter-syntax-researcher)
+
+**Recommended syntax:** Lucene/Datadog-style `key:value`. Colon is not a shell metacharacter, so simple queries (`level:error`) need zero quoting. Full grammar defined with AND/OR/NOT, negation via `-` prefix, regex via `/pattern/`, numeric comparisons via `>`, `>=`, `<`, `<=`, wildcard via `*`/`?`, and bare text for full-text search.
+
+**AST types:** `FilterExpr` (And/Or/Not/Term), `FilterTerm` (negated, optional field path, matcher), `Matcher` (Exact/Substring/Regex/Comparison/Wildcard).
+
+**Parser choice:** winnow v0.7 -- zero dependencies, good error messages via ContextError, right-sized for this grammar (~200 lines). Preferred over chumsky (overkill), pest (grammar file overhead), and hand-rolled (more boilerplate for worse errors).
+
+**Field resolution:** well-known fields first, then fields HashMap, dotted keys traverse into nested serde_json::Value.
+
+### Codebase Integration Research (codebase-researcher)
+
+**Parser lifecycle:** Option (a) chosen -- Cmd carries optional `Box<dyn RecordParser>`, exec/spawn extracts or falls back to default. Each call gets its own parser instance. Parser constructed after `command.into()` but before spawning.
+
+**Field extractor lifecycle:** One per exec/spawn call, sourced from Cmd or default.
+
+**OutputBuffer migration:** Complete use-site inventory mapped across process.rs (~15 test functions, exec/spawn callsites at specific line numbers), task.rs, prelude.rs, signal.rs. LogEntry must implement Clone for tokio::broadcast compatibility.
+
+**Cmd extension:** Adding `Box<dyn RecordParser>` + `Box<dyn FieldExtractor>` breaks derive(Clone). Cmd is only cloned in tests, not production code. Recommendation: remove derive(Clone) from Cmd.
+
+**spawn() buffer isolation:** Current spawn() creates a separate buffer (existing bug -- ref is dropped). Separation is correct; ProcessHandle should carry `Arc<Mutex<OutputBuffer>>` for access. Composition is a log store concern (wave 2).
+
+**Module layout confirmed:** `crates/runme/src/log/` with mod.rs (shared types), parse.rs, extract.rs, filter.rs, store.rs, search.rs, stream.rs. 18-step migration checklist provided.
 
 ## Blockers
 
