@@ -7,6 +7,10 @@
 use std::fmt;
 
 use regex::Regex;
+use winnow::combinator::{alt, opt};
+use winnow::error::{ContextError, StrContext, StrContextValue};
+use winnow::token::{any, take_while};
+use winnow::Parser;
 
 use super::LogEntry;
 
@@ -79,17 +83,17 @@ pub fn parse(input: &str) -> Result<FilterExpr, String> {
         return Err("empty filter expression".to_string());
     }
     let mut stream = input;
-    match parse_query(&mut stream) {
-        Ok(expr) => {
+    query
+        .parse_next(&mut stream)
+        .map_err(|e| format!("parse error: {}", e))
+        .and_then(|expr| {
             let remaining = stream.trim();
-            if !remaining.is_empty() {
-                Err(format!("unexpected trailing input: {:?}", remaining))
-            } else {
+            if remaining.is_empty() {
                 Ok(expr)
+            } else {
+                Err(format!("unexpected trailing input: {:?}", remaining))
             }
-        }
-        Err(msg) => Err(format!("parse error: {}", msg)),
-    }
+        })
 }
 
 /// Evaluate a filter expression against a log entry.
@@ -261,135 +265,165 @@ fn regex_syntax_needs_escape(c: char) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Parser (hand-rolled recursive descent, using winnow error types for
-// descriptive error messages)
+// Parser (winnow v0.7)
 // ---------------------------------------------------------------------------
 
-/// Parse a query: `or_expr`
-fn parse_query(input: &mut &str) -> Result<FilterExpr, String> {
-    parse_or_expr(input)
+type PResult<T> = winnow::Result<T, ContextError>;
+
+/// Skip horizontal whitespace.
+fn ws(input: &mut &str) -> PResult<()> {
+    take_while(0.., ' ').void().parse_next(input)
 }
 
-/// Handle OR precedence: `and_expr (OR and_expr)*`
-fn parse_or_expr(input: &mut &str) -> Result<FilterExpr, String> {
-    let mut left = parse_and_expr(input)?;
+/// Try to consume a keyword with word-boundary check. Returns true if consumed.
+fn try_keyword(input: &mut &str, kw: &str) -> bool {
+    if let Some(rest) = input.strip_prefix(kw)
+        && (rest.is_empty() || !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+    {
+        *input = rest;
+        return true;
+    }
+    false
+}
+
+/// Peek at whether a keyword is next (without consuming).
+fn peek_keyword(input: &str, kw: &str) -> bool {
+    input.strip_prefix(kw).is_some_and(|rest| {
+        rest.is_empty() || !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// Parse an escaped string body up to `delimiter`, handling `\x` escapes.
+fn escaped_body(input: &mut &str, delimiter: char) -> PResult<String> {
+    let mut result = String::new();
     loop {
-        skip_spaces(input);
-        if input.starts_with("OR ") || input.starts_with("OR)") {
-            // Consume "OR"
-            *input = &input[2..];
-            skip_spaces(input);
-            let right = parse_and_expr(input)?;
-            left = FilterExpr::Or(Box::new(left), Box::new(right));
-        } else if *input == "OR" {
-            // "OR" at end of input with nothing after
-            return Err("expected expression after OR".to_string());
-        } else {
+        let chunk: &str =
+            take_while(0.., |c: char| c != delimiter && c != '\\').parse_next(input)?;
+        result.push_str(chunk);
+        if input.is_empty() || input.starts_with(delimiter) {
             break;
         }
+        // Consume backslash + next char
+        '\\'.parse_next(input)?;
+        if !input.is_empty() {
+            result.push(any.parse_next(input)?);
+        }
     }
-    Ok(left)
+    Ok(result)
 }
 
-/// Handle AND precedence and implicit AND: `unary_expr ((AND)? unary_expr)*`
-fn parse_and_expr(input: &mut &str) -> Result<FilterExpr, String> {
-    let mut left = parse_unary_expr(input)?;
-    loop {
-        skip_spaces(input);
-        if input.is_empty() || input.starts_with(')') {
-            break;
-        }
-        // Check for OR -- if we see OR, let the caller handle it
-        if input.starts_with("OR ") || input.starts_with("OR)") || *input == "OR" {
-            break;
-        }
-        // Explicit AND
-        if input.starts_with("AND ") || input.starts_with("AND)") {
-            *input = &input[3..];
-            skip_spaces(input);
-        } else if *input == "AND" {
-            return Err("expected expression after AND".to_string());
-        }
-        // Check again after consuming AND
-        if input.is_empty() || input.starts_with(')') {
-            break;
-        }
-        if input.starts_with("OR ") || input.starts_with("OR)") || *input == "OR" {
-            break;
-        }
-        let right = parse_unary_expr(input)?;
-        left = FilterExpr::And(Box::new(left), Box::new(right));
-    }
-    Ok(left)
+// -- Leaf parsers (values) --------------------------------------------------
+
+/// Parse a comparison operator: `>=`, `>`, `<=`, `<`.
+fn cmp_op(input: &mut &str) -> PResult<CmpOp> {
+    alt((
+        ">=".value(CmpOp::Gte),
+        "<=".value(CmpOp::Lte),
+        ">".value(CmpOp::Gt),
+        "<".value(CmpOp::Lt),
+    ))
+    .parse_next(input)
 }
 
-/// Handle NOT prefix and parenthesized groups: `NOT expr | '(' query ')' | term`
-fn parse_unary_expr(input: &mut &str) -> Result<FilterExpr, String> {
-    skip_spaces(input);
-    if input.starts_with("NOT ") || input.starts_with("NOT(") {
-        *input = &input[3..];
-        skip_spaces(input);
-        let inner = parse_unary_expr(input)?;
-        return Ok(FilterExpr::Not(Box::new(inner)));
-    }
-    if input.starts_with('(') {
-        *input = &input[1..];
-        skip_spaces(input);
-        let inner = parse_query(input)?;
-        skip_spaces(input);
-        if input.starts_with(')') {
-            *input = &input[1..];
-        } else {
-            return Err("expected closing parenthesis ')'".to_string());
-        }
-        return Ok(inner);
-    }
-    parse_term_expr(input)
+/// Parse a comparison value: `>400`, `>=3.5`, `<-1`.
+fn comparison(input: &mut &str) -> PResult<Matcher> {
+    let op = cmp_op.parse_next(input)?;
+    let num_str: &str = take_while(1.., |c: char| c.is_ascii_digit() || c == '.' || c == '-')
+        .context(StrContext::Expected(StrContextValue::Description(
+            "number after comparison operator",
+        )))
+        .parse_next(input)?;
+    let num: f64 = num_str.parse().map_err(|_| {
+        let mut e = ContextError::new();
+        e.push(StrContext::Expected(StrContextValue::Description(
+            "valid number",
+        )));
+        e
+    })?;
+    Ok(Matcher::Comparison(op, num))
 }
 
-/// Parse a single term: `'-'? field ':' value | '-'? bare_text`
-fn parse_term_expr(input: &mut &str) -> Result<FilterExpr, String> {
-    skip_spaces(input);
+/// Parse a regex value: `/pattern/`.
+fn regex_value(input: &mut &str) -> PResult<Matcher> {
+    '/'.parse_next(input)?;
+    let pattern = escaped_body(input, '/')?;
+    '/'.context(StrContext::Expected(StrContextValue::Description("closing '/'")))
+        .parse_next(input)?;
+    Regex::new(&pattern).map(Matcher::Regex).map_err(|_| {
+        let mut e = ContextError::new();
+        e.push(StrContext::Expected(StrContextValue::Description(
+            "valid regex pattern",
+        )));
+        e
+    })
+}
 
-    if input.is_empty() {
-        return Err("expected filter term".to_string());
-    }
+/// Parse a quoted string: `"..."`.
+fn quoted_string(input: &mut &str) -> PResult<Matcher> {
+    '"'.parse_next(input)?;
+    let value = escaped_body(input, '"')?;
+    '"'.context(StrContext::Expected(StrContextValue::Description(
+        "closing '\"'",
+    )))
+    .parse_next(input)?;
+    Ok(Matcher::Exact(value))
+}
 
-    // Check for negation prefix.
-    let negated = if input.starts_with('-') {
-        *input = &input[1..];
-        true
+/// Parse a bare word (non-space, non-paren chars). Returns the word as a Matcher.
+fn bare_value(input: &mut &str) -> PResult<Matcher> {
+    let word: &str =
+        take_while(1.., |c: char| c != ' ' && c != ')' && c != '(').parse_next(input)?;
+    Ok(if word.contains('*') || word.contains('?') {
+        Matcher::Wildcard(word.to_string())
     } else {
-        false
-    };
+        Matcher::Substring(word.to_string())
+    })
+}
 
-    // Try to parse as field:value first.
-    if let Some(colon_pos) = find_field_colon(input) {
-        let field_str = &input[..colon_pos];
-        if !field_str.is_empty() && is_valid_field(field_str) {
-            let field = parse_field_path(field_str);
-            *input = &input[colon_pos + 1..];
-            let matcher = parse_value(input)?;
-            return Ok(FilterExpr::Term(FilterTerm {
-                negated,
-                field: Some(field),
-                matcher,
-            }));
-        }
+/// Parse a value after `field:` — first character determines the value type.
+fn value_matcher(input: &mut &str) -> PResult<Matcher> {
+    match input.chars().next() {
+        None => Err(ContextError::new()),
+        Some('>' | '<') => comparison(input),
+        Some('/') => regex_value(input),
+        Some('"') => quoted_string(input),
+        Some(_) => bare_value(input),
+    }
+}
+
+// -- Term parser ------------------------------------------------------------
+
+/// Characters valid in a field name.
+fn is_field_char(c: char) -> bool {
+    c.is_alphanumeric() || "_.-@".contains(c)
+}
+
+/// Parse a single term: `'-'? field ':' value` or `'-'? bare_text`.
+fn term_expr(input: &mut &str) -> PResult<FilterExpr> {
+    ws.parse_next(input)?;
+    let negated = opt('-').parse_next(input)?.is_some();
+    let saved = *input;
+
+    // Try field:value — scan for colon within field-valid characters
+    let field_name: &str = take_while(0.., is_field_char).parse_next(input)?;
+    if !field_name.is_empty()
+        && !matches!(field_name, "AND" | "OR" | "NOT")
+        && opt(':').parse_next(input)?.is_some()
+    {
+        let field = FieldPath(field_name.split('.').map(String::from).collect());
+        let matcher = value_matcher
+            .context(StrContext::Label("value after ':'"))
+            .parse_next(input)?;
+        return Ok(FilterExpr::Term(FilterTerm {
+            negated,
+            field: Some(field),
+            matcher,
+        }));
     }
 
-    // Fall through to bare text.
-    let text = parse_bare_word(input);
-    if text.is_empty() {
-        return Err("expected filter term".to_string());
-    }
-
-    let matcher = if contains_wildcard(&text) {
-        Matcher::Wildcard(text)
-    } else {
-        Matcher::Substring(text)
-    };
-
+    // Not field:value — backtrack and parse as bare text
+    *input = saved;
+    let matcher = bare_value.parse_next(input)?;
     Ok(FilterExpr::Term(FilterTerm {
         negated,
         field: None,
@@ -397,208 +431,66 @@ fn parse_term_expr(input: &mut &str) -> Result<FilterExpr, String> {
     }))
 }
 
-/// Find the position of the colon that separates field from value.
-fn find_field_colon(input: &str) -> Option<usize> {
-    for (i, ch) in input.char_indices() {
-        if ch == ':' {
-            return Some(i);
-        }
-        if ch == ' ' || ch == '(' || ch == ')' {
-            return None;
-        }
-        if !is_field_char(ch) {
-            return None;
-        }
+// -- Expression parsers (precedence climbing) -------------------------------
+
+/// NOT prefix, parenthesized group, or term.
+fn unary_expr(input: &mut &str) -> PResult<FilterExpr> {
+    ws.parse_next(input)?;
+    if try_keyword(input, "NOT") {
+        ws.parse_next(input)?;
+        let inner = unary_expr.parse_next(input)?;
+        return Ok(FilterExpr::Not(Box::new(inner)));
     }
-    None
+    if opt('(').parse_next(input)?.is_some() {
+        ws.parse_next(input)?;
+        let inner = query.parse_next(input)?;
+        ws.parse_next(input)?;
+        ')'.context(StrContext::Expected(StrContextValue::CharLiteral(')')))
+            .parse_next(input)?;
+        return Ok(inner);
+    }
+    term_expr.parse_next(input)
 }
 
-/// Check if a character is valid in a field name.
-fn is_field_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_' || c == '.' || c == '-' || c == '@'
-}
-
-/// Check if a string is a valid field name (not a keyword).
-fn is_valid_field(s: &str) -> bool {
-    if s == "AND" || s == "OR" || s == "NOT" {
-        return false;
-    }
-    s.chars().all(is_field_char)
-}
-
-/// Parse a dotted field path string into a FieldPath.
-fn parse_field_path(s: &str) -> FieldPath {
-    FieldPath(s.split('.').map(|seg| seg.to_string()).collect())
-}
-
-/// Parse a value after the colon in a field:value term.
-fn parse_value(input: &mut &str) -> Result<Matcher, String> {
-    if input.is_empty() {
-        return Err("expected value after ':'".to_string());
-    }
-
-    // Comparison value: >=, >, <=, <
-    if input.starts_with(">=")
-        || input.starts_with('>')
-        || input.starts_with("<=")
-        || input.starts_with('<')
-    {
-        return parse_comparison(input);
-    }
-
-    // Regex value: /pattern/
-    if input.starts_with('/') {
-        return parse_regex(input);
-    }
-
-    // Quoted string: "..."
-    if input.starts_with('"') {
-        return parse_quoted_string(input);
-    }
-
-    // Bare word (may contain wildcards).
-    let word = parse_bare_word(input);
-    if word.is_empty() {
-        return Err("expected value".to_string());
-    }
-
-    if contains_wildcard(&word) {
-        Ok(Matcher::Wildcard(word))
-    } else {
-        Ok(Matcher::Substring(word))
-    }
-}
-
-/// Parse a comparison value: `>N`, `>=N`, `<N`, `<=N`.
-fn parse_comparison(input: &mut &str) -> Result<Matcher, String> {
-    let (op, skip) = if input.starts_with(">=") {
-        (CmpOp::Gte, 2)
-    } else if input.starts_with('>') {
-        (CmpOp::Gt, 1)
-    } else if input.starts_with("<=") {
-        (CmpOp::Lte, 2)
-    } else {
-        (CmpOp::Lt, 1)
-    };
-    *input = &input[skip..];
-
-    let num_str = parse_number_str(input);
-    if num_str.is_empty() {
-        return Err("expected number after comparison operator".to_string());
-    }
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid number: {:?}", num_str))?;
-    Ok(Matcher::Comparison(op, num))
-}
-
-/// Parse a number string (digits, optional decimal point, optional leading minus).
-fn parse_number_str(input: &mut &str) -> String {
-    let mut result = String::new();
-    let mut seen_dot = false;
-
-    // Optional leading minus for negative numbers.
-    if input.starts_with('-') {
-        result.push('-');
-        *input = &input[1..];
-    }
-
-    while let Some(ch) = input.chars().next() {
-        if ch.is_ascii_digit() {
-            result.push(ch);
-            *input = &input[ch.len_utf8()..];
-        } else if ch == '.' && !seen_dot {
-            seen_dot = true;
-            result.push(ch);
-            *input = &input[1..];
-        } else {
-            break;
-        }
-    }
-    result
-}
-
-/// Parse a regex value: `/pattern/`.
-fn parse_regex(input: &mut &str) -> Result<Matcher, String> {
-    // Consume opening '/'.
-    *input = &input[1..];
-    let mut pattern = String::new();
-    let mut escaped = false;
-
+/// AND precedence (explicit `AND` or implicit juxtaposition).
+fn and_expr(input: &mut &str) -> PResult<FilterExpr> {
+    let mut left = unary_expr.parse_next(input)?;
     loop {
-        if input.is_empty() {
-            return Err("expected closing '/' for regex".to_string());
-        }
-        let ch = input.chars().next().unwrap();
-        *input = &input[ch.len_utf8()..];
-
-        if escaped {
-            pattern.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            pattern.push(ch);
-            escaped = true;
-        } else if ch == '/' {
+        ws.parse_next(input)?;
+        if input.is_empty() || input.starts_with(')') || peek_keyword(input, "OR") {
             break;
-        } else {
-            pattern.push(ch);
         }
+        let _ = try_keyword(input, "AND"); // optional explicit AND
+        ws.parse_next(input)?;
+        if input.is_empty() || input.starts_with(')') || peek_keyword(input, "OR") {
+            break;
+        }
+        let right = unary_expr.parse_next(input)?;
+        left = FilterExpr::And(Box::new(left), Box::new(right));
     }
-
-    Regex::new(&pattern).map(Matcher::Regex).map_err(|e| {
-        format!("invalid regex /{}/: {}", pattern, e)
-    })
+    Ok(left)
 }
 
-/// Parse a quoted string: `"..."`.
-fn parse_quoted_string(input: &mut &str) -> Result<Matcher, String> {
-    // Consume opening '"'.
-    *input = &input[1..];
-    let mut value = String::new();
-    let mut escaped = false;
-
+/// OR precedence: `and_expr ("OR" and_expr)*`.
+fn or_expr(input: &mut &str) -> PResult<FilterExpr> {
+    let mut left = and_expr.parse_next(input)?;
     loop {
-        if input.is_empty() {
-            return Err("expected closing '\"' for quoted string".to_string());
-        }
-        let ch = input.chars().next().unwrap();
-        *input = &input[ch.len_utf8()..];
-
-        if escaped {
-            value.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            break;
-        } else {
-            value.push(ch);
-        }
-    }
-    Ok(Matcher::Exact(value))
-}
-
-/// Parse a bare word (no spaces, no parens).
-fn parse_bare_word(input: &mut &str) -> String {
-    let mut word = String::new();
-    while let Some(ch) = input.chars().next() {
-        if ch == ' ' || ch == ')' || ch == '(' {
+        ws.parse_next(input)?;
+        if !try_keyword(input, "OR") {
             break;
         }
-        word.push(ch);
-        *input = &input[ch.len_utf8()..];
+        ws.parse_next(input)?;
+        let right = and_expr
+            .context(StrContext::Label("expression after OR"))
+            .parse_next(input)?;
+        left = FilterExpr::Or(Box::new(left), Box::new(right));
     }
-    word
+    Ok(left)
 }
 
-/// Check if a string contains wildcard characters.
-fn contains_wildcard(s: &str) -> bool {
-    s.contains('*') || s.contains('?')
-}
-
-/// Skip whitespace.
-fn skip_spaces(input: &mut &str) {
-    *input = input.trim_start();
+/// Top-level query entry point.
+fn query(input: &mut &str) -> PResult<FilterExpr> {
+    or_expr.parse_next(input)
 }
 
 // ---------------------------------------------------------------------------
