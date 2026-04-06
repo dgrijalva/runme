@@ -8,13 +8,15 @@ use tokio::task::JoinSet;
 use crate::cmd::Cmd;
 use crate::error::TaskError;
 use crate::log::LogEntry;
-use crate::process::{self, ExecOutput, OutputBuffer, ProcessError, ProcessHandle};
+use crate::log::buffer::OutputBuffer;
+use crate::process::{self, ExecOutput, ProcessError, ProcessHandle};
 
 /// The type of async task functions.
 ///
 /// Task functions are `async fn(&TaskContext) -> Result<(), TaskError>` — this
 /// type alias represents that as a function pointer returning a boxed future.
-pub type TaskFn = fn(&TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>>;
+pub type TaskFn =
+    fn(&TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>>;
 
 /// Task metadata — what the macro extracts and registers.
 ///
@@ -84,7 +86,6 @@ impl TaskContext {
         buffer.lines().iter().cloned().collect()
     }
 }
-
 
 /// Collects and looks up tasks.
 pub struct Registry {
@@ -180,14 +181,18 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn dummy_task(ctx: &TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+    fn dummy_task(
+        ctx: &TaskContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
         Box::pin(async move {
             println!("Running dummy task: {}", ctx.name);
             Ok(())
         })
     }
 
-    fn another_task(ctx: &TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+    fn another_task(
+        ctx: &TaskContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
         Box::pin(async move {
             println!("Running another task: {}", ctx.name);
             Ok(())
@@ -279,14 +284,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_parallel() {
-        fn task_a(ctx: &TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+        fn task_a(
+            ctx: &TaskContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
             Box::pin(async move {
                 println!("parallel task A: {}", ctx.name);
                 Ok(())
             })
         }
 
-        fn task_b(ctx: &TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+        fn task_b(
+            ctx: &TaskContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
             Box::pin(async move {
                 println!("parallel task B: {}", ctx.name);
                 Ok(())

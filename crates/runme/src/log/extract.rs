@@ -94,13 +94,7 @@ impl CommonJsonFieldExtractor {
     ];
 
     /// Message field candidates (priority order).
-    const MESSAGE_FIELDS: &'static [&'static str] = &[
-        "msg",
-        "message",
-        "event",
-        "text",
-        "body",
-    ];
+    const MESSAGE_FIELDS: &'static [&'static str] = &["msg", "message", "event", "text", "body"];
 
     /// Timestamp field candidates (priority order).
     const TIMESTAMP_FIELDS: &'static [&'static str] = &[
@@ -116,15 +110,36 @@ impl CommonJsonFieldExtractor {
 
     /// Additional well-known field groups: (semantic name, candidate field names).
     const ADDITIONAL_FIELDS: &'static [(&'static str, &'static [&'static str])] = &[
-        ("caller", &["caller", "source", "logger", "logger_name", "name"]),
+        (
+            "caller",
+            &["caller", "source", "logger", "logger_name", "name"],
+        ),
         ("error", &["error", "err", "exception", "error.message"]),
-        ("stack_trace", &["stack_trace", "stacktrace", "stack", "error.stack_trace", "exception.stacktrace"]),
+        (
+            "stack_trace",
+            &[
+                "stack_trace",
+                "stacktrace",
+                "stack",
+                "error.stack_trace",
+                "exception.stacktrace",
+            ],
+        ),
         ("hostname", &["hostname", "host", "host.name"]),
         ("pid", &["pid", "process", "process.pid"]),
-        ("service", &["service", "service.name", "app", "application"]),
-        ("trace_id", &["trace_id", "traceId", "trace.id", "dd.trace_id"]),
+        (
+            "service",
+            &["service", "service.name", "app", "application"],
+        ),
+        (
+            "trace_id",
+            &["trace_id", "traceId", "trace.id", "dd.trace_id"],
+        ),
         ("span_id", &["span_id", "spanId", "span.id", "dd.span_id"]),
-        ("request_id", &["request_id", "requestId", "req_id", "x-request-id"]),
+        (
+            "request_id",
+            &["request_id", "requestId", "req_id", "x-request-id"],
+        ),
     ];
 
     /// Look up a field by name in a JSON value. Handles dotted keys by
@@ -161,18 +176,22 @@ impl CommonJsonFieldExtractor {
     /// Convert Python levelno to level name.
     fn levelno_to_name(val: &serde_json::Value) -> Option<String> {
         let n = val.as_u64()?;
-        Some(match n {
-            0..=10 => "DEBUG",
-            11..=20 => "INFO",
-            21..=30 => "WARNING",
-            31..=40 => "ERROR",
-            41.. => "CRITICAL",
-        }.to_string())
+        Some(
+            match n {
+                0..=10 => "DEBUG",
+                11..=20 => "INFO",
+                21..=30 => "WARNING",
+                31..=40 => "ERROR",
+                41.. => "CRITICAL",
+            }
+            .to_string(),
+        )
     }
 
     /// Look up a field in logfmt key-value pairs.
     fn logfmt_get<'a>(pairs: &'a [(String, String)], field: &str) -> Option<&'a str> {
-        pairs.iter()
+        pairs
+            .iter()
             .find(|(k, _)| k == field)
             .map(|(_, v)| v.as_str())
     }
@@ -215,7 +234,8 @@ impl CommonJsonFieldExtractor {
         for &(semantic_name, candidates) in Self::ADDITIONAL_FIELDS {
             for &candidate in candidates {
                 if let Some(v) = Self::json_get(val, candidate) {
-                    fields.entry(semantic_name.to_string())
+                    fields
+                        .entry(semantic_name.to_string())
                         .or_insert_with(|| v.clone());
                     break;
                 }
@@ -239,13 +259,16 @@ impl CommonJsonFieldExtractor {
             if let Some(v) = Self::logfmt_get(pairs, field_name) {
                 if field_name == "levelno" {
                     if let Ok(n) = v.parse::<u64>() {
-                        level = Some(match n {
-                            0..=10 => "DEBUG",
-                            11..=20 => "INFO",
-                            21..=30 => "WARNING",
-                            31..=40 => "ERROR",
-                            41.. => "CRITICAL",
-                        }.to_string());
+                        level = Some(
+                            match n {
+                                0..=10 => "DEBUG",
+                                11..=20 => "INFO",
+                                21..=30 => "WARNING",
+                                31..=40 => "ERROR",
+                                41.. => "CRITICAL",
+                            }
+                            .to_string(),
+                        );
                     } else {
                         level = Some(v.to_string());
                     }
@@ -278,7 +301,8 @@ impl CommonJsonFieldExtractor {
         for &(semantic_name, candidates) in Self::ADDITIONAL_FIELDS {
             for &candidate in candidates {
                 if let Some(v) = Self::logfmt_get(pairs, candidate) {
-                    fields.entry(semantic_name.to_string())
+                    fields
+                        .entry(semantic_name.to_string())
                         .or_insert_with(|| serde_json::Value::String(v.to_string()));
                     break;
                 }
@@ -441,10 +465,7 @@ mod tests {
             fields.fields.get("hostname"),
             Some(&serde_json::Value::String("web-01".to_string()))
         );
-        assert_eq!(
-            fields.fields.get("pid"),
-            Some(&serde_json::json!(1234))
-        );
+        assert_eq!(fields.fields.get("pid"), Some(&serde_json::json!(1234)));
         assert_eq!(
             fields.fields.get("trace_id"),
             Some(&serde_json::Value::String("abc".to_string()))
@@ -536,10 +557,7 @@ mod tests {
             }
         }
 
-        let layered = LayeredExtractor::new(vec![
-            Box::new(ExtractorA),
-            Box::new(ExtractorB),
-        ]);
+        let layered = LayeredExtractor::new(vec![Box::new(ExtractorA), Box::new(ExtractorB)]);
 
         let record = RawRecord {
             raw: String::new(),
@@ -586,10 +604,7 @@ mod tests {
             }
         }
 
-        let layered = LayeredExtractor::new(vec![
-            Box::new(ExtractorA),
-            Box::new(ExtractorB),
-        ]);
+        let layered = LayeredExtractor::new(vec![Box::new(ExtractorA), Box::new(ExtractorB)]);
 
         let record = RawRecord {
             raw: String::new(),
@@ -598,10 +613,19 @@ mod tests {
 
         let fields = layered.extract(&record);
         // Both keys present
-        assert_eq!(fields.fields.get("key_a"), Some(&serde_json::json!("val_a")));
-        assert_eq!(fields.fields.get("key_b"), Some(&serde_json::json!("val_b")));
+        assert_eq!(
+            fields.fields.get("key_a"),
+            Some(&serde_json::json!("val_a"))
+        );
+        assert_eq!(
+            fields.fields.get("key_b"),
+            Some(&serde_json::json!("val_b"))
+        );
         // Shared key: first writer wins
-        assert_eq!(fields.fields.get("shared"), Some(&serde_json::json!("from_a")));
+        assert_eq!(
+            fields.fields.get("shared"),
+            Some(&serde_json::json!("from_a"))
+        );
     }
 
     // -- LogEntry construction --

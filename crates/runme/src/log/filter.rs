@@ -7,10 +7,10 @@
 use std::fmt;
 
 use regex::Regex;
+use winnow::Parser;
 use winnow::combinator::{alt, opt};
 use winnow::error::{ContextError, StrContext, StrContextValue};
 use winnow::token::{any, take_while};
-use winnow::Parser;
 
 use super::LogEntry;
 
@@ -347,8 +347,10 @@ fn comparison(input: &mut &str) -> PResult<Matcher> {
 fn regex_value(input: &mut &str) -> PResult<Matcher> {
     '/'.parse_next(input)?;
     let pattern = escaped_body(input, '/')?;
-    '/'.context(StrContext::Expected(StrContextValue::Description("closing '/'")))
-        .parse_next(input)?;
+    '/'.context(StrContext::Expected(StrContextValue::Description(
+        "closing '/'",
+    )))
+    .parse_next(input)?;
     Regex::new(&pattern).map(Matcher::Regex).map_err(|_| {
         let mut e = ContextError::new();
         e.push(StrContext::Expected(StrContextValue::Description(
@@ -558,9 +560,7 @@ mod tests {
             FilterExpr::Term(term) => {
                 assert!(!term.negated);
                 assert_eq!(term.field.as_ref().unwrap().0, vec!["level"]);
-                assert!(
-                    std::matches!(&term.matcher, Matcher::Substring(s) if s == "error")
-                );
+                assert!(std::matches!(&term.matcher, Matcher::Substring(s) if s == "error"));
             }
             _ => panic!("expected Term, got {:?}", expr),
         }
@@ -571,10 +571,7 @@ mod tests {
         let expr = parse("http.status:500").unwrap();
         match &expr {
             FilterExpr::Term(term) => {
-                assert_eq!(
-                    term.field.as_ref().unwrap().0,
-                    vec!["http", "status"]
-                );
+                assert_eq!(term.field.as_ref().unwrap().0, vec!["http", "status"]);
             }
             _ => panic!("expected Term"),
         }
@@ -740,8 +737,7 @@ mod tests {
 
     #[test]
     fn parse_complex_expression() {
-        let expr =
-            parse("level:error AND (service:auth OR service:api) -status:<200").unwrap();
+        let expr = parse("level:error AND (service:auth OR service:api) -status:<200").unwrap();
         // Should parse without error -- complex nested expression
         assert!(std::matches!(&expr, FilterExpr::And(_, _)));
     }
@@ -945,8 +941,7 @@ mod tests {
     #[test]
     fn eval_parenthesized_or() {
         let entry = make_rich_entry();
-        let expr =
-            parse("level:error AND (service:auth-api OR service:billing)").unwrap();
+        let expr = parse("level:error AND (service:auth-api OR service:billing)").unwrap();
         assert!(matches(&expr, &entry));
     }
 

@@ -119,10 +119,7 @@ fn cache_dir_for(hash_prefix: &str) -> Result<PathBuf, CompileError> {
 
 /// Get the expected binary path inside a cache directory.
 fn binary_path_in(cache_dir: &Path) -> PathBuf {
-    cache_dir
-        .join("target")
-        .join("debug")
-        .join("runme-script")
+    cache_dir.join("target").join("debug").join("runme-script")
 }
 
 /// Check if the cache is valid (marker file exists and matches the full hash).
@@ -135,11 +132,7 @@ fn is_cached(cache_dir: &Path, expected_hash: &str) -> bool {
 }
 
 /// Generate a Cargo project in the cache directory from the RUNME.rs source.
-fn generate_project(
-    cache_dir: &Path,
-    source: &str,
-    runme_file: &Path,
-) -> Result<(), CompileError> {
+fn generate_project(cache_dir: &Path, source: &str, runme_file: &Path) -> Result<(), CompileError> {
     // Determine the absolute path to the runme library crate
     let runme_lib_path = find_runme_lib_path(runme_file)?;
 
@@ -202,9 +195,7 @@ fn find_runme_lib_path(runme_file: &Path) -> Result<PathBuf, CompileError> {
     }
 
     // Fallback: walk up from the RUNME.rs file location
-    let start_dir = runme_file
-        .parent()
-        .ok_or(CompileError::NoLibPath)?;
+    let start_dir = runme_file.parent().ok_or(CompileError::NoLibPath)?;
     let mut search = start_dir.to_path_buf();
     loop {
         let candidate = search.join("crates").join("runme");
@@ -297,7 +288,10 @@ mod tests {
         let runme_lib = workspace_root.join("crates").join("runme");
         if !runme_lib.join("Cargo.toml").is_file() {
             // Skip test if we can't find the runme lib (CI or unusual layout)
-            eprintln!("Skipping test_compile_and_cache: runme lib not found at {:?}", runme_lib);
+            eprintln!(
+                "Skipping test_compile_and_cache: runme lib not found at {:?}",
+                runme_lib
+            );
             return;
         }
 
@@ -370,7 +364,11 @@ fn main() {{
         // First compile
         let result1 = compile(&runme_path).expect("first compile should succeed");
         assert!(!result1.was_cached, "first compile should not be cached");
-        assert!(result1.binary_path.exists(), "binary should exist after compile at {:?}", result1.binary_path);
+        assert!(
+            result1.binary_path.exists(),
+            "binary should exist after compile at {:?}",
+            result1.binary_path
+        );
 
         // Second compile -- should be cached
         let result2 = compile(&runme_path).expect("second compile should succeed");

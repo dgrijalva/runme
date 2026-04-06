@@ -2,8 +2,8 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::log::parse::RecordParser;
 use crate::log::extract::FieldExtractor;
+use crate::log::parse::RecordParser;
 
 /// A command to execute.
 ///
@@ -303,9 +303,7 @@ mod tests {
         let mut std_cmd = std::process::Command::new("cargo");
         std_cmd.arg("build");
 
-        let cmd = Cmd::from(std_cmd)
-            .env("EXTRA", "yes")
-            .cwd("./subdir");
+        let cmd = Cmd::from(std_cmd).env("EXTRA", "yes").cwd("./subdir");
         assert_eq!(cmd.envs().len(), 1);
         assert_eq!(cmd.get_cwd(), Some(Path::new("./subdir")));
     }
@@ -330,8 +328,8 @@ mod tests {
 
     #[test]
     fn test_record_parser_and_field_extractor() {
-        use crate::log::parse::PlainLineParser;
         use crate::log::extract::CommonJsonFieldExtractor;
+        use crate::log::parse::PlainLineParser;
 
         let cmd = Cmd::new("my-app")
             .record_parser(PlainLineParser)

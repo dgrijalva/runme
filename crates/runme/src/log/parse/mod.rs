@@ -220,7 +220,10 @@ mod tests {
     fn fallback_rust_panic_multiline() {
         let mut parser = default_parser();
         // First feed: just the panic line (no non-continuation line yet)
-        let r1 = parser.feed(b"thread 'main' panicked at 'oh no', src/main.rs:1:1\nstack backtrace:\n", false);
+        let r1 = parser.feed(
+            b"thread 'main' panicked at 'oh no', src/main.rs:1:1\nstack backtrace:\n",
+            false,
+        );
         assert!(matches!(r1, ParseResult::Incomplete));
 
         // Now add a non-continuation line -- this should trigger the record
@@ -242,11 +245,29 @@ mod tests {
 
         // JSON auto-detected
         let r1 = parser.feed(b"{\"msg\":\"hello\"}\n", false);
-        assert!(matches!(r1, ParseResult::Record(RawRecord { parsed: ParsedContent::Json(_), .. }, _)));
+        assert!(matches!(
+            r1,
+            ParseResult::Record(
+                RawRecord {
+                    parsed: ParsedContent::Json(_),
+                    ..
+                },
+                _
+            )
+        ));
 
         // Plain text fallback
         let r2 = parser.feed(b"plain line\n", false);
-        assert!(matches!(r2, ParseResult::Record(RawRecord { parsed: ParsedContent::PlainText, .. }, _)));
+        assert!(matches!(
+            r2,
+            ParseResult::Record(
+                RawRecord {
+                    parsed: ParsedContent::PlainText,
+                    ..
+                },
+                _
+            )
+        ));
     }
 
     // -- FallbackParser active parser tracking --
@@ -257,12 +278,16 @@ mod tests {
 
         // Feed incomplete data that triggers Incomplete from RustPanicParser
         // (after JsonlParser rejects it)
-        let r1 = parser.feed(b"thread 'main' panicked at 'oh no', src/main.rs:1:1\n", false);
+        let r1 = parser.feed(
+            b"thread 'main' panicked at 'oh no', src/main.rs:1:1\n",
+            false,
+        );
         assert!(matches!(r1, ParseResult::Incomplete));
 
         // The active parser should be the RustPanicParser.
         // Now feed more data with the continuation + non-continuation
-        let full = b"thread 'main' panicked at 'oh no', src/main.rs:1:1\nstack backtrace:\nnormal line\n";
+        let full =
+            b"thread 'main' panicked at 'oh no', src/main.rs:1:1\nstack backtrace:\nnormal line\n";
         let r2 = parser.feed(full, false);
         match r2 {
             ParseResult::Record(rec, consumed) => {
@@ -280,7 +305,10 @@ mod tests {
         let mut parser = default_parser();
 
         // Trigger Incomplete
-        let _ = parser.feed(b"thread 'main' panicked at 'oh no', src/main.rs:1:1\n", false);
+        let _ = parser.feed(
+            b"thread 'main' panicked at 'oh no', src/main.rs:1:1\n",
+            false,
+        );
 
         // Reset should clear active
         parser.reset();

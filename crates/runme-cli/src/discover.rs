@@ -69,7 +69,10 @@ fn walk_down(root_dir: &Path, exclude: &Path) -> Vec<PathBuf> {
     for entry in walker.flatten() {
         let path = entry.path();
         if path.is_file()
-            && path.file_name().map(|n| n == RUNME_FILENAME).unwrap_or(false)
+            && path
+                .file_name()
+                .map(|n| n == RUNME_FILENAME)
+                .unwrap_or(false)
             && path != exclude
         {
             children.push(path.to_path_buf());

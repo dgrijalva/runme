@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn, Meta, Expr, ExprLit, Lit, MetaNameValue, ReturnType};
+use syn::{Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, ReturnType, parse_macro_input};
 
 /// Attribute macro for defining a runme task.
 ///
@@ -46,7 +46,9 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             Meta::NameValue(MetaNameValue { path, value, .. }) => {
                 let key = path.get_ident().map(|i| i.to_string()).unwrap_or_default();
                 let val = match &value {
-                    Expr::Lit(ExprLit { lit: Lit::Str(s), .. }) => s.value(),
+                    Expr::Lit(ExprLit {
+                        lit: Lit::Str(s), ..
+                    }) => s.value(),
                     _ => {
                         return syn::Error::new_spanned(value, "expected string literal")
                             .to_compile_error()
@@ -60,9 +62,12 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                         depends_on = val.split(',').map(|s| s.trim().to_string()).collect();
                     }
                     other => {
-                        return syn::Error::new_spanned(path, format!("unknown attribute: {}", other))
-                            .to_compile_error()
-                            .into();
+                        return syn::Error::new_spanned(
+                            path,
+                            format!("unknown attribute: {}", other),
+                        )
+                        .to_compile_error()
+                        .into();
                     }
                 }
             }
@@ -81,7 +86,13 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             .iter()
             .filter_map(|attr| {
                 if attr.path().is_ident("doc")
-                    && let Meta::NameValue(MetaNameValue { value: Expr::Lit(ExprLit { lit: Lit::Str(s), .. }), .. }) = &attr.meta
+                    && let Meta::NameValue(MetaNameValue {
+                        value:
+                            Expr::Lit(ExprLit {
+                                lit: Lit::Str(s), ..
+                            }),
+                        ..
+                    }) = &attr.meta
                 {
                     return Some(s.value().trim().to_string());
                 }
@@ -114,10 +125,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     // Generate a wrapper function name for the TaskFn registration
-    let wrapper_name = syn::Ident::new(
-        &format!("__runme_taskfn_{}", fn_name),
-        fn_name.span(),
-    );
+    let wrapper_name = syn::Ident::new(&format!("__runme_taskfn_{}", fn_name), fn_name.span());
 
     // Detect whether the function has an explicit return type (Result) or returns ()
     let has_return_type = !matches!(input_fn.sig.output, ReturnType::Default);

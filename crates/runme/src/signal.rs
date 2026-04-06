@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use nix::sys::signal::Signal;
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
 
 use crate::process::ProcessHandle;
@@ -73,9 +73,12 @@ impl SignalHandler {
         let handler = self.clone();
 
         tokio::spawn(async move {
-            let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-            let mut sighup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sighup =
+                signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
 
             loop {
                 tokio::select! {
@@ -105,7 +108,8 @@ impl Default for SignalHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process::{self, OutputBuffer};
+    use crate::log::buffer::OutputBuffer;
+    use crate::process;
 
     #[tokio::test]
     async fn test_signal_handler_track_and_stop() {

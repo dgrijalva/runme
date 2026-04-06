@@ -137,8 +137,7 @@ pub fn export_raw(entries: &[LogEntry], writer: &mut impl Write) -> std::io::Res
 /// Requires `LogEntry` to implement `serde::Serialize`.
 pub fn export_jsonl(entries: &[LogEntry], writer: &mut impl Write) -> std::io::Result<()> {
     for entry in entries {
-        serde_json::to_writer(&mut *writer, entry)
-            .map_err(std::io::Error::other)?;
+        serde_json::to_writer(&mut *writer, entry).map_err(std::io::Error::other)?;
         writer.write_all(b"\n")?;
     }
     writer.flush()
@@ -176,8 +175,7 @@ pub async fn export_jsonl_async(
 ) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     for entry in entries {
-        let json = serde_json::to_vec(entry)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_vec(entry).map_err(std::io::Error::other)?;
         writer.write_all(&json).await?;
         writer.write_all(b"\n").await?;
     }
@@ -367,9 +365,8 @@ mod tests {
     async fn test_filtered_stream_by_level() {
         let (tx, _) = broadcast::channel::<LogEntry>(16);
         let rx = tx.subscribe();
-        let mut filtered = FilteredStream::new(rx, |e: &LogEntry| {
-            e.level.as_deref() == Some("error")
-        });
+        let mut filtered =
+            FilteredStream::new(rx, |e: &LogEntry| e.level.as_deref() == Some("error"));
 
         let _ = tx.send(make_entry_full("app", 0, "info msg", Some("info"), None));
         let _ = tx.send(make_entry_full("app", 1, "error msg", Some("error"), None));
@@ -384,8 +381,7 @@ mod tests {
     async fn test_filtered_stream_by_content() {
         let (tx, _) = broadcast::channel::<LogEntry>(16);
         let rx = tx.subscribe();
-        let mut filtered =
-            FilteredStream::new(rx, |e: &LogEntry| e.raw.contains("ERROR"));
+        let mut filtered = FilteredStream::new(rx, |e: &LogEntry| e.raw.contains("ERROR"));
 
         let _ = tx.send(make_entry("app", 0, "INFO: starting"));
         let _ = tx.send(make_entry("app", 1, "ERROR: disk full"));
@@ -489,10 +485,7 @@ mod tests {
 
     #[test]
     fn test_export_jsonl_basic() {
-        let entries = vec![
-            make_entry("app", 0, "hello"),
-            make_entry("app", 1, "world"),
-        ];
+        let entries = vec![make_entry("app", 0, "hello"), make_entry("app", 1, "world")];
 
         let mut output = Vec::new();
         export_jsonl(&entries, &mut output).unwrap();
@@ -656,7 +649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_integration_output_buffer_tail() {
-        use crate::process::OutputBuffer;
+        use crate::log::buffer::OutputBuffer;
 
         let mut buffer = OutputBuffer::new(100);
         // Subscribe via tail()
@@ -670,13 +663,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_integration_output_buffer_filtered() {
-        use crate::process::OutputBuffer;
+        use crate::log::buffer::OutputBuffer;
 
         let mut buffer = OutputBuffer::new(100);
         let rx = buffer.subscribe_sender().subscribe();
-        let mut filtered = FilteredStream::new(rx, |e: &LogEntry| {
-            e.raw.contains("important")
-        });
+        let mut filtered = FilteredStream::new(rx, |e: &LogEntry| e.raw.contains("important"));
 
         buffer.push(make_entry("task", 0, "noise"));
         buffer.push(make_entry("task", 1, "important message"));
@@ -688,7 +679,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_integration_replay_from_buffer() {
-        use crate::process::OutputBuffer;
+        use crate::log::buffer::OutputBuffer;
 
         let mut buffer = OutputBuffer::new(100);
         buffer.push(make_entry("task", 0, "line 0"));
@@ -707,7 +698,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_integration_export_buffer_contents() {
-        use crate::process::OutputBuffer;
+        use crate::log::buffer::OutputBuffer;
 
         let mut buffer = OutputBuffer::new(100);
         buffer.push(make_entry("task", 0, "line A"));
@@ -717,10 +708,7 @@ mod tests {
         let entries: Vec<LogEntry> = buffer.lines().iter().cloned().collect();
         let mut raw_output = Vec::new();
         export_raw(&entries, &mut raw_output).unwrap();
-        assert_eq!(
-            String::from_utf8(raw_output).unwrap(),
-            "line A\nline B\n"
-        );
+        assert_eq!(String::from_utf8(raw_output).unwrap(), "line A\nline B\n");
 
         // Export as JSONL
         let mut jsonl_output = Vec::new();

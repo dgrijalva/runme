@@ -68,7 +68,7 @@ impl LogStore {
     }
 
     /// Ingest all current entries from an OutputBuffer snapshot.
-    pub fn ingest_buffer(&mut self, buffer: &crate::process::OutputBuffer) {
+    pub fn ingest_buffer(&mut self, buffer: &super::buffer::OutputBuffer) {
         for entry in buffer.lines().iter() {
             self.push(entry.clone());
         }
@@ -86,7 +86,11 @@ impl LogStore {
 
     /// Compose all sources into a single ordered stream, returning owned clones.
     pub fn compose_owned(&self) -> Vec<LogEntry> {
-        let mut all: Vec<LogEntry> = self.sources.values().flat_map(|v| v.iter().cloned()).collect();
+        let mut all: Vec<LogEntry> = self
+            .sources
+            .values()
+            .flat_map(|v| v.iter().cloned())
+            .collect();
         all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.cmp(&b.source)));
         all
     }
@@ -128,19 +132,17 @@ impl LogStore {
 
     /// Group entries by level value.
     pub fn group_by_level(&self) -> HashMap<String, Vec<&LogEntry>> {
-        self.group_by(|entry| {
-            entry
-                .level
-                .clone()
-                .unwrap_or_else(|| "(none)".to_string())
-        })
+        self.group_by(|entry| entry.level.clone().unwrap_or_else(|| "(none)".to_string()))
     }
 
     /// Group entries by an arbitrary key function.
     ///
     /// The key function extracts a grouping key from each entry. Returns a map
     /// from key to the entries that produced that key.
-    pub fn group_by(&self, key_fn: impl Fn(&LogEntry) -> String) -> HashMap<String, Vec<&LogEntry>> {
+    pub fn group_by(
+        &self,
+        key_fn: impl Fn(&LogEntry) -> String,
+    ) -> HashMap<String, Vec<&LogEntry>> {
         let mut groups: HashMap<String, Vec<&LogEntry>> = HashMap::new();
         for entry in self.sources.values().flat_map(|v| v.iter()) {
             let key = key_fn(entry);
@@ -255,7 +257,7 @@ where
 mod tests {
     use super::*;
     use crate::log::ParsedContent;
-    use crate::process::OutputBuffer;
+    use crate::log::buffer::OutputBuffer;
 
     /// Helper to create a LogEntry for testing.
     fn make_entry(source: &str, seq: u64, raw: &str) -> LogEntry {
@@ -521,8 +523,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_filtered_by_level() {
         let mut store = LogStore::new();
-        let mut errors_rx =
-            store.subscribe_filtered(|e| e.level.as_deref() == Some("error"));
+        let mut errors_rx = store.subscribe_filtered(|e| e.level.as_deref() == Some("error"));
 
         store.push(make_entry_with_level("app", 0, "info msg", "info"));
         store.push(make_entry_with_level("app", 1, "error msg", "error"));

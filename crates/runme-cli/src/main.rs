@@ -65,6 +65,10 @@ fn main() {
 
     // Use exec crate for process replacement (replaces current process)
     let err = exec::execvp(&compiled.binary_path, &argv);
-    eprintln!("runme: failed to exec {}: {}", compiled.binary_path.display(), err);
+    eprintln!(
+        "runme: failed to exec {}: {}",
+        compiled.binary_path.display(),
+        err
+    );
     std::process::exit(1);
 }

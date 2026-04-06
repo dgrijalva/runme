@@ -131,10 +131,7 @@ impl Search {
     /// Each match gets `context_lines` entries before and after. When context
     /// windows of nearby matches overlap, they are merged into a single
     /// [`ContextGroup`].
-    pub fn execute_with_context<'a>(
-        &self,
-        entries: &'a [LogEntry],
-    ) -> SearchResultWithContext<'a> {
+    pub fn execute_with_context<'a>(&self, entries: &'a [LogEntry]) -> SearchResultWithContext<'a> {
         let compiled = self.compile();
         let len = entries.len();
 
@@ -435,9 +432,7 @@ mod tests {
 
     #[test]
     fn context_window_basic() {
-        let entries: Vec<LogEntry> = (0..10)
-            .map(|i| entry(&format!("line {i}"), None))
-            .collect();
+        let entries: Vec<LogEntry> = (0..10).map(|i| entry(&format!("line {i}"), None)).collect();
         // Match on "line 5", context of 2
         let result = Search::new("line 5")
             .context(2)
@@ -456,9 +451,7 @@ mod tests {
 
     #[test]
     fn context_window_at_start_of_entries() {
-        let entries: Vec<LogEntry> = (0..5)
-            .map(|i| entry(&format!("line {i}"), None))
-            .collect();
+        let entries: Vec<LogEntry> = (0..5).map(|i| entry(&format!("line {i}"), None)).collect();
         let result = Search::new("line 0")
             .context(3)
             .execute_with_context(&entries);
@@ -472,9 +465,7 @@ mod tests {
 
     #[test]
     fn context_window_at_end_of_entries() {
-        let entries: Vec<LogEntry> = (0..5)
-            .map(|i| entry(&format!("line {i}"), None))
-            .collect();
+        let entries: Vec<LogEntry> = (0..5).map(|i| entry(&format!("line {i}"), None)).collect();
         let result = Search::new("line 4")
             .context(3)
             .execute_with_context(&entries);
@@ -487,9 +478,7 @@ mod tests {
 
     #[test]
     fn context_window_merges_overlapping() {
-        let entries: Vec<LogEntry> = (0..20)
-            .map(|i| entry(&format!("line {i}"), None))
-            .collect();
+        let entries: Vec<LogEntry> = (0..20).map(|i| entry(&format!("line {i}"), None)).collect();
         // Matches at index 5 and 8, context of 2.
         // Window for 5: [3, 8)  -> indices 3,4,5,6,7
         // Window for 8: [6, 11) -> indices 6,7,8,9,10
@@ -516,9 +505,7 @@ mod tests {
 
     #[test]
     fn context_window_separate_groups() {
-        let entries: Vec<LogEntry> = (0..20)
-            .map(|i| entry(&format!("line {i}"), None))
-            .collect();
+        let entries: Vec<LogEntry> = (0..20).map(|i| entry(&format!("line {i}"), None)).collect();
         // Matches at index 2 and 15, context of 1.
         // Window for 2:  [1, 4)  -> indices 1,2,3
         // Window for 15: [14, 17) -> indices 14,15,16
@@ -599,17 +586,13 @@ mod tests {
     #[test]
     fn context_no_matches_returns_empty_groups() {
         let entries = vec![entry("hello", None)];
-        let result = Search::new("xyz")
-            .context(2)
-            .execute_with_context(&entries);
+        let result = Search::new("xyz").context(2).execute_with_context(&entries);
         assert!(result.groups.is_empty());
     }
 
     #[test]
     fn context_zero_lines_same_as_no_context() {
-        let entries: Vec<LogEntry> = (0..5)
-            .map(|i| entry(&format!("line {i}"), None))
-            .collect();
+        let entries: Vec<LogEntry> = (0..5).map(|i| entry(&format!("line {i}"), None)).collect();
         let result = Search::new("line 2")
             .context(0)
             .execute_with_context(&entries);
@@ -690,9 +673,7 @@ mod tests {
 
     #[test]
     fn all_entries_match_with_large_context() {
-        let entries: Vec<LogEntry> = (0..5)
-            .map(|i| entry(&format!("match {i}"), None))
-            .collect();
+        let entries: Vec<LogEntry> = (0..5).map(|i| entry(&format!("match {i}"), None)).collect();
         let result = Search::new("match")
             .context(10)
             .execute_with_context(&entries);

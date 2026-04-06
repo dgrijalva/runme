@@ -1,5 +1,5 @@
 use super::super::{ParseResult, ParsedContent, RawRecord};
-use super::{next_line, RecordParser};
+use super::{RecordParser, next_line};
 
 /// Parses `key=value` format (logfmt). Scans for a newline-terminated line
 /// and parses it as logfmt key=value pairs.
@@ -105,11 +105,7 @@ impl LogfmtParser {
         }
 
         // Need at least 1 key=value pair to be considered logfmt
-        if pairs.is_empty() {
-            None
-        } else {
-            Some(pairs)
-        }
+        if pairs.is_empty() { None } else { Some(pairs) }
     }
 }
 

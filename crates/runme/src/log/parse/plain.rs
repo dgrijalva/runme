@@ -1,5 +1,5 @@
 use super::super::ParseResult;
-use super::{next_line, RecordParser};
+use super::{RecordParser, next_line};
 
 /// Scans for `\n`. Returns everything up to the newline as one record.
 /// At EOF, emits whatever remains. Always succeeds -- terminal fallback.

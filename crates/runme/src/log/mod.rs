@@ -1,12 +1,13 @@
-pub mod parse;
+pub mod buffer;
 pub mod extract;
 pub mod filter;
+pub mod parse;
 pub mod search;
 pub mod store;
 pub mod stream;
 
-use std::collections::HashMap;
 use serde::Serialize;
+use std::collections::HashMap;
 
 /// Result of attempting to parse a record from the input buffer.
 pub enum ParseResult {

@@ -1,7 +1,7 @@
 use regex::Regex;
 
 use super::super::{ParseResult, ParsedContent, RawRecord};
-use super::{next_line, RecordParser};
+use super::{RecordParser, next_line};
 
 /// Recognizes Rust panic output and captures the full backtrace as one record.
 /// Operates on raw bytes, converting to string (lossy) for regex matching.
@@ -14,10 +14,7 @@ impl RustPanicParser {
     pub fn new() -> Self {
         Self {
             start_re: Regex::new(r"^thread\s+'[^']*'\s+panicked\s+at\s+").unwrap(),
-            continuation_re: Regex::new(
-                r"^(stack backtrace:|note:\s|\s+\d+:\s|\s+at\s)",
-            )
-            .unwrap(),
+            continuation_re: Regex::new(r"^(stack backtrace:|note:\s|\s+\d+:\s|\s+at\s)").unwrap(),
         }
     }
 }

@@ -1,12 +1,10 @@
-use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use nix::sys::signal::{killpg, Signal};
+use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
 use tokio::io::AsyncReadExt;
-use tokio::sync::broadcast;
 
 use crate::cmd::Cmd;
 use crate::log::extract::{self, FieldExtractor};
@@ -28,7 +26,10 @@ pub enum ProcessError {
     Wait(std::io::Error),
     Timeout,
     /// Process exited with a non-zero exit code.
-    ExitCode { code: i32, output: ExecOutput },
+    ExitCode {
+        code: i32,
+        output: ExecOutput,
+    },
 }
 
 impl std::fmt::Display for ProcessError {
@@ -63,69 +64,8 @@ impl ExecOutputExt for Result<ExecOutput, ProcessError> {
     }
 }
 
-/// Output ring buffer for a task.
-///
-/// Stores log entries with bounded capacity. When full, oldest entries are dropped.
-/// Also broadcasts new entries to subscribers.
-pub struct OutputBuffer {
-    lines: VecDeque<LogEntry>,
-    capacity: usize,
-    tx: broadcast::Sender<LogEntry>,
-}
-
-impl OutputBuffer {
-    /// Create a new buffer with the given capacity.
-    pub fn new(capacity: usize) -> Self {
-        let (tx, _) = broadcast::channel(capacity.max(16));
-        Self {
-            lines: VecDeque::with_capacity(capacity),
-            capacity,
-            tx,
-        }
-    }
-
-    /// Push a log entry into the buffer. Drops the oldest if at capacity.
-    pub fn push(&mut self, entry: LogEntry) {
-        if self.lines.len() >= self.capacity {
-            self.lines.pop_front();
-        }
-        // Broadcast to subscribers (ignore errors — no receivers is OK)
-        let _ = self.tx.send(entry.clone());
-        self.lines.push_back(entry);
-    }
-
-    /// Get all buffered entries.
-    pub fn lines(&self) -> &VecDeque<LogEntry> {
-        &self.lines
-    }
-
-    /// Get a broadcast receiver for new entries.
-    pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> {
-        self.tx.subscribe()
-    }
-
-    /// Number of entries currently in the buffer.
-    pub fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    /// Whether the buffer is empty.
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    /// The maximum capacity of the buffer.
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Get a reference to the broadcast sender.
-    ///
-    /// Useful for passing to streaming utilities (e.g., `stream::tail()`).
-    pub fn subscribe_sender(&self) -> &broadcast::Sender<LogEntry> {
-        &self.tx
-    }
-}
+// Re-export OutputBuffer so existing `crate::process::OutputBuffer` paths still work.
+pub use crate::log::buffer::OutputBuffer;
 
 /// Build a LogEntry from a RawRecord and extracted fields.
 fn build_log_entry(
@@ -265,7 +205,10 @@ impl ProcessHandle {
             stderr: String::new(),
         };
         if exit_code != 0 {
-            return Err(ProcessError::ExitCode { code: exit_code, output });
+            return Err(ProcessError::ExitCode {
+                code: exit_code,
+                output,
+            });
         }
         Ok(output)
     }
@@ -319,11 +262,14 @@ pub async fn exec(
 
     // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
     // Separate parser instances for stdout and stderr (parsers are stateful).
-    let mut stdout_parser: Box<dyn RecordParser> = cmd.parser.take()
+    let mut stdout_parser: Box<dyn RecordParser> = cmd
+        .parser
+        .take()
         .unwrap_or_else(|| Box::new(parse::default_parser()));
-    let mut stderr_parser: Box<dyn RecordParser> =
-        Box::new(parse::default_parser());
-    let extractor: Box<dyn FieldExtractor> = cmd.extractor.take()
+    let mut stderr_parser: Box<dyn RecordParser> = Box::new(parse::default_parser());
+    let extractor: Box<dyn FieldExtractor> = cmd
+        .extractor
+        .take()
         .unwrap_or_else(|| Box::new(extract::default_extractor()));
 
     let mut child = build_command(cmd).spawn().map_err(ProcessError::Spawn)?;
@@ -413,7 +359,10 @@ pub async fn exec(
     };
 
     if exit_code != 0 {
-        return Err(ProcessError::ExitCode { code: exit_code, output });
+        return Err(ProcessError::ExitCode {
+            code: exit_code,
+            output,
+        });
     }
 
     Ok(output)
@@ -433,11 +382,14 @@ pub async fn spawn(
 
     // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
     // Separate parser instances for stdout and stderr (parsers are stateful).
-    let stdout_parser: Box<dyn RecordParser> = cmd.parser.take()
+    let stdout_parser: Box<dyn RecordParser> = cmd
+        .parser
+        .take()
         .unwrap_or_else(|| Box::new(parse::default_parser()));
-    let stderr_parser: Box<dyn RecordParser> =
-        Box::new(parse::default_parser());
-    let extractor: Box<dyn FieldExtractor> = cmd.extractor.take()
+    let stderr_parser: Box<dyn RecordParser> = Box::new(parse::default_parser());
+    let extractor: Box<dyn FieldExtractor> = cmd
+        .extractor
+        .take()
         .unwrap_or_else(|| Box::new(extract::default_extractor()));
 
     let mut child = build_command(cmd).spawn().map_err(ProcessError::Spawn)?;
@@ -471,13 +423,20 @@ pub async fn spawn(
                 let mut p = parser_clone.lock().await;
                 let mut s = seq_clone.lock().await;
                 drain_records_async(
-                    &mut byte_buf, eof,
-                    p.as_mut(), extractor_clone.as_ref(),
-                    &source_clone, &mut s, &buf_clone,
-                ).await;
+                    &mut byte_buf,
+                    eof,
+                    p.as_mut(),
+                    extractor_clone.as_ref(),
+                    &source_clone,
+                    &mut s,
+                    &buf_clone,
+                )
+                .await;
             }
 
-            if eof { break; }
+            if eof {
+                break;
+            }
         }
     });
 
@@ -496,13 +455,20 @@ pub async fn spawn(
                 let mut p = parser_clone.lock().await;
                 let mut s = seq_clone.lock().await;
                 drain_records_async(
-                    &mut byte_buf, eof,
-                    p.as_mut(), extractor_clone.as_ref(),
-                    &source_clone, &mut s, &buf_clone,
-                ).await;
+                    &mut byte_buf,
+                    eof,
+                    p.as_mut(),
+                    extractor_clone.as_ref(),
+                    &source_clone,
+                    &mut s,
+                    &buf_clone,
+                )
+                .await;
             }
 
-            if eof { break; }
+            if eof {
+                break;
+            }
         }
     });
 
@@ -560,7 +526,9 @@ mod tests {
     #[tokio::test]
     async fn test_exec_raw_lines_not_json() {
         let mut buffer = OutputBuffer::new(100);
-        let _result = exec("echo 'just plain text'", "test", &mut buffer).await.unwrap();
+        let _result = exec("echo 'just plain text'", "test", &mut buffer)
+            .await
+            .unwrap();
 
         assert!(!buffer.is_empty());
         let entry = &buffer.lines()[0];
@@ -594,7 +562,9 @@ mod tests {
     async fn test_spawn_captures_output() {
         let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
         // Use a command that produces output and exits
-        let mut handle = spawn("echo spawned_output", "test", buffer.clone()).await.unwrap();
+        let mut handle = spawn("echo spawned_output", "test", buffer.clone())
+            .await
+            .unwrap();
 
         // Wait for the process to finish
         let _result = handle.wait().await.unwrap();
@@ -613,7 +583,9 @@ mod tests {
     async fn test_process_group_cleanup() {
         // Spawn a shell that spawns a child; stopping should kill both
         let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
-        let mut handle = spawn("sh -c 'sleep 120 & sleep 120'", "test", buffer).await.unwrap();
+        let mut handle = spawn("sh -c 'sleep 120 & sleep 120'", "test", buffer)
+            .await
+            .unwrap();
 
         assert!(handle.is_running());
 
@@ -774,10 +746,7 @@ mod tests {
 
         // Kill it from the outside using its PID directly
         let pid = handle.pid().expect("should have a pid");
-        nix::sys::signal::kill(
-            Pid::from_raw(pid as i32),
-            Signal::SIGKILL,
-        ).unwrap();
+        nix::sys::signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL).unwrap();
 
         // wait() should return an error (non-zero exit from signal death)
         let result = handle.wait().await;
@@ -836,7 +805,10 @@ mod tests {
             Err(other) => panic!("unexpected error: {:?}", other),
         };
 
-        assert!(output.stdout.contains("hello"), "valid output after binary data was lost");
+        assert!(
+            output.stdout.contains("hello"),
+            "valid output after binary data was lost"
+        );
     }
 
     #[tokio::test]

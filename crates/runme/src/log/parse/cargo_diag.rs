@@ -1,7 +1,7 @@
 use regex::Regex;
 
 use super::super::{ParseResult, ParsedContent, RawRecord};
-use super::{next_line, RecordParser};
+use super::{RecordParser, next_line};
 
 /// Recognizes cargo compiler errors/warnings and captures the full diagnostic
 /// as one record. Operates on raw bytes.
@@ -14,10 +14,8 @@ impl CargoDiagnosticParser {
     pub fn new() -> Self {
         Self {
             start_re: Regex::new(r"^(error|warning)(\[E\d{4}\])?:\s").unwrap(),
-            continuation_re: Regex::new(
-                r"^(\s*-->|\s*\||\s*=\s*(note|help|warning):|\s*$)",
-            )
-            .unwrap(),
+            continuation_re: Regex::new(r"^(\s*-->|\s*\||\s*=\s*(note|help|warning):|\s*$)")
+                .unwrap(),
         }
     }
 }
