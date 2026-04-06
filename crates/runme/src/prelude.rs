@@ -1,3 +1,4 @@
+pub use crate::cmd::Cmd;
 pub use crate::error::{ExitHint, ResultExt, TaskError, TaskResult};
 pub use crate::process::{ExecOutput, ExecOutputExt, LogLine, OutputBuffer, ProcessError, ProcessHandle};
 pub use crate::signal::SignalHandler;

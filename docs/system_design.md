@@ -313,22 +313,16 @@ The conversion extracts what `std::process::Command` carries (program, args, env
 ```rust
 let cmd = Cmd::from(std_cmd)
     .cwd("./subdir")
-    .timeout(Duration::from_secs(30));
+    .env("EXTRA", "yes");
 ```
 
-### Open Questions
+### Design Decisions
 
-**What belongs on `Cmd` vs elsewhere?** The command itself clearly owns program, args, env, cwd. But what about:
-- **Timeout** — is it a property of the command ("this should never run longer than 30s") or of the execution context ("run this with a 30s timeout")?
-- **Readiness checks** — does a command know how to tell you it's ready (e.g. "wait for port 8080"), or is that a separate concern layered on top?
-- **Output expectations** — should a command declare that it produces JSON logs, or is that a runtime interpretation?
-- **Retry/restart policy** — "restart on failure" feels like orchestration, not command description.
+**`Cmd` is a pure value — no runtime behavior.** `Cmd` owns program, args, env, and cwd. Timeout, readiness checks, output expectations, and retry/restart policy live on the execution side (task definition or execution call), not on the command itself. This keeps `Cmd` simple and composable.
 
-Putting everything on `Cmd` makes it a self-contained unit of work. Keeping `Cmd` lean and putting runtime behavior on the execution call (or on the task definition) keeps the type simple and composable. There's a spectrum here.
+**Working directory** is relative to the RUNME.rs file's location, since that's where the code lives.
 
-**Working directory semantics.** `.cwd()` relative to what? The RUNME.rs file's location? The directory `runme` was invoked from? The project root? Needs a clear convention, probably relative to the RUNME.rs file since that's where the code lives.
-
-**Environment inheritance.** Does a `Cmd` start with the parent's full environment and overlay, or start empty? Overlay is almost certainly right (you rarely want to strip `PATH`), but worth being explicit.
+**Environment inheritance** is overlay: `Cmd` starts with the parent process's full environment and adds/overrides from `.env()` calls. You rarely want to strip `PATH`.
 
 ## Child Process Failure Modes
 

@@ -5,8 +5,9 @@ use std::time::Duration;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use tokio::sync::broadcast;
+
+use crate::cmd::Cmd;
 
 /// Captured output from a process execution.
 #[derive(Debug, Clone)]
@@ -224,34 +225,33 @@ impl ProcessHandle {
 }
 
 /// Build a tokio Command that spawns in its own process group.
-fn build_command(command: &str) -> Command {
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c");
-    cmd.arg(command);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+fn build_command(cmd: Cmd) -> tokio::process::Command {
+    let mut command = cmd.into_tokio_command();
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
 
     // Spawn in a new process group
     unsafe {
-        cmd.pre_exec(|| {
+        command.pre_exec(|| {
             nix::unistd::setpgid(Pid::from_raw(0), Pid::from_raw(0))
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             Ok(())
         });
     }
 
-    cmd
+    command
 }
 
 /// Execute a command synchronously (wait for completion), capturing all output.
 ///
 /// Lines are parsed for JSON structure and pushed into the provided OutputBuffer.
+/// Accepts anything that converts to `Cmd`: a `&str`/`String` (shell mode) or a `Cmd` value.
 pub async fn exec(
-    command: &str,
+    command: impl Into<Cmd>,
     task_name: &str,
     buffer: &mut OutputBuffer,
 ) -> Result<ExecOutput, ProcessError> {
-    let mut child = build_command(command).spawn().map_err(ProcessError::Spawn)?;
+    let mut child = build_command(command.into()).spawn().map_err(ProcessError::Spawn)?;
 
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
@@ -326,12 +326,13 @@ pub async fn exec(
 /// Spawn a command in the background, returning a handle for monitoring and control.
 ///
 /// Output is continuously read into the provided OutputBuffer by background tasks.
+/// Accepts anything that converts to `Cmd`: a `&str`/`String` (shell mode) or a `Cmd` value.
 pub async fn spawn(
-    command: &str,
+    command: impl Into<Cmd>,
     task_name: &str,
     buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
 ) -> Result<ProcessHandle, ProcessError> {
-    let mut child = build_command(command).spawn().map_err(ProcessError::Spawn)?;
+    let mut child = build_command(command.into()).spawn().map_err(ProcessError::Spawn)?;
 
     let pgid = child.id().map(|id| id as i32);
 

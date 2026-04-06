@@ -101,6 +101,19 @@ runme/
 
 **Key dependencies:** `tokio` (runtime, process, sync, signal), `nix` (process groups, signals)
 
+### Phase 3b: Command API
+**Goal:** Structured command builder that separates "what to run" from "how to run it." See `docs/system_design.md` § Command API.
+
+- `Cmd` type in `crates/runme/src/cmd.rs` — program, args, env overlays, working directory
+- `Cmd::new("program").args([...]).env("K", "V").cwd("./path")` builder API
+- `Cmd::shell("string")` — wraps in `sh -c` for pipes/globs/redirects
+- `&str` → `Cmd::shell()` implicit conversion so `ctx.exec("echo hi")` still works
+- `From<std::process::Command>` via `get_program()`, `get_args()`, `get_envs()`
+- `ctx.exec()` and `ctx.spawn()` accept `impl Into<Cmd>`
+- Cmd is a pure value — no timeout, retry, or runtime behavior (those live on the execution side)
+- Working directory relative to RUNME.rs file location
+- Environment inherits from parent process, overlays additions
+
 ### Phase 4: CLI Interface
 **Goal:** Fully functional CLI for humans and agents.
 

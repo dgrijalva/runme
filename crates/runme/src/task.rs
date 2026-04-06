@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
+use crate::cmd::Cmd;
 use crate::error::TaskError;
 use crate::process::{self, ExecOutput, LogLine, OutputBuffer, ProcessError, ProcessHandle};
 
@@ -61,13 +62,17 @@ impl TaskContext {
     }
 
     /// Run a command and wait for it to complete. Captures output.
-    pub async fn exec(&self, command: &str) -> Result<ExecOutput, ProcessError> {
+    ///
+    /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
+    pub async fn exec(&self, command: impl Into<Cmd>) -> Result<ExecOutput, ProcessError> {
         let mut buffer = self.output.lock().await;
         process::exec(command, &self.name, &mut buffer).await
     }
 
     /// Spawn a long-running command. Returns a handle for monitoring/control.
-    pub async fn spawn(&self, command: &str) -> Result<ProcessHandle, ProcessError> {
+    ///
+    /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
+    pub async fn spawn(&self, command: impl Into<Cmd>) -> Result<ProcessHandle, ProcessError> {
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(10_000)));
         process::spawn(command, &self.name, buffer).await
     }
