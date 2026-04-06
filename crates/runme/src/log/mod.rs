@@ -6,10 +6,10 @@ pub mod store;
 
 use std::collections::HashMap;
 
-/// Result of attempting to parse a line of input.
+/// Result of attempting to parse a record from the input buffer.
 pub enum ParseResult {
-    /// Successfully parsed a complete record.
-    Record(RawRecord),
+    /// Successfully parsed a complete record. `usize` is bytes consumed from input.
+    Record(RawRecord, usize),
     /// This parser doesn't handle this input -- try the next one.
     Rejection,
     /// Input could be a partial record in this format -- need more data.

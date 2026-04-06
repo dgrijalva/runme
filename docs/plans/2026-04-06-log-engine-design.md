@@ -36,10 +36,12 @@ stdout/stderr bytes
 
 Fuses record splitting and parsing. These are coupled because you can't split records without understanding the format (JSON needs brace-depth tracking, plain text splits on newlines, multiline patterns need continuation detection).
 
+The parser operates on raw bytes, not pre-split lines. This supports binary formats, concatenated JSON, and any framing scheme. The **stream handler** owns the accumulation buffer (`BytesMut`); the parser is a pure recognizer that scans from the start of the buffer and reports how many bytes it consumed.
+
 ```rust
 pub enum ParseResult {
-    /// Successfully parsed a complete record
-    Record(RawRecord),
+    /// Successfully parsed a complete record. `usize` is bytes consumed from input.
+    Record(RawRecord, usize),
     /// This parser doesn't handle this input -- try the next one
     Rejection,
     /// Input could be a partial record in this format -- need more data
@@ -59,16 +61,50 @@ pub enum ParsedContent {
 }
 
 pub trait RecordParser: Send + Sync {
-    /// Feed a line (or chunk) of text. Returns a parse result.
-    /// Parsers may be stateful (buffering partial records).
-    fn feed(&mut self, line: &str) -> ParseResult;
-
-    /// Flush any buffered partial input (e.g., at stream end).
-    /// Returns a record if there was buffered content, None otherwise.
-    fn flush(&mut self) -> Option<RawRecord>;
+    /// Scan the front of `data` for a record.
+    ///
+    /// - `data`: the accumulated bytes not yet consumed. The parser examines
+    ///   the beginning of this slice and returns how many bytes it consumed.
+    /// - `eof`: true when no more data will arrive (process exited). Parsers
+    ///   that would normally return `Incomplete` should emit what they have
+    ///   or `Rejection` so the next parser can try.
+    ///
+    /// Parsers do **not** buffer data internally -- the caller owns the buffer
+    /// and re-feeds the full unconsumed slice on each call.
+    fn feed(&mut self, data: &[u8], eof: bool) -> ParseResult;
 
     /// Reset parser state (e.g., between commands).
     fn reset(&mut self);
+}
+```
+
+### Stream Handler
+
+The stream handler in `exec()` / `spawn()` owns a `BytesMut` accumulation buffer and drives the parser:
+
+```rust
+use bytes::BytesMut;
+
+let mut buf = BytesMut::new();
+loop {
+    // read new bytes from stdout/stderr into buf
+    let n = reader.read_buf(&mut buf).await?;
+    let eof = n == 0;
+
+    // drain records from the buffer
+    loop {
+        match parser.feed(&buf, eof) {
+            Record(record, consumed) => {
+                buf.advance(consumed);
+                let entry = build_log_entry(record, &extractor, source, &mut seq);
+                output_buffer.push(entry);
+                // continue -- buffer may contain more records
+            }
+            Incomplete => break,  // wait for more data
+            Rejection => break,   // shouldn't happen with FallbackParser
+        }
+    }
+    if eof { break; }
 }
 ```
 
@@ -76,25 +112,50 @@ pub trait RecordParser: Send + Sync {
 
 Priority-ordered fallback. Tries each inner parser in order. First `Record` wins. `Incomplete` means "buffer more and keep trying this parser." `Rejection` means "try the next parser."
 
+Tracks an "active parser" index. When a parser returns `Incomplete`, it becomes active and is tried exclusively on subsequent calls until it either produces a `Record` (active cleared, restart from top) or `Rejection` (active cleared, try next parser).
+
 ```rust
 pub struct FallbackParser {
     parsers: Vec<Box<dyn RecordParser>>,
+    active: Option<usize>,  // index of parser that returned Incomplete
 }
 
 impl FallbackParser {
     pub fn new(parsers: Vec<Box<dyn RecordParser>>) -> Self;
 }
 
-impl RecordParser for FallbackParser { ... }
+impl RecordParser for FallbackParser {
+    fn feed(&mut self, data: &[u8], eof: bool) -> ParseResult {
+        if let Some(idx) = self.active {
+            match self.parsers[idx].feed(data, eof) {
+                Record(rec, n) => { self.active = None; return Record(rec, n); }
+                Incomplete => return Incomplete,
+                Rejection => { self.active = None; /* fall through to try next */ }
+            }
+        }
+        let start = self.active.map(|i| i + 1).unwrap_or(0);
+        self.active = None;
+        for i in start..self.parsers.len() {
+            match self.parsers[i].feed(data, eof) {
+                Record(rec, n) => return Record(rec, n),
+                Incomplete => { self.active = Some(i); return Incomplete; }
+                Rejection => continue,
+            }
+        }
+        Rejection
+    }
+}
 ```
 
 ### Built-in Parsers (Wave 1)
 
-- **JsonlParser** -- Detects JSON objects and arrays. Single-line by default. Handles the common case of structured log output. When the parser has seen >3 JSON lines and encounters non-JSON, it flags the resulting record with `{"_anomalous": true, "_anomaly_reason": "plain_text_in_json_stream"}` in the fields HashMap. No multiline/pretty-printed JSON parser needed for wave 1 -- pretty-printed JSON in log streams is rare.
-- **RustPanicParser** -- Recognizes Rust panic output and captures the full backtrace as one record. Start pattern: `^thread\s+'[^']*'\s+panicked\s+at\s+`. Continuation: `^(stack backtrace:|note:\s|\s+\d+:\s|\s+at\s)`. End: first non-matching line.
-- **CargoDiagnosticParser** -- Recognizes cargo compiler errors/warnings and captures the full diagnostic (including `-->` file references and help text) as one record. Start pattern: `^(error|warning)(\[E\d{4}\])?:\s`. Continuation: `^(\s*-->|\s*\||\s*=\s*(note|help|warning):|\s*$)`. End: next diagnostic start or non-matching line.
-- **LogfmtParser** -- Parses `key=value` format. Prevalent in Go (slog TextHandler), Heroku/12-factor, cloud-native tooling. Parser implementation: split on spaces, split on `=`, handle quoted values. Emits `ParsedContent::Logfmt(Vec<(String, String)>)`. Same field name mapping table used by `CommonJsonFieldExtractor` works for extraction.
-- **PlainLineParser** -- Always succeeds. One line = one record. Terminal fallback.
+All parsers receive `&[u8]` and return bytes consumed. Text parsers validate UTF-8 from the byte slice for the `RawRecord.raw` field. Binary format support (BSON, protobuf) is a future extension — the trait boundary already supports it.
+
+- **JsonlParser** -- Scans for JSON objects/arrays at the start of the buffer. Uses brace/bracket depth tracking (skipping over quoted strings) to find the end of the record. Handles both newline-delimited JSON and concatenated JSON (`{"a":1}{"b":2}`). Bytes consumed includes the record and any trailing newline/whitespace. Anomaly detection: when the parser has seen >3 JSON records and encounters non-JSON, it rejects (so the next parser handles it) but sets a flag for the field extractor. At EOF, emits partial JSON as PlainText or rejects.
+- **RustPanicParser** -- Scans for the start pattern `thread '...' panicked at` in the buffer. If found, scans continuation lines. Returns Record when the first non-continuation line is found (consumed bytes include only the panic, not the trailing non-continuation line). At EOF, emits whatever it has.
+- **CargoDiagnosticParser** -- Scans for cargo `error`/`warning` diagnostic start. Captures the full diagnostic block. Similar to RustPanicParser.
+- **LogfmtParser** -- Scans for a newline-terminated line containing `key=value` pairs. Validates the logfmt structure. Bytes consumed includes the trailing newline. At EOF, emits the remaining buffer if it looks like logfmt.
+- **PlainLineParser** -- Scans for `\n`. Returns everything up to and including `\n` as one record (trailing newline stripped from `raw`). At EOF, emits whatever remains. Always succeeds — terminal fallback.
 
 **Deferred to wave 2:** Python tracebacks, Java stack traces, Go panics, Node.js multi-line errors. All have been cataloged with heuristics by research but are lower priority than the Rust-ecosystem patterns above.
 
@@ -382,12 +443,13 @@ Decision: **Option A** -- removing derive(Clone). It's cleaner and the test impa
 
 ### Parser Lifecycle
 
-Each `exec()` / `spawn()` call gets its own parser instance. The parser is sourced from `Cmd` or falls back to the default chain.
+Each `exec()` / `spawn()` call gets its own parser instance and `BytesMut` buffer. The parser is sourced from `Cmd` or falls back to the default chain.
 
 - `Cmd` carries `Option<Box<dyn RecordParser>>` and `Option<Box<dyn FieldExtractor>>`
 - In `exec()` / `spawn()`: extract the parser from Cmd (if present) or construct the default `FallbackParser`
-- Parser is constructed after `command.into()` but before spawning
-- Each call gets a fresh parser instance -- no sharing across calls
+- Stream handler creates a `BytesMut` buffer, reads raw bytes from stdout/stderr, feeds the parser, advances past consumed bytes
+- Each call gets a fresh parser instance and buffer -- no sharing across calls
+- `BufReader::lines()` is replaced by `read_buf()` into `BytesMut` -- no pre-splitting on newlines
 
 ### Field Extractor Lifecycle
 
@@ -429,8 +491,9 @@ Current behavior: `spawn()` creates a separate buffer not connected to TaskConte
 9. Update `From<&str>` and `From<Command>` impls to set parser/extractor to `None`
 10. Remove `LogLine` enum and its impl from `process.rs`
 11. Update `OutputBuffer` to use `LogEntry` instead of `LogLine`
-12. Update `exec()` to construct parser chain from Cmd, feed lines through pipeline, produce `LogEntry`
-13. Update `spawn()` similarly, ensure `ProcessHandle` carries `Arc<Mutex<OutputBuffer>>`
+12. Add `bytes = "1"` dependency to `Cargo.toml`
+13. Update `exec()`: replace `BufReader::lines()` with `BytesMut` + `read_buf()` loop, feed bytes to parser, advance buffer on Record
+14. Update `spawn()` similarly, ensure `ProcessHandle` carries `Arc<Mutex<OutputBuffer>>`
 14. Update `task.rs` return type from `Vec<LogLine>` to `Vec<LogEntry>`
 15. Update `prelude.rs` re-exports
 16. Migrate all existing tests to use `LogEntry`

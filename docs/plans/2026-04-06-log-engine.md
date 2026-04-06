@@ -437,6 +437,10 @@ validation:
 | Additional well-known fields go in HashMap, not struct | caller, error, stack_trace, hostname, pid, service, trace_id, span_id, request_id are useful but not universal enough for struct fields. | 2026-04-06 |
 | Anomaly detection in JsonlParser | Non-JSON in an otherwise-JSON stream is flagged with _anomalous field. Signals panics, misconfigurations, or debug output. | 2026-04-06 |
 | spawn() ProcessHandle carries Arc<Mutex<OutputBuffer>> | Fixes existing bug where buffer ref is dropped. Composition across sources is wave 2 (log store). | 2026-04-06 |
+| RecordParser takes &[u8] bytes, not &str lines | Enables binary format support (BSON, protobuf). Stream handler owns BytesMut buffer, parser is a pure recognizer. Eliminates BufReader::lines() pre-splitting. | 2026-04-06 |
+| ParseResult::Record includes bytes consumed | Parser reports how many bytes it consumed so stream handler can advance the buffer. Enables concatenated records without delimiters. | 2026-04-06 |
+| EOF flag on feed() instead of separate flush() | Single code path for all parsing. At EOF, parsers that would return Incomplete emit what they have or Reject. No duplicate logic across feed/flush. | 2026-04-06 |
+| BytesMut for stream handler buffer | O(1) advance past consumed bytes vs Vec<u8> drain which is O(n). Already a transitive dep via tokio. Parser receives &[u8] — doesn't know the buffer type. | 2026-04-06 |
 
 ## Findings
 

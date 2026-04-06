@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::process::Stdio;
 use std::time::Duration;
 
+use bytes::{Buf, BytesMut};
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::sync::broadcast;
 
 use crate::cmd::Cmd;
@@ -119,27 +120,13 @@ impl OutputBuffer {
     }
 }
 
-/// Feed a line through the parsing pipeline, producing a LogEntry.
-fn process_line(
-    line: &str,
-    parser: &mut dyn RecordParser,
+/// Build a LogEntry from a RawRecord and extracted fields.
+fn build_log_entry(
+    raw_record: super::log::RawRecord,
     extractor: &dyn FieldExtractor,
     source: &str,
     seq: &mut u64,
-) -> Option<LogEntry> {
-    let raw_record = match parser.feed(line) {
-        ParseResult::Record(rec) => rec,
-        ParseResult::Rejection => {
-            // Should not happen if PlainLineParser is terminal in the chain,
-            // but handle gracefully.
-            return None;
-        }
-        ParseResult::Incomplete => {
-            // Multiline record in progress — no entry yet.
-            return None;
-        }
-    };
-
+) -> LogEntry {
     let extracted = extractor.extract(&raw_record);
     let entry = LogEntry {
         raw: raw_record.raw,
@@ -152,7 +139,59 @@ fn process_line(
         fields: extracted.fields,
     };
     *seq += 1;
-    Some(entry)
+    entry
+}
+
+/// Drain records from a buffer using the parser, pushing entries into the output buffer.
+fn drain_records(
+    buf: &mut BytesMut,
+    eof: bool,
+    parser: &mut dyn RecordParser,
+    extractor: &dyn FieldExtractor,
+    source: &str,
+    seq: &mut u64,
+    output: &mut OutputBuffer,
+) {
+    loop {
+        if buf.is_empty() {
+            break;
+        }
+        match parser.feed(buf, eof) {
+            ParseResult::Record(rec, consumed) => {
+                buf.advance(consumed);
+                let entry = build_log_entry(rec, extractor, source, seq);
+                output.push(entry);
+                // continue -- buffer may contain more records
+            }
+            ParseResult::Incomplete | ParseResult::Rejection => break,
+        }
+    }
+}
+
+/// Drain records from a buffer (async version for spawn background tasks).
+async fn drain_records_async(
+    buf: &mut BytesMut,
+    eof: bool,
+    parser: &mut dyn RecordParser,
+    extractor: &dyn FieldExtractor,
+    source: &str,
+    seq: &mut u64,
+    output: &std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
+) {
+    loop {
+        if buf.is_empty() {
+            break;
+        }
+        match parser.feed(buf, eof) {
+            ParseResult::Record(rec, consumed) => {
+                buf.advance(consumed);
+                let entry = build_log_entry(rec, extractor, source, seq);
+                output.lock().await.push(entry);
+                // continue -- buffer may contain more records
+            }
+            ParseResult::Incomplete | ParseResult::Rejection => break,
+        }
+    }
 }
 
 /// Handle to a running child process.
@@ -260,8 +299,9 @@ fn build_command(cmd: Cmd) -> tokio::process::Command {
 
 /// Execute a command synchronously (wait for completion), capturing all output.
 ///
-/// Lines are fed through the parsing pipeline (RecordParser -> FieldExtractor -> LogEntry)
-/// and pushed into the provided OutputBuffer.
+/// Bytes are fed through the parsing pipeline (RecordParser -> FieldExtractor -> LogEntry)
+/// and pushed into the provided OutputBuffer. Uses BytesMut accumulation buffers
+/// with read_buf() instead of line-oriented BufReader.
 /// Accepts anything that converts to `Cmd`: a `&str`/`String` (shell mode) or a `Cmd` value.
 pub async fn exec(
     command: impl Into<Cmd>,
@@ -271,89 +311,90 @@ pub async fn exec(
     let mut cmd = command.into();
 
     // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
-    let mut parser: Box<dyn RecordParser> = cmd.parser.take()
+    // Separate parser instances for stdout and stderr (parsers are stateful).
+    let mut stdout_parser: Box<dyn RecordParser> = cmd.parser.take()
         .unwrap_or_else(|| Box::new(parse::default_parser()));
+    let mut stderr_parser: Box<dyn RecordParser> =
+        Box::new(parse::default_parser());
     let extractor: Box<dyn FieldExtractor> = cmd.extractor.take()
         .unwrap_or_else(|| Box::new(extract::default_extractor()));
 
     let mut child = build_command(cmd).spawn().map_err(ProcessError::Spawn)?;
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
 
-    let mut stdout_reader = BufReader::new(stdout).lines();
-    let mut stderr_reader = BufReader::new(stderr).lines();
-
+    let mut stdout_buf = BytesMut::new();
+    let mut stderr_buf = BytesMut::new();
     let mut stdout_text = String::new();
     let mut stderr_text = String::new();
     let mut seq: u64 = 0;
 
-    // Read stdout and stderr concurrently
-    loop {
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+
+    // Read stdout and stderr concurrently using raw bytes
+    while !stdout_done || !stderr_done {
         tokio::select! {
-            line = stdout_reader.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        stdout_text.push_str(&l);
-                        stdout_text.push('\n');
-                        if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
-                            buffer.push(entry);
+            n = stdout.read_buf(&mut stdout_buf), if !stdout_done => {
+                match n {
+                    Ok(0) => {
+                        stdout_done = true;
+                        // Drain with eof=true
+                        drain_records(
+                            &mut stdout_buf, true,
+                            stdout_parser.as_mut(), extractor.as_ref(),
+                            task_name, &mut seq, buffer,
+                        );
+                        // Capture remaining text for ExecOutput
+                        if !stdout_buf.is_empty() {
+                            stdout_text.push_str(&String::from_utf8_lossy(&stdout_buf));
+                            stdout_buf.clear();
                         }
                     }
-                    Ok(None) => {
-                        // stdout closed, drain stderr
-                        while let Ok(Some(l)) = stderr_reader.next_line().await {
-                            stderr_text.push_str(&l);
-                            stderr_text.push('\n');
-                            if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
-                                buffer.push(entry);
-                            }
-                        }
-                        break;
+                    Ok(bytes_read) => {
+                        // Accumulate the newly read bytes for ExecOutput
+                        stdout_text.push_str(&String::from_utf8_lossy(&stdout_buf[stdout_buf.len() - bytes_read..]));
+                        // Drain records
+                        drain_records(
+                            &mut stdout_buf, false,
+                            stdout_parser.as_mut(), extractor.as_ref(),
+                            task_name, &mut seq, buffer,
+                        );
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        stdout_done = true;
+                    }
                 }
             }
-            line = stderr_reader.next_line() => {
-                match line {
-                    Ok(Some(l)) => {
-                        stderr_text.push_str(&l);
-                        stderr_text.push('\n');
-                        if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
-                            buffer.push(entry);
+            n = stderr.read_buf(&mut stderr_buf), if !stderr_done => {
+                match n {
+                    Ok(0) => {
+                        stderr_done = true;
+                        drain_records(
+                            &mut stderr_buf, true,
+                            stderr_parser.as_mut(), extractor.as_ref(),
+                            task_name, &mut seq, buffer,
+                        );
+                        if !stderr_buf.is_empty() {
+                            stderr_text.push_str(&String::from_utf8_lossy(&stderr_buf));
+                            stderr_buf.clear();
                         }
                     }
-                    Ok(None) => {
-                        // stderr closed, drain stdout
-                        while let Ok(Some(l)) = stdout_reader.next_line().await {
-                            stdout_text.push_str(&l);
-                            stdout_text.push('\n');
-                            if let Some(entry) = process_line(&l, parser.as_mut(), extractor.as_ref(), task_name, &mut seq) {
-                                buffer.push(entry);
-                            }
-                        }
-                        break;
+                    Ok(bytes_read) => {
+                        stderr_text.push_str(&String::from_utf8_lossy(&stderr_buf[stderr_buf.len() - bytes_read..]));
+                        drain_records(
+                            &mut stderr_buf, false,
+                            stderr_parser.as_mut(), extractor.as_ref(),
+                            task_name, &mut seq, buffer,
+                        );
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        stderr_done = true;
+                    }
                 }
             }
         }
-    }
-
-    // Flush any buffered partial records from the parser.
-    if let Some(raw_record) = parser.flush() {
-        let extracted = extractor.extract(&raw_record);
-        let entry = LogEntry {
-            raw: raw_record.raw,
-            parsed: raw_record.parsed,
-            source: task_name.to_string(),
-            seq,
-            timestamp: extracted.timestamp,
-            level: extracted.level,
-            message: extracted.message,
-            fields: extracted.fields,
-        };
-        buffer.push(entry);
     }
 
     let status = child.wait().await.map_err(ProcessError::Wait)?;
@@ -374,7 +415,7 @@ pub async fn exec(
 /// Spawn a command in the background, returning a handle for monitoring and control.
 ///
 /// Output is continuously read into the provided OutputBuffer by background tasks.
-/// Lines are fed through the parsing pipeline.
+/// Bytes are fed through the parsing pipeline using BytesMut buffers.
 /// Accepts anything that converts to `Cmd`: a `&str`/`String` (shell mode) or a `Cmd` value.
 pub async fn spawn(
     command: impl Into<Cmd>,
@@ -384,8 +425,11 @@ pub async fn spawn(
     let mut cmd = command.into();
 
     // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
-    let parser: Box<dyn RecordParser> = cmd.parser.take()
+    // Separate parser instances for stdout and stderr (parsers are stateful).
+    let stdout_parser: Box<dyn RecordParser> = cmd.parser.take()
         .unwrap_or_else(|| Box::new(parse::default_parser()));
+    let stderr_parser: Box<dyn RecordParser> =
+        Box::new(parse::default_parser());
     let extractor: Box<dyn FieldExtractor> = cmd.extractor.take()
         .unwrap_or_else(|| Box::new(extract::default_extractor()));
 
@@ -393,51 +437,65 @@ pub async fn spawn(
 
     let pgid = child.id().map(|id| id as i32);
 
-    let stdout = child.stdout.take().expect("stdout piped");
-    let stderr = child.stderr.take().expect("stderr piped");
+    let mut stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
 
     let task_name_owned = task_name.to_string();
 
-    // We need the parser and extractor in the background tasks. Since parsers
-    // are stateful and not Clone, we share them via Arc<Mutex>. Each stream
-    // (stdout/stderr) feeds into the same parser so multiline detection works
-    // across both streams. In practice, stdout and stderr lines interleave
-    // nondeterministically anyway, so sharing a parser is correct.
-    let parser = std::sync::Arc::new(tokio::sync::Mutex::new(parser));
+    // Each stream gets its own parser instance (parsers are stateful).
+    // The extractor is stateless and can be shared.
+    let stdout_parser = std::sync::Arc::new(tokio::sync::Mutex::new(stdout_parser));
+    let stderr_parser = std::sync::Arc::new(tokio::sync::Mutex::new(stderr_parser));
     let extractor = std::sync::Arc::new(extractor);
     let seq = std::sync::Arc::new(tokio::sync::Mutex::new(0u64));
 
-    // Background task: read stdout lines into buffer
+    // Background task: read stdout bytes into buffer
     let buf_clone = buffer.clone();
-    let parser_clone = parser.clone();
+    let parser_clone = stdout_parser;
     let extractor_clone = extractor.clone();
     let seq_clone = seq.clone();
     let source_clone = task_name_owned.clone();
     let stdout_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let mut p = parser_clone.lock().await;
-            let mut s = seq_clone.lock().await;
-            if let Some(entry) = process_line(&line, p.as_mut(), extractor_clone.as_ref(), &source_clone, &mut s) {
-                buf_clone.lock().await.push(entry);
+        let mut byte_buf = BytesMut::new();
+        while let Ok(n) = stdout.read_buf(&mut byte_buf).await {
+            let eof = n == 0;
+
+            {
+                let mut p = parser_clone.lock().await;
+                let mut s = seq_clone.lock().await;
+                drain_records_async(
+                    &mut byte_buf, eof,
+                    p.as_mut(), extractor_clone.as_ref(),
+                    &source_clone, &mut s, &buf_clone,
+                ).await;
             }
+
+            if eof { break; }
         }
     });
 
-    // Background task: read stderr lines into buffer
+    // Background task: read stderr bytes into buffer
     let buf_clone = buffer.clone();
-    let parser_clone = parser.clone();
-    let extractor_clone = extractor.clone();
+    let parser_clone = stderr_parser;
+    let extractor_clone = extractor;
     let seq_clone = seq;
     let source_clone = task_name_owned;
     let stderr_task = tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let mut p = parser_clone.lock().await;
-            let mut s = seq_clone.lock().await;
-            if let Some(entry) = process_line(&line, p.as_mut(), extractor_clone.as_ref(), &source_clone, &mut s) {
-                buf_clone.lock().await.push(entry);
+        let mut byte_buf = BytesMut::new();
+        while let Ok(n) = stderr.read_buf(&mut byte_buf).await {
+            let eof = n == 0;
+
+            {
+                let mut p = parser_clone.lock().await;
+                let mut s = seq_clone.lock().await;
+                drain_records_async(
+                    &mut byte_buf, eof,
+                    p.as_mut(), extractor_clone.as_ref(),
+                    &source_clone, &mut s, &buf_clone,
+                ).await;
             }
+
+            if eof { break; }
         }
     });
 
