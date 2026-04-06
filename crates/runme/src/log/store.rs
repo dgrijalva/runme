@@ -157,6 +157,13 @@ impl LogStore {
         self.tx.subscribe()
     }
 
+    /// Get a reference to the broadcast sender.
+    ///
+    /// Useful for passing to streaming utilities (e.g., `stream::tail()`).
+    pub fn sender(&self) -> &broadcast::Sender<LogEntry> {
+        &self.tx
+    }
+
     /// Subscribe with a filter. Returns a `FilteredSubscription` that wraps the
     /// broadcast receiver and only yields entries matching the predicate.
     pub fn subscribe_filtered<F>(&self, filter: F) -> FilteredSubscription<F>

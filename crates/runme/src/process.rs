@@ -118,6 +118,13 @@ impl OutputBuffer {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
+
+    /// Get a reference to the broadcast sender.
+    ///
+    /// Useful for passing to streaming utilities (e.g., `stream::tail()`).
+    pub fn subscribe_sender(&self) -> &broadcast::Sender<LogEntry> {
+        &self.tx
+    }
 }
 
 /// Build a LogEntry from a RawRecord and extracted fields.

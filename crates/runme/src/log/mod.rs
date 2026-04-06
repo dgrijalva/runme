@@ -3,8 +3,10 @@ pub mod extract;
 pub mod filter;
 pub mod search;
 pub mod store;
+pub mod stream;
 
 use std::collections::HashMap;
+use serde::Serialize;
 
 /// Result of attempting to parse a record from the input buffer.
 pub enum ParseResult {
@@ -23,7 +25,7 @@ pub struct RawRecord {
 }
 
 /// How the record was parsed.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub enum ParsedContent {
     Json(serde_json::Value),
     Logfmt(Vec<(String, String)>),
@@ -41,7 +43,7 @@ pub struct ExtractedFields {
 /// The universal log record. Everything downstream works with this type.
 ///
 /// Must implement Clone (required by `tokio::broadcast`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct LogEntry {
     /// The raw text of the record, exactly as captured from the process.
     pub raw: String,
