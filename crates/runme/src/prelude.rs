@@ -1,5 +1,6 @@
-pub use crate::task::{TaskDef, TaskContext, TaskFn, Registry, TaskError};
-pub use crate::process::{ExecResult, ProcessHandle, ProcessError, LogLine, OutputBuffer};
+pub use crate::error::{ExitHint, ResultExt, TaskError, TaskResult};
+pub use crate::process::{ExecOutput, ExecOutputExt, LogLine, OutputBuffer, ProcessError, ProcessHandle};
 pub use crate::signal::SignalHandler;
-pub use runme_macros::task;
+pub use crate::task::{Registry, TaskContext, TaskDef, TaskFn};
 pub use runme_macros::main as runme_main;
+pub use runme_macros::task;

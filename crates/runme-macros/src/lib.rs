@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, ItemFn, Meta, Expr, ExprLit, Lit, MetaNameValue};
+use syn::{parse_macro_input, ItemFn, Meta, Expr, ExprLit, Lit, MetaNameValue, ReturnType};
 
 /// Attribute macro for defining a runme task.
 ///
@@ -74,6 +74,25 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
 
+    // If no desc attribute, extract from doc comments (/// lines)
+    if description.is_none() {
+        let doc_lines: Vec<String> = input_fn
+            .attrs
+            .iter()
+            .filter_map(|attr| {
+                if attr.path().is_ident("doc") {
+                    if let Meta::NameValue(MetaNameValue { value: Expr::Lit(ExprLit { lit: Lit::Str(s), .. }), .. }) = &attr.meta {
+                        return Some(s.value().trim().to_string());
+                    }
+                }
+                None
+            })
+            .collect();
+        if !doc_lines.is_empty() {
+            description = Some(doc_lines.join(" "));
+        }
+    }
+
     // Generate the description token
     let desc_tokens = match &description {
         Some(d) => quote! { Some(#d) },
@@ -100,19 +119,47 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         fn_name.span(),
     );
 
-    // The wrapper function adapts the user's function (sync or async)
-    // to the TaskFn type: fn(&TaskContext) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>
-    let wrapper = if is_async {
-        quote! {
-            fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + Send + '_>> {
-                ::std::boxed::Box::pin(#fn_name(ctx))
+    // Detect whether the function has an explicit return type (Result) or returns ()
+    let has_return_type = !matches!(input_fn.sig.output, ReturnType::Default);
+
+    // The wrapper adapts the user's function (sync/async, void/Result)
+    // to TaskFn: fn(&TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>>
+    let wrapper = match (is_async, has_return_type) {
+        (true, true) => {
+            // async fn(...) -> Result<(), TaskError>
+            quote! {
+                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
+                    ::std::boxed::Box::pin(#fn_name(ctx))
+                }
             }
         }
-    } else {
-        quote! {
-            fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ()> + Send + '_>> {
-                #fn_name(ctx);
-                ::std::boxed::Box::pin(::std::future::ready(()))
+        (true, false) => {
+            // async fn(...) — no return type, wrap with Ok(())
+            quote! {
+                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
+                    ::std::boxed::Box::pin(async move {
+                        #fn_name(ctx).await;
+                        Ok(())
+                    })
+                }
+            }
+        }
+        (false, true) => {
+            // fn(...) -> Result<(), TaskError>
+            quote! {
+                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
+                    let result = #fn_name(ctx);
+                    ::std::boxed::Box::pin(::std::future::ready(result))
+                }
+            }
+        }
+        (false, false) => {
+            // fn(...) — no return type, wrap with Ok(())
+            quote! {
+                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
+                    #fn_name(ctx);
+                    ::std::boxed::Box::pin(::std::future::ready(Ok(())))
+                }
             }
         }
     };
@@ -169,7 +216,15 @@ pub fn main(_attr: TokenStream, _item: TokenStream) -> TokenStream {
 
                     // Run the named task
                     if let Some(task_name) = args.get(1) {
-                        registry.run(task_name).await;
+                        if let Err(e) = registry.run(task_name).await {
+                            let output = e.output();
+                            if output.is_object() || output.is_array() {
+                                eprintln!("{}", ::runme::serde_json::to_string_pretty(output).unwrap_or_else(|_| e.to_string()));
+                            } else {
+                                eprintln!("Error: {}", e);
+                            }
+                            ::std::process::exit(e.exit_code());
+                        }
                     } else {
                         println!("Available tasks:");
                         for task in registry.list() {

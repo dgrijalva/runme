@@ -75,16 +75,18 @@ pub fn compile(runme_file: &Path) -> Result<CompileResult, CompileError> {
     // Need to compile: generate the Cargo project
     generate_project(&cache_dir, &source, runme_file)?;
 
+    eprintln!("runme: compiling...");
+
     // Run cargo build.
     // Set CARGO_TARGET_DIR explicitly so that cargo doesn't follow the path
     // dependency back into the workspace and use its target directory instead.
     let target_dir = cache_dir.join("target");
     let output = Command::new("cargo")
-        .args(["build", "--release"])
+        .args(["build"])
         .current_dir(&cache_dir)
         .env("CARGO_TARGET_DIR", &target_dir)
         .output()
-        .map_err(|e| CompileError::Io(e))?;
+        .map_err(CompileError::Io)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -118,7 +120,7 @@ fn cache_dir_for(hash_prefix: &str) -> Result<PathBuf, CompileError> {
 fn binary_path_in(cache_dir: &Path) -> PathBuf {
     cache_dir
         .join("target")
-        .join("release")
+        .join("debug")
         .join("runme-script")
 }
 
@@ -307,9 +309,10 @@ mod tests {
 use std::pin::Pin;
 use std::future::Future;
 
-fn hello(ctx: &TaskContext) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {{
+fn hello(ctx: &TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {{
     Box::pin(async move {{
         println!("Hello from compile test: {{}}", ctx.name);
+        Ok(())
     }})
 }}
 
@@ -336,7 +339,10 @@ fn main() {{
 
     let rt = runme::tokio::runtime::Runtime::new().unwrap();
     if let Some(task_name) = args.get(1) {{
-        rt.block_on(registry.run(task_name));
+        if let Err(e) = rt.block_on(registry.run(task_name)) {{
+            eprintln!("Error: {{}}", e);
+            std::process::exit(e.exit_code());
+        }}
     }} else {{
         println!("Available tasks:");
         for task in registry.list() {{

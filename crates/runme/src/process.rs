@@ -8,10 +8,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::broadcast;
 
-/// Result of a completed process execution.
+/// Captured output from a process execution.
 #[derive(Debug, Clone)]
-pub struct ExecResult {
-    pub exit_code: i32,
+pub struct ExecOutput {
     pub stdout: String,
     pub stderr: String,
 }
@@ -48,6 +47,8 @@ pub enum ProcessError {
     Signal(nix::Error),
     Wait(std::io::Error),
     Timeout,
+    /// Process exited with a non-zero exit code.
+    ExitCode { code: i32, output: ExecOutput },
 }
 
 impl std::fmt::Display for ProcessError {
@@ -57,11 +58,30 @@ impl std::fmt::Display for ProcessError {
             ProcessError::Signal(e) => write!(f, "failed to send signal: {}", e),
             ProcessError::Wait(e) => write!(f, "failed to wait for process: {}", e),
             ProcessError::Timeout => write!(f, "process did not exit within timeout"),
+            ProcessError::ExitCode { code, .. } => write!(f, "process exited with code {}", code),
         }
     }
 }
 
 impl std::error::Error for ProcessError {}
+
+/// Extension trait for accessing output from exec results regardless of exit code.
+pub trait ExecOutputExt {
+    fn output(&self) -> Option<&ExecOutput>;
+}
+
+impl ExecOutputExt for Result<ExecOutput, ProcessError> {
+    /// Returns the captured output whether the process succeeded or failed
+    /// with a non-zero exit code. Returns `None` only for infrastructure
+    /// errors (spawn failure, signal error, etc.).
+    fn output(&self) -> Option<&ExecOutput> {
+        match self {
+            Ok(output) => Some(output),
+            Err(ProcessError::ExitCode { output, .. }) => Some(output),
+            Err(_) => None,
+        }
+    }
+}
 
 /// Output ring buffer for a task.
 ///
@@ -174,13 +194,17 @@ impl ProcessHandle {
     }
 
     /// Wait for the process to exit and return the result.
-    pub async fn wait(&mut self) -> Result<ExecResult, ProcessError> {
+    pub async fn wait(&mut self) -> Result<ExecOutput, ProcessError> {
         let status = self.child.wait().await.map_err(ProcessError::Wait)?;
-        Ok(ExecResult {
-            exit_code: status.code().unwrap_or(-1),
+        let exit_code = status.code().unwrap_or(-1);
+        let output = ExecOutput {
             stdout: String::new(), // Output went to the buffer via background tasks
             stderr: String::new(),
-        })
+        };
+        if exit_code != 0 {
+            return Err(ProcessError::ExitCode { code: exit_code, output });
+        }
+        Ok(output)
     }
 
     /// Get the task name associated with this handle.
@@ -226,7 +250,7 @@ pub async fn exec(
     command: &str,
     task_name: &str,
     buffer: &mut OutputBuffer,
-) -> Result<ExecResult, ProcessError> {
+) -> Result<ExecOutput, ProcessError> {
     let mut child = build_command(command).spawn().map_err(ProcessError::Spawn)?;
 
     let stdout = child.stdout.take().expect("stdout piped");
@@ -286,11 +310,17 @@ pub async fn exec(
 
     let _ = task_name; // used for future logging context
 
-    Ok(ExecResult {
-        exit_code: status.code().unwrap_or(-1),
+    let exit_code = status.code().unwrap_or(-1);
+    let output = ExecOutput {
         stdout: stdout_text,
         stderr: stderr_text,
-    })
+    };
+
+    if exit_code != 0 {
+        return Err(ProcessError::ExitCode { code: exit_code, output });
+    }
+
+    Ok(output)
 }
 
 /// Spawn a command in the background, returning a handle for monitoring and control.
@@ -344,17 +374,15 @@ mod tests {
     #[tokio::test]
     async fn test_exec_captures_stdout() {
         let mut buffer = OutputBuffer::new(100);
-        let result = exec("echo hello", "test", &mut buffer).await.unwrap();
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stdout, "hello\n");
+        let output = exec("echo hello", "test", &mut buffer).await.unwrap();
+        assert_eq!(output.stdout, "hello\n");
     }
 
     #[tokio::test]
     async fn test_exec_captures_stderr() {
         let mut buffer = OutputBuffer::new(100);
-        let result = exec("echo error >&2", "test", &mut buffer).await.unwrap();
-        assert_eq!(result.exit_code, 0);
-        assert_eq!(result.stderr, "error\n");
+        let output = exec("echo error >&2", "test", &mut buffer).await.unwrap();
+        assert_eq!(output.stderr, "error\n");
     }
 
     #[tokio::test]
@@ -388,8 +416,11 @@ mod tests {
     #[tokio::test]
     async fn test_exec_nonzero_exit() {
         let mut buffer = OutputBuffer::new(100);
-        let result = exec("exit 42", "test", &mut buffer).await.unwrap();
-        assert_eq!(result.exit_code, 42);
+        let err = exec("exit 42", "test", &mut buffer).await.unwrap_err();
+        match err {
+            ProcessError::ExitCode { code, .. } => assert_eq!(code, 42),
+            other => panic!("expected ExitCode, got: {:?}", other),
+        }
     }
 
     #[tokio::test]

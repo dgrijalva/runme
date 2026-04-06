@@ -1,16 +1,18 @@
 use runme::prelude::*;
 
-#[runme::task(desc = "Install runme CLI via cargo install")]
-fn install(_ctx: &TaskContext) {
-    let status = std::process::Command::new("cargo")
-        .args(["install", "--path", "crates/runme-cli"])
-        .status()
-        .expect("failed to run cargo install");
-
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
+/// Install runme CLI via cargo install
+#[runme::task]
+async fn install(ctx: &TaskContext) -> TaskResult {
+    ctx.exec("cargo install --path crates/runme-cli").await?;
+    Ok(())
 }
 
 #[runme::main]
 fn main() {}
+
+/// Test task
+#[runme::task]
+fn test(_ctx: &TaskContext) -> TaskResult {
+    eprintln!("test2333");
+    Ok(())
+}

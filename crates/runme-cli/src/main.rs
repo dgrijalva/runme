@@ -44,14 +44,7 @@ fn main() {
 
     // Compile (or use cached binary)
     let compiled = match compile(&runme_file) {
-        Ok(result) => {
-            if result.was_cached {
-                eprintln!("runme: using cached binary");
-            } else {
-                eprintln!("runme: compiled {}", runme_file.display());
-            }
-            result
-        }
+        Ok(result) => result,
         Err(e) => {
             eprintln!("runme: compilation failed: {}", e);
             std::process::exit(1);

@@ -1,3 +1,4 @@
+pub mod error;
 pub mod task;
 pub mod process;
 pub mod signal;
@@ -12,3 +13,6 @@ pub use inventory;
 
 // Re-export tokio so macro-generated code (#[tokio::main]) can reference it
 pub use tokio;
+
+// Re-export serde_json so macro-generated code can reference it
+pub use serde_json;

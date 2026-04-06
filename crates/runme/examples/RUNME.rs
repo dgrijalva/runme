@@ -1,11 +1,13 @@
 use runme::prelude::*;
 
-#[runme::task(desc = "Say hello")]
+/// Say hello
+#[runme::task]
 async fn hello(ctx: &TaskContext) {
     println!("Hello from task: {}", ctx.name);
 }
 
-#[runme::task(desc = "Say goodbye")]
+/// Say goodbye
+#[runme::task]
 async fn goodbye(ctx: &TaskContext) {
     println!("Goodbye from task: {}", ctx.name);
 }
