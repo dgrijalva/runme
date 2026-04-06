@@ -37,6 +37,75 @@ The `runme` binary owns the compile-and-run pipeline:
 
 This means RUNME.rs files are just Rust code — no special syntax, no nightly features, no cargo-script. The `runme` tool handles all the build machinery transparently. The `runme` library dependency is auto-injected into the generated Cargo.toml.
 
+### Multi-File Compilation
+
+When multiple RUNME.rs files exist in a directory tree, they are all compiled into a **single binary**. The TUI, log engine, process management, and task runtime live in the `runme` library crate, which gets compiled into this binary. Everything runs in-process — no cross-process serialization boundary. The existing `Registry`/`OutputBuffer`/`LogStore` model works as-is.
+
+#### Generated Workspace
+
+Each discovered RUNME.rs becomes its own crate in a generated Cargo workspace:
+
+```
+~/.cache/runme/<hash>/
+├── Cargo.toml           # workspace manifest
+├── root/
+│   ├── Cargo.toml       # lib crate for ./RUNME.rs
+│   └── src/lib.rs       # stripped RUNME.rs source (no main)
+├── services_auth/
+│   ├── Cargo.toml       # lib crate for services/auth/RUNME.rs
+│   └── src/lib.rs
+├── web_app/
+│   ├── Cargo.toml       # lib crate for web-app/RUNME.rs
+│   └── src/lib.rs
+└── runner/
+    ├── Cargo.toml       # bin crate — depends on all the above
+    └── src/main.rs      # imports all crates, builds unified Registry, runs TUI
+```
+
+1. **Discover** all RUNME.rs files in the tree (walk up, then walk down).
+2. **Generate a workspace** in the cache directory. Each RUNME.rs becomes a library crate. Its `main()` / `#[runme::main]` is stripped — it exports only its `inventory`-registered tasks.
+3. **Each RUNME.rs crate** depends on the `runme` library and declares its own frontmatter dependencies. Dependency collisions between files are isolated by crate boundaries — each crate can use different versions of the same dependency.
+4. **The runner crate** depends on all RUNME.rs crates. Because `inventory` uses linker sections, all `TaskDef` registrations from all crates end up in the same global collection at link time. The runner's `main()` calls `Registry::from_inventory()` and gets every task from every file. No explicit wiring needed.
+5. **Content-hash** covers all source files combined. Cache invalidation recompiles only when any source changes.
+
+#### Path Dependencies
+
+RUNME.rs files can declare path-relative dependencies in their frontmatter:
+
+```rust
+//! [dependencies]
+//! monorepo-tools = { path = "../shared/tools" }
+```
+
+Once the source is copied into the cache directory, these relative paths would be broken. The code generator resolves this by rewriting path dependencies at generation time: the relative path is resolved against the **original RUNME.rs file's location** to produce an absolute path, which is written into the generated crate's `Cargo.toml`. The source code itself is unchanged.
+
+Cache invalidation for path dependencies: the content hash of the RUNME.rs file alone is not sufficient — changes to the path dependency's source would not trigger recompilation. Options:
+- Lean on Cargo's own incremental compilation: the generated project points at the real path on disk, so `cargo build` will detect source changes in path dependencies even if our hash says "cached." This requires separating "regenerate the Cargo project" (only when RUNME.rs files change) from "rebuild" (always run `cargo build`, let Cargo decide).
+- Include path dependency contents in the hash (expensive for large shared crates).
+
+The first option (let Cargo handle it) is simpler and likely sufficient. The cost is running `cargo build` on every invocation, but Cargo's own caching makes this a no-op when nothing changed.
+
+#### Task Grouping
+
+Tasks need to know which RUNME.rs they came from so the UI can group and namespace them. This requires a `group` field on `TaskDef`:
+
+```rust
+pub struct TaskDef {
+    pub name: &'static str,
+    pub description: Option<&'static str>,
+    pub group: &'static str,           // relative path of the RUNME.rs file
+    pub watch: Option<&'static str>,
+    pub depends_on: &'static [&'static str],
+    pub func: TaskFn,
+}
+```
+
+**Default**: the `#[task]` macro populates `group` automatically. The code generator can inject the relative path (e.g., `services/auth`) as a constant that the macro references. Alternatively, `file!()` gives the compile-time source path, which the macro can normalize.
+
+**Override**: a RUNME.rs file can set a human-friendly name for its group via a library API (e.g., `runme::set_group_name("Auth Service")` or an attribute on `#[runme::main]`). When set, this overrides the path-based default. The exact API is TBD.
+
+The root RUNME.rs group defaults to `.` or the project directory name.
+
 ### The `runme` CLI
 
 An installed binary. Handles discovery, compilation, and dispatch:
