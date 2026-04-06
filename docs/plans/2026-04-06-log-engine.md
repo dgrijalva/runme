@@ -77,14 +77,14 @@ Research (parallel)
 
 ## Status
 
-- [ ] Draft
-- [ ] Approved
+- [x] Draft
+- [x] Approved
 - [x] Research complete
-- [ ] Design synthesis complete
-- [ ] Wave 1: Parsing pipeline
-- [ ] Wave 2: Filter engine, log store, search
-- [ ] Wave 3: Re-streaming, export
-- [ ] Final validation
+- [x] Design synthesis complete
+- [x] Wave 1: Parsing pipeline
+- [x] Wave 2: Filter engine, log store, search
+- [x] Wave 3: Re-streaming, export
+- [x] Final validation
 
 ## Context
 
@@ -435,12 +435,17 @@ validation:
 | Remove derive(Clone) from Cmd | Box<dyn RecordParser> and Box<dyn FieldExtractor> are not Clone. Cmd is only cloned in tests. Cleaner than manual Clone impl. | 2026-04-06 |
 | LogEntry derives Clone | Required by tokio::broadcast::Sender. All fields are Clone-able. | 2026-04-06 |
 | Additional well-known fields go in HashMap, not struct | caller, error, stack_trace, hostname, pid, service, trace_id, span_id, request_id are useful but not universal enough for struct fields. | 2026-04-06 |
-| Anomaly detection in JsonlParser | Non-JSON in an otherwise-JSON stream is flagged with _anomalous field. Signals panics, misconfigurations, or debug output. | 2026-04-06 |
+| ~~Anomaly detection in JsonlParser~~ | Removed — superseded by stateless JsonlParser. See later decision. | 2026-04-06 |
 | spawn() ProcessHandle carries Arc<Mutex<OutputBuffer>> | Fixes existing bug where buffer ref is dropped. Composition across sources is wave 2 (log store). | 2026-04-06 |
 | RecordParser takes &[u8] bytes, not &str lines | Enables binary format support (BSON, protobuf). Stream handler owns BytesMut buffer, parser is a pure recognizer. Eliminates BufReader::lines() pre-splitting. | 2026-04-06 |
 | ParseResult::Record includes bytes consumed | Parser reports how many bytes it consumed so stream handler can advance the buffer. Enables concatenated records without delimiters. | 2026-04-06 |
 | EOF flag on feed() instead of separate flush() | Single code path for all parsing. At EOF, parsers that would return Incomplete emit what they have or Reject. No duplicate logic across feed/flush. | 2026-04-06 |
 | BytesMut for stream handler buffer | O(1) advance past consumed bytes vs Vec<u8> drain which is O(n). Already a transitive dep via tokio. Parser receives &[u8] — doesn't know the buffer type. | 2026-04-06 |
+| next_line() free function for line-based parsers | Shared line-scanning helper (find \n, handle EOF, UTF-8 conversion, consumed bytes). PlainLineParser is a thin wrapper. Multiline parsers call it in loops. Eliminates duplicated newline logic. | 2026-04-06 |
+| Parse module split into per-parser files | parse.rs → parse/ directory. mod.rs has trait + FallbackParser + next_line. Each parser in its own file with co-located tests. | 2026-04-06 |
+| JsonlParser is stateless | Removed json_record_count and anomaly detection. Brace-depth tracking emits on completion, starts fresh. Anomaly detection is a higher-layer concern if needed. | 2026-04-06 |
+| Binary data handling deferred | Documented as unsolved problem in design doc. Current behavior: from_utf8_lossy in PlainLineParser. Trait boundary already supports &[u8] for future binary parsers. | 2026-04-06 |
+| Filter parser uses winnow v0.7 | Hand-rolled parser replaced with winnow combinators per original design. Explicit dispatch by first character for value types (not alt, which backtracks incorrectly). | 2026-04-06 |
 
 ## Findings
 
@@ -452,7 +457,7 @@ validation:
 
 **Multiline patterns:** Rust panic and cargo diagnostic patterns are well-defined with clear start/continuation/end heuristics -- recommended for wave 1. Python tracebacks, Java stack traces, Go panics, and Node.js errors were cataloged but deferred to wave 2.
 
-**Anomaly detection:** When JsonlParser has seen >3 JSON lines and encounters non-JSON, flag with `_anomalous: true` and `_anomaly_reason` in the fields HashMap.
+**Anomaly detection:** Originally planned as a JsonlParser feature (flag non-JSON after 3+ JSON records). Removed during byte-oriented refactor — the stateless brace-depth parser doesn't need stream-level context. If anomaly detection is needed later, it belongs in a higher layer that can see stream history.
 
 **Additional well-known fields:** Nine semantic field groups identified for extraction into the fields HashMap (not as struct fields): caller/source, error, stack_trace, hostname, PID, service, trace_id, span_id, request_id -- each with multiple common name variations.
 

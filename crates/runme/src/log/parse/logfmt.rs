@@ -136,16 +136,7 @@ impl RecordParser for LogfmtParser {
                     None => ParseResult::Rejection,
                 }
             }
-            ParseResult::Incomplete => {
-                // No newline yet and not EOF -- could be incomplete logfmt
-                // Check if what we have so far could be logfmt to decide Incomplete vs Rejection
-                let line = String::from_utf8_lossy(data);
-                if line.contains('=') {
-                    ParseResult::Incomplete
-                } else {
-                    ParseResult::Rejection
-                }
-            }
+            ParseResult::Incomplete => ParseResult::Incomplete,
             other => other,
         }
     }

@@ -3,19 +3,13 @@ use super::RecordParser;
 
 /// Detects JSON objects and arrays from raw bytes. Uses brace/bracket depth
 /// tracking (skipping quoted strings) to find the end of a JSON record.
-/// Handles both newline-delimited JSON and concatenated JSON (`{"a":1}{"b":2}`).
-///
-/// Anomaly detection: after 3+ JSON records, non-JSON input is rejected
-/// (not emitted as a record -- the next parser handles it).
-pub struct JsonlParser {
-    json_record_count: u64,
-}
+/// Handles both newline-delimited JSON and concatenated JSON (`{"a":1}{"b":2}`),
+/// as well as pretty-printed JSON spanning multiple lines.
+pub struct JsonlParser;
 
 impl JsonlParser {
     pub fn new() -> Self {
-        Self {
-            json_record_count: 0,
-        }
+        Self
     }
 
     /// Skip leading whitespace/newlines in the byte slice.
@@ -100,7 +94,7 @@ impl JsonlParser {
 
 impl Default for JsonlParser {
     fn default() -> Self {
-        Self::new()
+        Self
     }
 }
 
@@ -126,13 +120,8 @@ impl RecordParser for JsonlParser {
 
         let first_byte = data[ws_skip];
 
-        // Check if it starts with { or [
+        // Not JSON if it doesn't start with { or [
         if first_byte != b'{' && first_byte != b'[' {
-            // Not JSON. If we've seen 3+ JSON records, reject (anomaly detection --
-            // the next parser handles it).
-            if self.json_record_count > 3 {
-                return ParseResult::Rejection;
-            }
             return ParseResult::Rejection;
         }
 
@@ -144,7 +133,6 @@ impl RecordParser for JsonlParser {
                 // Try to parse as JSON
                 match serde_json::from_slice::<serde_json::Value>(json_bytes) {
                     Ok(val) if val.is_object() || val.is_array() => {
-                        self.json_record_count += 1;
                         let raw = String::from_utf8_lossy(json_bytes).into_owned();
 
                         // Count trailing whitespace after JSON
@@ -185,9 +173,7 @@ impl RecordParser for JsonlParser {
         }
     }
 
-    fn reset(&mut self) {
-        self.json_record_count = 0;
-    }
+    fn reset(&mut self) {}
 }
 
 #[cfg(test)]
@@ -250,45 +236,6 @@ mod tests {
     fn jsonl_rejects_number() {
         let mut parser = JsonlParser::new();
         let result = parser.feed(b"42\n", false);
-        assert!(matches!(result, ParseResult::Rejection));
-    }
-
-    #[test]
-    fn jsonl_anomaly_detection() {
-        let mut parser = JsonlParser::new();
-        // Feed 4 JSON records to exceed threshold
-        parser.feed(b"{\"a\":1}\n", false);
-        parser.feed(b"{\"b\":2}\n", false);
-        parser.feed(b"{\"c\":3}\n", false);
-        parser.feed(b"{\"d\":4}\n", false);
-
-        // Now a non-JSON line should be rejected (anomaly --
-        // the next parser handles it)
-        let result = parser.feed(b"plain text after json\n", false);
-        assert!(matches!(result, ParseResult::Rejection));
-    }
-
-    #[test]
-    fn jsonl_no_anomaly_before_threshold() {
-        let mut parser = JsonlParser::new();
-        // Only 2 JSON records
-        parser.feed(b"{\"a\":1}\n", false);
-        parser.feed(b"{\"b\":2}\n", false);
-        // Non-JSON line should be a Rejection
-        let result = parser.feed(b"plain text\n", false);
-        assert!(matches!(result, ParseResult::Rejection));
-    }
-
-    #[test]
-    fn jsonl_reset_clears_count() {
-        let mut parser = JsonlParser::new();
-        parser.feed(b"{\"a\":1}\n", false);
-        parser.feed(b"{\"b\":2}\n", false);
-        parser.feed(b"{\"c\":3}\n", false);
-        parser.feed(b"{\"d\":4}\n", false);
-        parser.reset();
-        // After reset, non-JSON should be Rejection (count was cleared)
-        let result = parser.feed(b"plain text\n", false);
         assert!(matches!(result, ParseResult::Rejection));
     }
 
