@@ -15,7 +15,7 @@ use super::render::DisplayMode;
 use super::runner::TaskStatus;
 use super::sidebar;
 use super::viewport::{
-    scroll_down, scroll_down_half_page, scroll_to_bottom, scroll_to_top,
+    self, scroll_down, scroll_down_half_page, scroll_to_bottom, scroll_to_top,
     scroll_up, scroll_up_half_page,
 };
 
@@ -76,6 +76,12 @@ pub async fn run_event_loop(
             result = log_rx.recv() => {
                 match result {
                     Ok(entry) => {
+                        // Check new entry against active search before pushing
+                        if state.search.active {
+                            let visible_count = state.visible_line_indices().len();
+                            let text = entry.message.as_deref().unwrap_or(&entry.raw);
+                            state.search.check_new_entry(visible_count, text);
+                        }
                         state.log_lines.push(entry);
                         // In tail mode, scroll state stays as Tail (which will
                         // automatically anchor to the new last entry on render).
@@ -90,6 +96,19 @@ pub async fn run_event_loop(
                         state.dirty = true;
                         drop(store);
                         let _ = n; // acknowledged
+                        // Rescan search matches since entries changed
+                        if state.search.active {
+                            let visible = state.visible_log_lines();
+                            let texts: Vec<(usize, String)> = visible
+                                .iter()
+                                .enumerate()
+                                .map(|(i, e)| {
+                                    let text = e.message.as_deref().unwrap_or(&e.raw).to_string();
+                                    (i, text)
+                                })
+                                .collect();
+                            state.search.scan_matches(texts.iter().map(|(i, t)| (*i, t.as_str())));
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         // Log stream closed; keep running (task may have finished)
@@ -207,6 +226,13 @@ fn handle_key(
     // Filter input mode gets its own key handling — only Esc and Ctrl-C escape
     if state.mode == AppMode::FilterInput {
         handle_filter_input_key(key, state);
+        state.dirty = true;
+        return;
+    }
+
+    // Search input mode gets its own key handling
+    if state.mode == AppMode::SearchInput {
+        handle_search_input_key(key, state, &filtered_entries, viewport_height, viewport_width);
         state.dirty = true;
         return;
     }
@@ -408,6 +434,32 @@ fn handle_log_viewer_key(
             state.mode = AppMode::FilterInput;
         }
 
+        // /: enter search input mode
+        KeyCode::Char('/') => {
+            // Pre-populate with the previous search pattern if any
+            state.search.text = state.search.pattern.clone();
+            state.search.cursor = state.search.text.len();
+            state.mode = AppMode::SearchInput;
+        }
+
+        // n: jump to next search match
+        KeyCode::Char('n') => {
+            if state.search.active
+                && let Some(target) = state.search.next_match()
+            {
+                navigate_to_entry(state, target, filtered_entries, viewport_height, viewport_width);
+            }
+        }
+
+        // N: jump to previous search match
+        KeyCode::Char('N') => {
+            if state.search.active
+                && let Some(target) = state.search.prev_match()
+            {
+                navigate_to_entry(state, target, filtered_entries, viewport_height, viewport_width);
+            }
+        }
+
         // 1-9: toggle source N
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
@@ -467,6 +519,131 @@ fn handle_filter_input_key(key: KeyEvent, state: &mut AppState) {
         }
 
         _ => {}
+    }
+}
+
+/// Handle keys when in search input mode.
+fn handle_search_input_key(
+    key: KeyEvent,
+    state: &mut AppState,
+    filtered_entries: &[LogEntry],
+    viewport_height: u16,
+    viewport_width: u16,
+) {
+    match key.code {
+        // Enter: confirm search, scan matches, jump to nearest
+        KeyCode::Enter => {
+            state.search.confirm();
+            if state.search.active {
+                // Scan all visible entries for the pattern
+                let visible = state.visible_log_lines();
+                let texts: Vec<(usize, String)> = visible
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        let text = e.message.as_deref().unwrap_or(&e.raw).to_string();
+                        (i, text)
+                    })
+                    .collect();
+                state.search.scan_matches(texts.iter().map(|(i, t)| (*i, t.as_str())));
+
+                // Jump to the nearest match from the current cursor position
+                let cursor_pos = match state.scroll {
+                    viewport::ScrollState::Tail => {
+                        let visible_count = state.visible_line_indices().len();
+                        if visible_count > 0 { visible_count - 1 } else { 0 }
+                    }
+                    viewport::ScrollState::Pinned { cursor, .. } => cursor,
+                };
+                if let Some(target) = state.search.jump_to_nearest(cursor_pos) {
+                    navigate_to_entry(state, target, filtered_entries, viewport_height, viewport_width);
+                }
+            }
+            state.mode = AppMode::Normal;
+        }
+
+        // Esc: cancel search and return to Normal mode
+        KeyCode::Esc => {
+            state.search.cancel();
+            state.mode = AppMode::Normal;
+        }
+
+        // Ctrl-u: clear the search input
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.search.clear_input();
+        }
+
+        // Ctrl-c: cancel and return to Normal mode
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.search.cancel();
+            state.mode = AppMode::Normal;
+        }
+
+        // Left arrow: move cursor left
+        KeyCode::Left => {
+            state.search.move_left();
+        }
+
+        // Right arrow: move cursor right
+        KeyCode::Right => {
+            state.search.move_right();
+        }
+
+        // Backspace: delete character before cursor
+        KeyCode::Backspace => {
+            state.search.delete_char_before();
+        }
+
+        // Any other character: insert into the search text
+        KeyCode::Char(ch) => {
+            state.search.insert_char(ch);
+        }
+
+        _ => {}
+    }
+}
+
+/// Navigate to a specific visible entry index, updating the scroll state.
+fn navigate_to_entry(
+    state: &mut AppState,
+    target: usize,
+    _filtered_entries: &[LogEntry],
+    viewport_height: u16,
+    _viewport_width: u16,
+) {
+    let total = state.visible_line_indices().len();
+    if total == 0 {
+        return;
+    }
+    let target = target.min(total.saturating_sub(1));
+
+    // If target is the last entry, go to Tail
+    if target >= total.saturating_sub(1) {
+        state.scroll = viewport::ScrollState::Tail;
+    } else {
+        // Set cursor to target, compute appropriate top
+        let current_top = match state.scroll {
+            viewport::ScrollState::Pinned { top, .. } => top,
+            viewport::ScrollState::Tail => 0,
+        };
+        state.scroll = viewport::ScrollState::Pinned {
+            cursor: target,
+            top: current_top,
+        };
+        // Let the viewport adjust top for the new cursor position
+        // We need the filtered entries for this — recalculate from visible
+        let visible_entries: Vec<LogEntry> = state.visible_log_lines().into_iter().cloned().collect();
+        if !visible_entries.is_empty() {
+            // Use scroll_down/scroll_up logic to adjust — just set and let render fix it
+            // For a clean approach, manually recompute. A simple heuristic:
+            // Put the target entry in the middle of the viewport.
+            let half = (viewport_height / 2) as usize;
+            let new_top = target.saturating_sub(half);
+            state.scroll = viewport::ScrollState::Pinned {
+                cursor: target,
+                top: new_top,
+            };
+        }
     }
 }
 

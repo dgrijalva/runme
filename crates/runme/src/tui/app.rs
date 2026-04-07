@@ -26,6 +26,7 @@ use super::event::run_event_loop;
 use super::filter::{FilterInputState, filter_status_spans, render_filter_input};
 use super::render::{DisplayMode, SourceColors};
 use super::runner::{ProcessInfo, TaskRunner, TaskStatus};
+use super::search::{SearchState, render_search_input, search_status_spans};
 use super::sidebar::{self, SidebarEntry, SidebarState, SIDEBAR_WIDTH};
 use super::viewport::{self, ScrollState, new_entries_since_pin};
 
@@ -36,6 +37,8 @@ pub enum AppMode {
     Normal,
     /// Filter expression input mode
     FilterInput,
+    /// Search pattern input mode
+    SearchInput,
 }
 
 /// Core application state, shared across the event loop and rendering.
@@ -74,6 +77,8 @@ pub struct AppState {
     pub processes: Option<Arc<Mutex<Vec<ProcessInfo>>>>,
     /// Filter input state for the filter bar.
     pub filter_input: FilterInputState,
+    /// Search state for / search with n/N navigation.
+    pub search: SearchState,
 }
 
 impl Default for AppState {
@@ -101,6 +106,7 @@ impl AppState {
             sidebar_entries: Vec::new(),
             processes: None,
             filter_input: FilterInputState::new(),
+            search: SearchState::new(),
         }
     }
 
@@ -364,18 +370,36 @@ pub fn render_frame(
                 .map(|_| Line::from(""))
                 .collect();
 
+            // Determine if search highlighting is needed
+            let search_pattern = if state.search.active {
+                Some(state.search.pattern.clone())
+            } else {
+                None
+            };
+            let current_search_entry = state.search.current_match_index();
+
             // Place rendered entries into the buffer at their Y positions
             let cursor_style = Style::default().bg(Color::DarkGray);
             for ve in &vp_layout.entries {
+                // Determine if this entry is the current search match
+                let is_current_search_match = current_search_entry == Some(ve.entry_index);
+
                 for (line_offset, line) in ve.lines.iter().enumerate() {
                     let y = ve.y as usize + line_offset;
                     if y < log_height as usize {
+                        // Apply search highlighting if search is active
+                        let display_line = if let Some(ref pattern) = search_pattern {
+                            apply_search_highlight(line, pattern, is_current_search_match)
+                        } else {
+                            line.clone()
+                        };
+
                         if ve.is_cursor {
                             // Highlight the focused row
-                            let highlighted = line.clone().patch_style(cursor_style);
+                            let highlighted = display_line.patch_style(cursor_style);
                             line_buffer[y] = highlighted;
                         } else {
-                            line_buffer[y] = line.clone();
+                            line_buffer[y] = display_line;
                         }
                     }
                 }
@@ -391,10 +415,14 @@ pub fn render_frame(
         if state.mode == AppMode::FilterInput {
             // Render the filter input bar instead of the normal status bar
             render_filter_input(frame, vert_chunks[1], &state.filter_input);
+        } else if state.mode == AppMode::SearchInput {
+            // Render the search input bar instead of the normal status bar
+            render_search_input(frame, vert_chunks[1], &state.search);
         } else {
             let mode_text = match state.mode {
                 AppMode::Normal => "NORMAL",
                 AppMode::FilterInput => "FILTER", // won't reach here, but exhaustive
+                AppMode::SearchInput => "SEARCH", // won't reach here, but exhaustive
             };
 
             let focus_text = if state.sidebar.focused {
@@ -453,6 +481,9 @@ pub fn render_frame(
             // Active expression filter indicator
             spans.extend(filter_status_spans(&state.filter_input));
 
+            // Active search indicator
+            spans.extend(search_status_spans(&state.search));
+
             // Scroll position / entry count — use visible count
             let visible_count = state.visible_line_indices().len();
             if visible_count > 0 {
@@ -486,6 +517,55 @@ pub fn render_frame(
     })?;
 
     Ok(())
+}
+
+/// Apply search highlighting to a rendered line.
+///
+/// Walks each span in the line, finds substring matches of `pattern` (case-insensitive),
+/// and splits the span into highlighted/unhighlighted pieces.
+fn apply_search_highlight(
+    line: &Line<'static>,
+    pattern: &str,
+    is_current_match: bool,
+) -> Line<'static> {
+    use super::search::{find_match_ranges, current_match_highlight_style, match_highlight_style};
+
+    let hl_style = if is_current_match {
+        current_match_highlight_style()
+    } else {
+        match_highlight_style()
+    };
+
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+    for span in &line.spans {
+        let text: &str = &span.content;
+        let ranges = find_match_ranges(text, pattern);
+        if ranges.is_empty() {
+            new_spans.push(span.clone());
+        } else {
+            let mut pos = 0;
+            for range in &ranges {
+                if range.start > pos {
+                    new_spans.push(Span::styled(
+                        text[pos..range.start].to_string(),
+                        span.style,
+                    ));
+                }
+                // Overlay the highlight style on top of the existing span style
+                let merged = span.style.patch(hl_style);
+                new_spans.push(Span::styled(
+                    text[range.start..range.end].to_string(),
+                    merged,
+                ));
+                pos = range.end;
+            }
+            if pos < text.len() {
+                new_spans.push(Span::styled(text[pos..].to_string(), span.style));
+            }
+        }
+    }
+
+    Line::from(new_spans)
 }
 
 /// Enter raw mode, switch to the alternate screen, and enable mouse capture.
