@@ -13,7 +13,7 @@ use super::render::SourceColors;
 use super::runner::{ProcessInfo, ProcessStatus, TaskStatus};
 
 /// Fixed sidebar width in columns.
-pub const SIDEBAR_WIDTH: u16 = 26;
+pub const SIDEBAR_WIDTH: u16 = 28;
 
 /// State for the sidebar.
 #[derive(Debug, Clone)]
@@ -183,7 +183,8 @@ pub fn render_sidebar(
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let max_name_width = inner.width.saturating_sub(8) as usize; // leave room for [TAG]
+    // Fixed columns: prefix (2) + marker+space (2) + padding (1) + longest tag [SETUP] (7) = 12
+    let max_name_width = inner.width.saturating_sub(12) as usize;
 
     for (i, entry) in entries.iter().enumerate() {
         let is_selected = state.focused && i == state.selection;
@@ -208,11 +209,26 @@ pub fn render_sidebar(
 
         // Right-align the status tag
         let tag = format!("[{}]", entry.status_tag);
-        let name_and_tag_len = prefix.len() + display_name.len() + 1 + tag.len();
-        let padding = if name_and_tag_len < inner.width as usize {
-            " ".repeat(inner.width as usize - name_and_tag_len)
+        // Total line: prefix(2) + marker+space(2) + name + padding + tag
+        let used = prefix.len() + 2 + display_name.len() + tag.len();
+        let padding = if used < inner.width as usize {
+            " ".repeat(inner.width as usize - used)
         } else {
             " ".to_string()
+        };
+
+        // Dim everything when the source is hidden
+        let tag_style = if !entry.visible {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(entry.status_color)
+        };
+
+        let visibility_marker = if !entry.visible { "-" } else { "*" };
+        let marker_style = if !entry.visible {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(name_color)
         };
 
         let spans = vec![
@@ -224,9 +240,10 @@ pub fn render_sidebar(
                     Style::default().fg(Color::DarkGray)
                 },
             ),
+            Span::styled(format!("{} ", visibility_marker), marker_style),
             Span::styled(display_name, name_style),
             Span::raw(padding),
-            Span::styled(tag, Style::default().fg(entry.status_color)),
+            Span::styled(tag, tag_style),
         ];
 
         // If this is a section separator, add a blank line before completed processes

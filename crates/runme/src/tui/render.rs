@@ -220,47 +220,6 @@ fn render_raw(entry: &LogEntry, width: u16, wrap: bool) -> (Vec<Line<'static>>, 
     }
 }
 
-/// Format a timestamp for display. Extracts HH:MM:SS.mmm if possible,
-/// otherwise shows the raw string, truncated to TIMESTAMP_WIDTH.
-fn format_timestamp(ts: &Option<String>) -> String {
-    match ts {
-        Some(s) => {
-            // Try to extract time portion from common formats
-            // ISO 8601: "2024-01-15T12:01:03.418Z" -> "12:01:03.418"
-            if let Some(t_pos) = s.find('T') {
-                let time_part = &s[t_pos + 1..];
-                // Strip trailing Z
-                let time_clean = time_part.trim_end_matches('Z');
-                // Strip timezone offset like +05:30 or -08:00
-                // Look for +/- followed by digits (timezone offset at the end)
-                let time_clean = if let Some(plus_pos) = time_clean.rfind('+') {
-                    &time_clean[..plus_pos]
-                } else if let Some(minus_pos) = time_clean.rfind('-') {
-                    // Only strip if it looks like a timezone offset (after the time)
-                    // HH:MM:SS has at least 8 chars before any timezone offset
-                    if minus_pos >= 8 {
-                        &time_clean[..minus_pos]
-                    } else {
-                        time_clean
-                    }
-                } else {
-                    time_clean
-                };
-                // Take up to 12 chars (HH:MM:SS.mmm)
-                if time_clean.len() > TIMESTAMP_WIDTH {
-                    time_clean[..TIMESTAMP_WIDTH].to_string()
-                } else {
-                    time_clean.to_string()
-                }
-            } else {
-                // Not ISO format; show as-is
-                s.clone()
-            }
-        }
-        None => String::new(),
-    }
-}
-
 /// Format a level string and return (display text, color).
 fn format_level(level: &Option<String>) -> (String, Color) {
     match level.as_deref() {
@@ -542,19 +501,6 @@ mod tests {
         assert_eq!(wrap_text("hello world!", 5), vec!["hello", " worl", "d!"]);
         assert_eq!(wrap_text("a\nb\nc", 80), vec!["a", "b", "c"]);
         assert_eq!(wrap_text("", 80), vec![""]);
-    }
-
-    #[test]
-    fn test_format_timestamp_iso() {
-        let ts = Some("2024-01-15T12:01:03.418Z".to_string());
-        let result = format_timestamp(&ts);
-        assert!(result.starts_with("12:01:03.41"), "got: {}", result);
-    }
-
-    #[test]
-    fn test_format_timestamp_none() {
-        let result = format_timestamp(&None);
-        assert_eq!(result, "");
     }
 
     #[test]
