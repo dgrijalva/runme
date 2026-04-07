@@ -56,9 +56,11 @@ runme list
 ### TUI mode
 
 ```bash
-runme          # launches interactive TUI
-runme --tui    # explicit TUI mode
+runme          # launches task picker, then TUI
+runme build    # runs task directly in TUI
 ```
+
+When launched with no arguments, `runme` opens a **task picker** showing all tasks grouped by their source RUNME.rs file. Type to fuzzy-filter across task names, descriptions, and group names. Press Enter to launch the selected task and transition to the log viewer.
 
 ### Direct execution
 
@@ -207,6 +209,18 @@ error!(service = "auth", "connection failed");
 These flow through the same pipeline as child process output.
 
 ## TUI Keyboard Shortcuts
+
+### Task Picker
+
+| Key | Action |
+|-----|--------|
+| typing | Fuzzy filter tasks by name, description, or group |
+| `j` / `Down` | Move selection down |
+| `k` / `Up` | Move selection up |
+| `Enter` | Launch selected task |
+| `Backspace` | Delete last character of filter |
+| `Ctrl-u` | Clear filter input |
+| `Esc` / `q` | Quit |
 
 ### Global
 

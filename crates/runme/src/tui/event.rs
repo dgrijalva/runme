@@ -60,6 +60,19 @@ pub async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         handle_event(event, state, terminal);
+
+                        // Check if a task was selected from the picker
+                        if let Some(task) = state.pending_task.take() {
+                            state.launch_picked_task(task);
+                            // Re-subscribe to the new LogStore
+                            let store = state.log_store.lock().await;
+                            let existing = store.compose_owned();
+                            if !existing.is_empty() {
+                                state.log_lines = existing;
+                            }
+                            log_rx = store.subscribe();
+                            drop(store);
+                        }
                     }
                     Some(Err(_)) => {
                         // Terminal event read error — shut down
@@ -222,6 +235,13 @@ fn handle_key(
             .cloned()
             .collect()
     };
+
+    // Task picker mode: dedicated key handling
+    if state.mode == AppMode::TaskPicker {
+        handle_picker_key(key, state);
+        state.dirty = true;
+        return;
+    }
 
     // Filter input mode gets its own key handling — only Esc and Ctrl-C escape
     if state.mode == AppMode::FilterInput {
@@ -505,6 +525,77 @@ fn handle_log_viewer_key(
             if let Some(source) = sidebar::source_for_index(&state.sidebar_entries, idx) {
                 let source = source.to_string();
                 state.toggle_source_visibility(&source);
+            }
+        }
+
+        _ => {}
+    }
+}
+
+/// Handle keys when in task picker mode.
+///
+/// Returns `Some(task)` if the user selected a task, `None` otherwise.
+/// The caller (event loop) is responsible for launching the task.
+fn handle_picker_key(key: KeyEvent, state: &mut AppState) {
+    match key.code {
+        // Esc or q: quit (no task to run)
+        KeyCode::Esc | KeyCode::Char('q') => {
+            if let Some(ref picker) = state.picker
+                && (picker.input.is_empty() || key.code == KeyCode::Esc)
+            {
+                state.running = false;
+            }
+        }
+
+        // Ctrl-C: quit
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.running = false;
+        }
+
+        // Enter: launch selected task
+        KeyCode::Enter => {
+            if let Some(ref picker) = state.picker
+                && let Some(task) = picker.selected_task()
+            {
+                state.pending_task = Some(task);
+            }
+        }
+
+        // j / Down: move selection down
+        KeyCode::Char('j') | KeyCode::Down => {
+            if let Some(ref mut picker) = state.picker {
+                picker.move_down();
+            }
+        }
+
+        // k / Up: move selection up
+        KeyCode::Char('k') | KeyCode::Up => {
+            if let Some(ref mut picker) = state.picker {
+                picker.move_up();
+            }
+        }
+
+        // Backspace: delete last char of input
+        KeyCode::Backspace => {
+            if let Some(ref mut picker) = state.picker {
+                picker.delete_char();
+            }
+        }
+
+        // Ctrl-u: clear input
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(ref mut picker) = state.picker {
+                picker.input.clear();
+                picker.cursor = 0;
+                picker.selection = 0;
+                picker.scroll_offset = 0;
+            }
+        }
+
+        // Any other character: insert into fuzzy input
+        KeyCode::Char(ch) => {
+            if let Some(ref mut picker) = state.picker {
+                picker.insert_char(ch);
             }
         }
 

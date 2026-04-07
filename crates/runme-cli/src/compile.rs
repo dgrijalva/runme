@@ -368,8 +368,13 @@ fn generate_runner_main(entries: &[CrateEntry]) -> String {
                     }
                 }
             } else {
-                // No task specified — launch TUI (task picker will come later)
-                let mut app = runme::tui::App::new();
+                // No task specified — launch TUI with task picker
+                let tasks: Vec<&'static runme::task::TaskDef> = registry.list().to_vec();
+                let group_names_owned: std::collections::HashMap<String, String> = group_names
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect();
+                let mut app = runme::tui::App::with_picker(tasks, group_names_owned);
                 if let Err(e) = app.run().await {
                     eprintln!("TUI error: {}", e);
                     std::process::exit(1);

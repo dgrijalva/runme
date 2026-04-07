@@ -1,6 +1,7 @@
 pub mod app;
 pub mod event;
 pub mod filter;
+pub mod picker;
 pub mod render;
 pub mod runner;
 pub mod search;
@@ -9,6 +10,7 @@ pub mod viewport;
 
 pub use app::{App, AppMode, AppState};
 pub use filter::FilterInputState;
+pub use picker::PickerState;
 pub use render::{DisplayMode, SourceColors};
 pub use runner::{TaskRunner, TaskStatus};
 pub use search::SearchState;

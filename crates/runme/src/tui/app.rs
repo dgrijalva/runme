@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 
@@ -24,6 +24,7 @@ use crate::task::TaskDef;
 
 use super::event::run_event_loop;
 use super::filter::{FilterInputState, filter_status_spans, render_filter_input};
+use super::picker::{self, PickerState};
 use super::render::{DisplayMode, SourceColors};
 use super::runner::{ProcessInfo, TaskRunner, TaskStatus};
 use super::search::{SearchState, render_search_input, search_status_spans};
@@ -33,6 +34,8 @@ use super::viewport::{self, ScrollState, new_entries_since_pin};
 /// The mode the application is currently in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
+    /// Task picker — fuzzy-find task selection on startup
+    TaskPicker,
     /// Log viewer, navigating with keyboard
     Normal,
     /// Filter expression input mode
@@ -85,6 +88,18 @@ pub struct AppState {
     pub search: SearchState,
     /// Scroll offset within the entry detail overlay (for long entries).
     pub detail_scroll: usize,
+    /// Task picker state (only populated when in TaskPicker mode).
+    pub picker: Option<PickerState>,
+    /// All available tasks for the picker (kept for re-launching).
+    pub all_tasks: Vec<&'static TaskDef>,
+    /// Group name mapping for display (group_key -> display_name).
+    pub group_names: HashMap<String, String>,
+    /// Task selected from the picker, pending launch by the event loop.
+    pub pending_task: Option<&'static TaskDef>,
+    /// The task runner, stored here so the event loop can manage task launches
+    /// from the picker without needing access to the App wrapper.
+    #[allow(dead_code)]
+    pub runner: Option<TaskRunner>,
 }
 
 impl Default for AppState {
@@ -114,6 +129,11 @@ impl AppState {
             filter_input: FilterInputState::new(),
             search: SearchState::new(),
             detail_scroll: 0,
+            picker: None,
+            all_tasks: Vec::new(),
+            group_names: HashMap::new(),
+            pending_task: None,
+            runner: None,
         }
     }
 
@@ -199,16 +219,34 @@ impl AppState {
     pub fn show_all_sources(&mut self) {
         self.source_filter.clear();
     }
+
+    /// Launch a task from the picker. Sets up the TaskRunner and transitions
+    /// to Normal mode. Called from the event loop when pending_task is set.
+    pub fn launch_picked_task(&mut self, task: &'static TaskDef) {
+        let mut runner = TaskRunner::new();
+        let log_store = runner.log_store.clone();
+        let task_status = runner.status.clone();
+        let processes = runner.processes.clone();
+
+        runner.launch(task);
+
+        self.log_store = log_store;
+        self.task_status = Some(task_status);
+        self.task_name = Some(task.name.to_string());
+        self.processes = Some(processes);
+        self.mode = AppMode::Normal;
+        self.picker = None;
+        self.pending_task = None;
+        self.log_lines.clear();
+        self.dirty = true;
+        self.runner = Some(runner);
+    }
 }
 
 /// The top-level TUI application. Manages terminal setup/teardown and delegates
 /// to the event loop.
 pub struct App {
     pub state: AppState,
-    /// The task runner, if a task was launched. Stored here to keep it alive;
-    /// the runner's state is accessed through the shared Arc fields on AppState.
-    #[allow(dead_code)]
-    runner: Option<TaskRunner>,
 }
 
 impl Default for App {
@@ -221,29 +259,32 @@ impl App {
     pub fn new() -> Self {
         Self {
             state: AppState::new(),
-            runner: None,
         }
+    }
+
+    /// Create an App that starts with the task picker.
+    ///
+    /// Shows all available tasks grouped by their source file, with fuzzy
+    /// filtering. The user selects a task to launch.
+    pub fn with_picker(
+        tasks: Vec<&'static TaskDef>,
+        group_names: HashMap<String, String>,
+    ) -> Self {
+        let picker = PickerState::new(&tasks, &group_names);
+        let mut state = AppState::new();
+        state.mode = AppMode::TaskPicker;
+        state.picker = Some(picker);
+        state.all_tasks = tasks;
+        state.group_names = group_names;
+
+        Self { state }
     }
 
     /// Create an App configured to run a specific task immediately.
     pub fn with_task(task: &'static TaskDef) -> Self {
-        let mut runner = TaskRunner::new();
-        let log_store = runner.log_store.clone();
-        let task_status = runner.status.clone();
-        let processes = runner.processes.clone();
-
-        runner.launch(task);
-
         let mut state = AppState::new();
-        state.log_store = log_store;
-        state.task_status = Some(task_status);
-        state.task_name = Some(task.name.to_string());
-        state.processes = Some(processes);
-
-        Self {
-            state,
-            runner: Some(runner),
-        }
+        state.launch_picked_task(task);
+        Self { state }
     }
 
     /// Enter the TUI: set up the terminal, run the event loop, and restore
@@ -274,11 +315,22 @@ impl App {
 }
 
 /// Render a single frame. Draws the sidebar (left), log viewer (right), and
-/// status bar (bottom).
+/// status bar (bottom). In TaskPicker mode, renders the picker full-screen instead.
 pub fn render_frame(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
 ) -> io::Result<()> {
+    // Task picker mode gets its own full-screen rendering path
+    if state.mode == AppMode::TaskPicker {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            if let Some(ref mut picker_state) = state.picker {
+                picker::render_picker(frame, area, picker_state);
+            }
+        })?;
+        return Ok(());
+    }
+
     terminal.draw(|frame| {
         let area = frame.area();
 
@@ -441,6 +493,7 @@ pub fn render_frame(
         // -- Status bar (always visible) --
         {
             let mode_text = match state.mode {
+                AppMode::TaskPicker => "PICKER",
                 AppMode::Normal | AppMode::Help => "NORMAL",
                 AppMode::FilterInput => "FILTER",
                 AppMode::SearchInput => "SEARCH",
