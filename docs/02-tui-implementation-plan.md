@@ -26,7 +26,7 @@ Work lives entirely in the `runme` library crate (`crates/runme/src/tui/`), with
 - [ ] Process controls: stop, restart, signal from sidebar
 - [ ] Clean shutdown on quit/signal/panic (children stopped, terminal restored)
 
-## Status: in progress (Phase 2 complete)
+## Status: in progress (Phase 3 complete)
 
 ## Context
 

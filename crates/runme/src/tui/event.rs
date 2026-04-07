@@ -315,7 +315,7 @@ fn handle_log_viewer_key(
             );
         }
 
-        // Ctrl-d / Page Down: scroll down half page
+        // Ctrl-d / Page Down / ]: scroll down half page
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.scroll = scroll_down_half_page(
                 &state.scroll,
@@ -327,7 +327,7 @@ fn handle_log_viewer_key(
                 &mut state.source_colors,
             );
         }
-        KeyCode::PageDown => {
+        KeyCode::PageDown | KeyCode::Char(']') => {
             state.scroll = scroll_down_half_page(
                 &state.scroll,
                 filtered_entries,
@@ -339,7 +339,7 @@ fn handle_log_viewer_key(
             );
         }
 
-        // Ctrl-u / Page Up: scroll up half page
+        // Ctrl-u / Page Up / [: scroll up half page
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.scroll = scroll_up_half_page(
                 &state.scroll,
@@ -351,7 +351,7 @@ fn handle_log_viewer_key(
                 &mut state.source_colors,
             );
         }
-        KeyCode::PageUp => {
+        KeyCode::PageUp | KeyCode::Char('[') => {
             state.scroll = scroll_up_half_page(
                 &state.scroll,
                 filtered_entries,

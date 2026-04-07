@@ -222,8 +222,8 @@ These flow through the same pipeline as child process output.
 |-----|--------|
 | `j` / `Down` | Next entry |
 | `k` / `Up` | Previous entry |
-| `Ctrl-d` / `PageDown` | Scroll down half page |
-| `Ctrl-u` / `PageUp` | Scroll up half page |
+| `Ctrl-d` / `]` / `PageDown` | Scroll down half page |
+| `Ctrl-u` / `[` / `PageUp` | Scroll up half page |
 | `g` / `Home` | Jump to first entry |
 | `G` / `End` | Jump to last entry (tail mode) |
 | `v` / `m` | Toggle preview/raw display mode |

@@ -320,8 +320,8 @@ struct SearchState {
 |-----|--------|
 | `j` / `Down` | Move cursor down one entry |
 | `k` / `Up` | Move cursor up one entry |
-| `Ctrl-d` / `Page Down` | Scroll down half page |
-| `Ctrl-u` / `Page Up` | Scroll up half page |
+| `Ctrl-d` / `]` / `Page Down` | Scroll down half page |
+| `Ctrl-u` / `[` / `Page Up` | Scroll up half page |
 | `g` / `Home` | Jump to first entry |
 | `G` / `End` | Jump to last entry, re-enter tail mode |
 | `Enter` | Expand selected entry (detail view) |
