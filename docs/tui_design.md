@@ -6,7 +6,7 @@ The TUI is the primary interface for the power-user persona. It needs to handle 
 
 ## Existing Infrastructure
 
-All discovered RUNME.rs files are compiled into a single binary via a generated Cargo workspace (see `system_design.md` § Multi-File Compilation). The TUI runs in-process with access to every task from every file via `Registry::from_inventory()`. Each task carries a `group` field identifying which RUNME.rs it came from.
+All discovered RUNME.rs files are compiled into a single binary via a generated Cargo workspace (see `build_system_design.md`). The TUI runs in-process with access to every task from every file via `Registry::from_inventory()`. Each task carries a `group` key identifying which RUNME.rs it came from; group display names are managed by `GroupDef` and overridable via `#[runme::init]`.
 
 The TUI builds on top of these existing primitives:
 
@@ -94,11 +94,11 @@ When the user presses Enter on a log entry, an overlay or bottom pane expands to
 
 On startup (or when invoked with no specific task), the TUI shows a task picker that spans all discovered RUNME.rs files in the directory tree.
 
-Because all RUNME.rs files are compiled into a single binary (see **Multi-File Compilation Model** above), the picker has immediate access to every task from every file via `Registry::from_inventory()`. No per-file compilation at picker time — that happened when the binary was built.
+Because all RUNME.rs files are compiled into a single binary (see `build_system_design.md`), the picker has immediate access to every task from every file via `Registry::from_inventory()`. No per-file compilation at picker time — that happened when the binary was built.
 
 #### Grouping & Naming
 
-Tasks are grouped by their `TaskDef.group` field — the relative path of the RUNME.rs file by default, or a human-friendly name if the file overrides it:
+Tasks are grouped by their `TaskDef.group` key. The display name comes from `GroupDef.display_name` — which defaults to the relative path of the RUNME.rs file, overridable via `#[runme::init]` with `InitContext.set_group_name()`:
 
 ```
 +--[ pick a task ]---------------------------------------------------+
@@ -127,7 +127,7 @@ Tasks are grouped by their `TaskDef.group` field — the relative path of the RU
 
 The root RUNME.rs group is shown as `.` (or the project name if one is set).
 
-A RUNME.rs file can override its group name via a library API (TBD — something like `runme::set_name("Web Frontend")` in the file, or a macro attribute on main). This lets files self-describe with a human-friendly name while the path remains the default.
+A RUNME.rs file can override its group display name via `#[runme::init]` using `InitContext.set_group_name("Web Frontend")`. The path-based key remains the internal identifier; the display name is what the user sees.
 
 #### Interaction
 
