@@ -21,7 +21,9 @@ use crate::log::store::LogStore;
 use crate::task::TaskDef;
 
 use super::event::run_event_loop;
+use super::render::{DisplayMode, SourceColors};
 use super::runner::{TaskRunner, TaskStatus};
+use super::viewport::{self, ScrollState, new_entries_since_pin};
 
 /// The mode the application is currently in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +49,14 @@ pub struct AppState {
     pub task_status: Option<Arc<Mutex<TaskStatus>>>,
     /// Name of the running task, if any.
     pub task_name: Option<String>,
+    /// Display mode: preview (structured) or raw
+    pub display_mode: DisplayMode,
+    /// Whether to wrap long lines (true) or truncate (false)
+    pub wrap: bool,
+    /// Scroll state: tail or pinned
+    pub scroll: ScrollState,
+    /// Source color assignments, consistent within the session
+    pub source_colors: SourceColors,
 }
 
 impl AppState {
@@ -59,6 +69,10 @@ impl AppState {
             log_store: Arc::new(Mutex::new(LogStore::new())),
             task_status: None,
             task_name: None,
+            display_mode: DisplayMode::Preview,
+            wrap: false,
+            scroll: ScrollState::Tail,
+            source_colors: SourceColors::new(),
         }
     }
 }
@@ -128,10 +142,10 @@ impl App {
 }
 
 /// Render a single frame. Draws log lines in the main area and a status bar
-/// at the bottom showing mode, task name, and task status.
+/// at the bottom showing mode, task name, task status, and scroll position.
 pub fn render_frame(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    state: &AppState,
+    state: &mut AppState,
 ) -> io::Result<()> {
     terminal.draw(|frame| {
         let area = frame.area();
@@ -143,9 +157,11 @@ pub fn render_frame(
         ])
         .split(area);
 
-        // Main area: display log lines (tail mode — show the most recent lines
-        // that fit in the viewport)
-        let main_height = chunks[0].height as usize;
+        let main_area = chunks[0];
+        let main_width = main_area.width;
+        let main_height = main_area.height;
+
+        // Main area: use viewport-driven rendering
         let lines: Vec<Line> = if state.log_lines.is_empty() {
             if state.task_name.is_some() {
                 vec![Line::from(Span::styled(
@@ -159,19 +175,44 @@ pub fn render_frame(
                 ))]
             }
         } else {
-            // Take the last N entries that fit in the viewport (tail mode)
-            let start = state.log_lines.len().saturating_sub(main_height);
-            state.log_lines[start..]
-                .iter()
-                .map(|entry| {
-                    // Simple rendering: show raw text
-                    Line::from(entry.raw.clone())
-                })
-                .collect()
+            // Use the viewport to compute which entries are visible
+            let vp_layout = viewport::layout(
+                &state.scroll,
+                &state.log_lines,
+                main_height,
+                main_width,
+                state.display_mode,
+                state.wrap,
+                &mut state.source_colors,
+            );
+
+            // Build a line buffer for the entire viewport, initialized to empty
+            let mut line_buffer: Vec<Line<'static>> = (0..main_height)
+                .map(|_| Line::from(""))
+                .collect();
+
+            // Place rendered entries into the buffer at their Y positions
+            let cursor_style = Style::default().bg(Color::DarkGray);
+            for ve in &vp_layout.entries {
+                for (line_offset, line) in ve.lines.iter().enumerate() {
+                    let y = ve.y as usize + line_offset;
+                    if y < main_height as usize {
+                        if ve.is_cursor {
+                            // Highlight the focused row
+                            let highlighted = line.clone().patch_style(cursor_style);
+                            line_buffer[y] = highlighted;
+                        } else {
+                            line_buffer[y] = line.clone();
+                        }
+                    }
+                }
+            }
+
+            line_buffer
         };
 
         let log_paragraph = Paragraph::new(lines).block(Block::default());
-        frame.render_widget(log_paragraph, chunks[0]);
+        frame.render_widget(log_paragraph, main_area);
 
         // Status bar
         let mode_text = match state.mode {
@@ -197,13 +238,39 @@ pub fn render_frame(
             ));
         }
 
-        // Add entry count
+        // Display mode indicator
+        let mode_indicator = match state.display_mode {
+            DisplayMode::Preview => "preview",
+            DisplayMode::Raw => "raw",
+        };
+        let wrap_indicator = if state.wrap { "wrap" } else { "truncate" };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!(" {} {} ", mode_indicator, wrap_indicator),
+            Style::default().fg(Color::DarkGray),
+        ));
+
+        // Scroll position / entry count
         if !state.log_lines.is_empty() {
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!(" TAIL | {} ", state.log_lines.len()),
-                Style::default().fg(Color::DarkGray),
-            ));
+            match state.scroll {
+                ScrollState::Tail => {
+                    spans.push(Span::styled(
+                        format!(" TAIL | {} ", state.log_lines.len()),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+                ScrollState::Pinned { cursor, .. } => {
+                    let total = state.log_lines.len();
+                    let new_count = new_entries_since_pin(&state.scroll, total);
+                    let pos_text = if new_count > 0 {
+                        format!(" {} / {} (+{} new) ", cursor + 1, total, new_count)
+                    } else {
+                        format!(" {} / {} ", cursor + 1, total)
+                    };
+                    spans.push(Span::styled(pos_text, Style::default().fg(Color::DarkGray)));
+                }
+            }
         }
 
         let status_line = Line::from(spans);
@@ -244,6 +311,9 @@ mod tests {
         assert!(state.log_lines.is_empty());
         assert!(state.task_name.is_none());
         assert!(state.task_status.is_none());
+        assert_eq!(state.display_mode, DisplayMode::Preview);
+        assert!(!state.wrap);
+        assert_eq!(state.scroll, ScrollState::Tail);
     }
 
     #[test]
@@ -251,7 +321,23 @@ mod tests {
         let mut state = AppState::new();
         state.dirty = false;
         state.running = false;
+        state.display_mode = DisplayMode::Raw;
+        state.wrap = true;
         assert!(!state.dirty);
         assert!(!state.running);
+        assert_eq!(state.display_mode, DisplayMode::Raw);
+        assert!(state.wrap);
+    }
+
+    #[test]
+    fn app_state_scroll_transitions() {
+        let mut state = AppState::new();
+        assert_eq!(state.scroll, ScrollState::Tail);
+
+        state.scroll = ScrollState::Pinned { cursor: 5, top: 0 };
+        assert!(matches!(state.scroll, ScrollState::Pinned { cursor: 5, .. }));
+
+        state.scroll = ScrollState::Tail;
+        assert_eq!(state.scroll, ScrollState::Tail);
     }
 }

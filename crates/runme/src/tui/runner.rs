@@ -115,25 +115,21 @@ impl TaskRunner {
         let exec_log_store = log_store.clone();
         start_buffer_forwarder(ctx.output_buffer(), exec_log_store);
 
-        // Spawn the task function
+        // Spawn the task function.
+        // Use set_global_default so spawned child tasks also inherit the subscriber.
+        // (set_default is thread-local and doesn't propagate to tokio::spawn children.)
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        let _ = tracing::dispatcher::set_global_default(dispatch);
+
         let task_status = status.clone();
         tokio::spawn(async move {
-            // Set the subscriber as default for this async context
-            let _guard = tracing::subscriber::set_default(subscriber);
-
-            // Run the task function, catching panics
-            let result = tokio::spawn(async move { (task.func)(&ctx).await }).await;
+            // Run the task function directly (no nested spawn — the global
+            // subscriber covers us, and we get simpler error handling)
+            let result = (task.func)(&ctx).await;
 
             let result = match result {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(task_err)) => Err(task_err.to_string()),
-                Err(join_err) => {
-                    if join_err.is_panic() {
-                        Err("task panicked".to_string())
-                    } else {
-                        Err(format!("task join error: {}", join_err))
-                    }
-                }
+                Ok(()) => Ok(()),
+                Err(task_err) => Err(task_err.to_string()),
             };
 
             // Update status based on result

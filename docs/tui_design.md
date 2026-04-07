@@ -677,7 +677,7 @@ These are things to figure out during implementation, not blockers:
 1. **Sidebar width**: fixed vs auto-sized to longest task name? Resizable by the user?
 2. **Mouse support**: click to select entry, click sidebar to toggle source, scroll wheel. Not first priority, but scroll and click would be significant QoL — worth doing before the UI is "done."
 3. **Horizontal scroll mechanism**: in truncated mode, how to reveal clipped content. Vim-style `h`/`l`? Arrow keys? Something else?
-4. **Theme/color configuration**: hardcode a sensible dark theme first, make configurable later?
+4. **Theme/color configuration**: hardcode a sensible dark theme first, make configurable later? Current hardcoded colors (DarkGray cursor highlight, cyan/green/yellow/blue/magenta/red source palette) need validation across different terminal themes — they may look bad on light backgrounds. Design a color scheme system at some point.
 5. **Split views**: show two sources side-by-side instead of interleaved? Useful for comparing, but adds layout complexity. Defer to a later iteration?
 6. **Completed process accumulation**: if a task spawns hundreds of short-lived processes, the completed section of the sidebar could grow unwieldy. Cap? Collapse? Defer until it's a real problem.
 7. **Re-runs**: returning to the task picker and re-launching the same task. Clear previous state? Append to existing logs?
