@@ -322,9 +322,50 @@ fn generate_runner_main(entries: &[CrateEntry]) -> String {
             }
 
             if let Some(task_name) = args.get(1) {
-                if let Err(e) = registry.run(task_name).await {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(e.exit_code());
+                // Resolve task: short name when unambiguous, "group:task" to disambiguate.
+                // Group names come from group_names map (init hooks can override).
+                let task_group_name = |t: &&runme::task::TaskDef| -> String {
+                    group_names.get(t.group).cloned().unwrap_or_else(|| t.group.to_string())
+                };
+
+                let resolved = if let Some((group_query, short_name)) = task_name.split_once(':') {
+                    registry.list().iter()
+                        .find(|t| t.name == short_name && task_group_name(t) == group_query)
+                        .copied()
+                        .ok_or_else(|| format!("unknown task: {}", task_name))
+                } else {
+                    let matches: Vec<_> = registry.list().iter()
+                        .filter(|t| t.name == task_name.as_str())
+                        .collect();
+                    match matches.len() {
+                        0 => Err(format!("unknown task: {}", task_name)),
+                        1 => Ok(*matches[0]),
+                        _ => {
+                            // Root tasks (empty group) win short names
+                            if let Some(root_task) = matches.iter().find(|t| t.group.is_empty()) {
+                                Ok(**root_task)
+                            } else {
+                                let qualified: Vec<String> = matches.iter().map(|t| {
+                                    format!("{}:{}", task_group_name(t), t.name)
+                                }).collect();
+                                Err(format!("ambiguous task '{}', use: {}", task_name, qualified.join(", ")))
+                            }
+                        }
+                    }
+                };
+
+                match resolved {
+                    Ok(task) => {
+                        let ctx = runme::task::TaskContext::new(task.name);
+                        if let Err(e) = (task.func)(&ctx).await {
+                            eprintln!("Error: {}", e);
+                            std::process::exit(e.exit_code());
+                        }
+                    }
+                    Err(msg) => {
+                        eprintln!("Error: {}", msg);
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 println!("Available tasks:");

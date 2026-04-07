@@ -89,9 +89,23 @@ fn setup(ctx: &mut InitContext) {
     ctx.set_group_name("Auth Service");
 }
 
-#[runme::task(desc = "Run database migrations")]
+/// Run database migrations
+#[runme::task]
 async fn migrate(ctx: &TaskContext) -> TaskResult {
     ctx.exec("cargo run --bin migrate").await?;
+    Ok(())
+}
+
+/// Deploy to an environment
+// Tasks can accept arguments — see docs/system_design.md § Task Arguments
+#[runme::task]
+async fn deploy(ctx: &TaskContext, env: String, dry_run: bool) -> TaskResult {
+    // runme deploy --env staging --dry-run
+    if dry_run {
+        println!("would deploy to {}", env);
+    } else {
+        ctx.exec(format!("deploy --target {}", env)).await?;
+    }
     Ok(())
 }
 ```

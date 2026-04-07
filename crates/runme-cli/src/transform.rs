@@ -10,14 +10,36 @@ use crate::frontmatter::strip_shebang;
 pub fn transform_source(source: &str, group: &str) -> String {
     let stripped = strip_shebang(source);
 
+    // Strip //! frontmatter lines — they've already been parsed into Cargo.toml
+    // by the frontmatter module. Leaving them in causes compiler errors since
+    // they appear after the injected const.
+    let without_frontmatter = strip_frontmatter(&stripped);
+
     // Escape any special characters in the group string for a Rust string literal.
     // In practice group strings are path-derived (e.g. "services/auth") but be safe.
     let escaped_group = group.replace('\\', "\\\\").replace('"', "\\\"");
 
     format!(
         "const __RUNME_GROUP: &str = \"{}\";\n{}\npub fn __runme_link() {{}}\n",
-        escaped_group, stripped
+        escaped_group, without_frontmatter
     )
+}
+
+/// Strip leading `//!` doc comment lines (frontmatter) from source.
+fn strip_frontmatter(source: &str) -> &str {
+    let mut rest = source;
+    loop {
+        let trimmed = rest.trim_start_matches('\n');
+        if trimmed.starts_with("//!") {
+            // Skip this line
+            rest = match trimmed.find('\n') {
+                Some(pos) => &trimmed[pos + 1..],
+                None => "",
+            };
+        } else {
+            return trimmed;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -48,7 +70,8 @@ mod tests {
         let source = "#!/usr/bin/env runme\n//! [dependencies]\n//! reqwest = \"0.12\"\n\nuse runme::prelude::*;\nuse std::path::Path;\n";
         let result = transform_source(source, ".");
         assert!(result.starts_with("const __RUNME_GROUP: &str = \".\";\n"));
-        assert!(result.contains("//! [dependencies]"));
+        assert!(!result.contains("//! [dependencies]"));
+        assert!(!result.contains("//! reqwest"));
         assert!(result.contains("use runme::prelude::*;"));
         assert!(result.contains("use std::path::Path;"));
     }
@@ -89,14 +112,14 @@ mod tests {
 
     #[test]
     fn test_shebang_and_frontmatter_comments_both_present() {
-        // When both shebang and //! frontmatter comments are present, only the
-        // shebang is stripped; the //! lines remain in the transformed output.
+        // Both shebang and //! frontmatter are stripped from transformed output.
         let source = "#!/usr/bin/env runme\n//! [dependencies]\n//! tokio = \"1\"\n\nfn work() {}\n";
         let result = transform_source(source, "infra");
         assert!(result.starts_with("const __RUNME_GROUP: &str = \"infra\";\n"));
         assert!(!result.contains("#!/usr/bin/env runme"));
-        assert!(result.contains("//! [dependencies]"));
-        assert!(result.contains("//! tokio = \"1\""));
+        assert!(!result.contains("//! [dependencies]"));
+        assert!(!result.contains("//! tokio"));
+        assert!(result.contains("fn work() {}"));
         assert!(result.ends_with("pub fn __runme_link() {}\n"));
     }
 

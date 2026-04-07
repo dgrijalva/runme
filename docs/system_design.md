@@ -18,6 +18,7 @@ Each RUNME.rs is a Rust source file with a shebang pointing at the `runme` binar
 
 use runme::prelude::*;
 
+/// Build the project
 #[runme::task(watch = "src/**/*.rs")]
 async fn build(ctx: &TaskContext) -> TaskResult {
     ctx.exec("cargo build").await?;
@@ -86,7 +87,7 @@ RUNME.rs files form a hierarchy rooted in the filesystem:
 
 Tasks are defined as annotated functions in RUNME.rs files. The API should support:
 
-- **Self-documenting tasks** — every task carries a description that surfaces in `--help` and in the TUI. Derive macros on enums/structs can generate this automatically.
+- **Self-documenting tasks** — every task carries a description that surfaces in `--help` and in the TUI.
 - **Common patterns as conventions** — the library provides reusable building blocks:
   - Watch files and re-run on change
   - Run a subprocess with correct child process management
@@ -94,7 +95,59 @@ Tasks are defined as annotated functions in RUNME.rs files. The API should suppo
   - Run tasks in parallel (e.g. start API server + web server together)
   - Dependency chains (build before test)
 - **Smart defaults** — `runme init` and/or built-in tasks can auto-detect the project type (cargo, npm, etc.) and provide sensible `run`, `build`, `test`, `clean` commands out of the box.
-- **Rust-native API surface** — use enums, structs, and derive macros to define available commands. The type system documents the API; `#[derive(RunmeTask)]` or similar makes a struct self-describing for CLI and TUI.
+
+### Task Arguments
+
+Task arguments use progressive complexity based on the function signature. The `#[task]` macro detects which form and generates appropriate CLI parsing.
+
+**Zero args** — most tasks:
+
+```rust
+/// Build the project
+#[runme::task]
+async fn build(ctx: &TaskContext) -> TaskResult {
+    ctx.exec("cargo build").await?;
+    Ok(())
+}
+```
+
+**Simple args** — extra parameters after `&TaskContext` become CLI flags, inferred from name and type:
+
+```rust
+/// Deploy to an environment
+#[runme::task]
+async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
+    // runme deploy --env staging --port 8080 --verbose
+    ctx.exec(format!("deploy --target {} -p {}", env, port)).await?;
+    Ok(())
+}
+```
+
+Type mapping: `String`/`u16`/etc. → `--name <value>`, `bool` → `--name` (flag), `Option<T>` → optional, `Vec<T>` → repeatable. No help text, no short flags, no defaults — intentionally limited.
+
+**Full control** — a single struct parameter with `clap::Parser` derive for rich CLI features:
+
+```rust
+#[derive(clap::Parser)]
+struct DeployArgs {
+    /// Target environment
+    #[arg(short, long)]
+    env: String,
+
+    /// Port to bind
+    #[arg(short, long, default_value = "8080")]
+    port: u16,
+}
+
+/// Deploy to an environment
+#[runme::task]
+async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult {
+    ctx.exec(format!("deploy --target {} -p {}", args.env, args.port)).await?;
+    Ok(())
+}
+```
+
+The boundary is clean: the moment you need help text, short flags, or defaults, graduate to a struct.
 
 ### Dual Interface
 

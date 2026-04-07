@@ -46,7 +46,7 @@ Pure implementation following the detailed spec in `build_system_design.md`. The
 
 ---
 
-## Status: draft
+## Status: complete
 
 ## Context
 

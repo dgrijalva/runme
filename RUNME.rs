@@ -1,6 +1,6 @@
-use runme::prelude::*;
+#!/usr/bin/env runme
 
-const __RUNME_GROUP: &str = "";
+use runme::prelude::*;
 
 /// Install runme CLI via cargo install
 #[runme::task]
@@ -16,32 +16,10 @@ fn test(_ctx: &TaskContext) -> TaskResult {
     Ok(())
 }
 
-fn main() {
-    runme::tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("failed to create tokio runtime")
-        .block_on(async {
-            let registry = Registry::from_inventory();
-            let args: Vec<String> = std::env::args().collect();
-
-            if args.iter().any(|a| a == "--list") {
-                for task in registry.list() {
-                    println!("{}: {}", task.name, task.description.unwrap_or(""));
-                }
-                return;
-            }
-
-            if let Some(task_name) = args.get(1) {
-                if let Err(e) = registry.run(task_name).await {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(e.exit_code());
-                }
-            } else {
-                println!("Available tasks:");
-                for task in registry.list() {
-                    println!("  {}: {}", task.name, task.description.unwrap_or(""));
-                }
-            }
-        });
+/// Testing nested runme files
+#[runme::task]
+async fn example_nested(ctx: &TaskContext) -> TaskResult {
+    ctx.exec("echo foo bar baz").await?;
+    eprintln!("It's working!0");
+    Ok(())
 }
