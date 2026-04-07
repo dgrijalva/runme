@@ -128,8 +128,11 @@ impl PickerState {
             .tasks
             .iter()
             .filter_map(|pt| {
-                // Match against qualified name and description
-                let name_score = self.matcher.fuzzy_match(&pt.qualified_name, &self.input);
+                // Match against qualified name and description.
+                // Name matches get a large bonus so task names win over
+                // incidental matches in descriptions.
+                let name_score = self.matcher.fuzzy_match(&pt.qualified_name, &self.input)
+                    .map(|s| s + 1000);
                 let desc_score = pt.task.description.and_then(|d| {
                     self.matcher.fuzzy_match(d, &self.input)
                 });
