@@ -7,7 +7,8 @@ pub mod process;
 pub mod signal;
 pub mod task;
 
-// Re-export macros at the crate root so users can write #[runme::task]
+// Re-export macros at the crate root so users can write #[runme::task], #[runme::init]
+pub use runme_macros::init;
 pub use runme_macros::task;
 
 // Re-export inventory so generated code can reference it

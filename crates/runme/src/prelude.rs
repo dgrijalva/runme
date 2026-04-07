@@ -11,4 +11,5 @@ pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawR
 pub use crate::process::{ExecOutput, ExecOutputExt, ProcessError, ProcessHandle};
 pub use crate::signal::SignalHandler;
 pub use crate::task::{Registry, TaskContext, TaskDef, TaskFn};
+pub use runme_macros::init;
 pub use runme_macros::task;

@@ -7,6 +7,10 @@ use syn::{Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, ReturnType, parse_mac
 /// Supports both sync and async task functions. The function is wrapped
 /// to produce the `TaskFn` signature: `fn(&TaskContext) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>`.
 ///
+/// The generated `TaskDef` includes `group: __RUNME_GROUP`. This constant is
+/// injected by the code generator at compile time. For standalone usage (tests,
+/// examples), define `const __RUNME_GROUP: &str = "";` manually.
+///
 /// Usage:
 /// ```ignore
 /// #[runme::task(desc = "Build the project", watch = "src/**/*.rs")]
@@ -181,6 +185,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             ::runme::task::TaskDef {
                 name: #fn_name_str,
                 description: #desc_tokens,
+                group: __RUNME_GROUP,
                 watch: #watch_tokens,
                 depends_on: #deps_tokens,
                 func: #wrapper_name,
@@ -191,55 +196,68 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Attribute macro for the runme entry point.
+/// Attribute macro for per-file initialization hooks.
+///
+/// Registers an `InitDef` via `inventory`. The function can accept either
+/// `&mut InitContext` or no arguments.
+///
+/// The generated `InitDef` includes `group: __RUNME_GROUP`. This constant is
+/// injected by the code generator at compile time. For standalone usage (tests,
+/// examples), define `const __RUNME_GROUP: &str = "";` manually.
 ///
 /// Usage:
 /// ```ignore
-/// #[runme::main]
-/// fn main() {}
+/// #[runme::init]
+/// fn setup(ctx: &mut InitContext) {
+///     ctx.set_group_name("Auth Service");
+/// }
 /// ```
 ///
-/// Replaces the function body with an async tokio main that sets up
-/// the registry, parses CLI args, and dispatches to tasks.
+/// Or without arguments:
+/// ```ignore
+/// #[runme::init]
+/// fn setup() {
+///     // one-time setup
+/// }
+/// ```
 #[proc_macro_attribute]
-pub fn main(_attr: TokenStream, _item: TokenStream) -> TokenStream {
+pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let input_fn = parse_macro_input!(item as ItemFn);
+    let fn_name = &input_fn.sig.ident;
+
+    // Determine whether the function takes an InitContext argument
+    let has_ctx_arg = !input_fn.sig.inputs.is_empty();
+
+    // Generate a wrapper function name
+    let wrapper_name = syn::Ident::new(&format!("__runme_initfn_{}", fn_name), fn_name.span());
+
+    // The wrapper adapts the user's function to fn(&mut InitContext)
+    let wrapper = if has_ctx_arg {
+        // fn(ctx: &mut InitContext) — pass through directly
+        quote! {
+            fn #wrapper_name(ctx: &mut ::runme::init::InitContext) {
+                #fn_name(ctx)
+            }
+        }
+    } else {
+        // fn() — ignore the context argument
+        quote! {
+            fn #wrapper_name(_ctx: &mut ::runme::init::InitContext) {
+                #fn_name()
+            }
+        }
+    };
+
     let expanded = quote! {
-        fn main() {
-            ::runme::tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("failed to create tokio runtime")
-                .block_on(async {
-                    let registry = ::runme::task::Registry::from_inventory();
+        #input_fn
 
-                    let args: Vec<String> = ::std::env::args().collect();
+        #wrapper
 
-                    // Handle --list flag
-                    if args.iter().any(|a| a == "--list") {
-                        for task in registry.list() {
-                            println!("{}: {}", task.name, task.description.unwrap_or(""));
-                        }
-                        return;
-                    }
-
-                    // Run the named task
-                    if let Some(task_name) = args.get(1) {
-                        if let Err(e) = registry.run(task_name).await {
-                            let output = e.output();
-                            if output.is_object() || output.is_array() {
-                                eprintln!("{}", ::runme::serde_json::to_string_pretty(output).unwrap_or_else(|_| e.to_string()));
-                            } else {
-                                eprintln!("Error: {}", e);
-                            }
-                            ::std::process::exit(e.exit_code());
-                        }
-                    } else {
-                        println!("Available tasks:");
-                        for task in registry.list() {
-                            println!("  {}: {}", task.name, task.description.unwrap_or(""));
-                        }
-                    }
-                });
+        ::runme::inventory::submit! {
+            ::runme::init::InitDef {
+                group: __RUNME_GROUP,
+                func: #wrapper_name,
+            }
         }
     };
 
