@@ -1,6 +1,8 @@
 mod compile;
+mod crate_name;
 mod discover;
 mod frontmatter;
+mod transform;
 
 use std::path::PathBuf;
 

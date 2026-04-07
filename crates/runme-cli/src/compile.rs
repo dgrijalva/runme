@@ -315,6 +315,7 @@ runme::inventory::submit! {{
     TaskDef {{
         name: "hello",
         description: Some("Test task"),
+        group: "",
         watch: None,
         depends_on: &[],
         func: hello,

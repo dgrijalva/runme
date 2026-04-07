@@ -26,6 +26,7 @@ pub type TaskFn =
 pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
+    pub group: &'static str,
     pub watch: Option<&'static str>,
     pub depends_on: &'static [&'static str],
     pub func: TaskFn,
@@ -202,6 +203,7 @@ mod tests {
     static TEST_TASK_A: TaskDef = TaskDef {
         name: "alpha",
         description: Some("The alpha task"),
+        group: "",
         watch: None,
         depends_on: &[],
         func: dummy_task,
@@ -210,6 +212,7 @@ mod tests {
     static TEST_TASK_B: TaskDef = TaskDef {
         name: "beta",
         description: None,
+        group: "",
         watch: Some("src/**/*.rs"),
         depends_on: &["alpha"],
         func: another_task,
@@ -305,6 +308,7 @@ mod tests {
         static PARA: TaskDef = TaskDef {
             name: "para_a",
             description: Some("Parallel A"),
+            group: "",
             watch: None,
             depends_on: &[],
             func: task_a,
@@ -313,6 +317,7 @@ mod tests {
         static PARB: TaskDef = TaskDef {
             name: "para_b",
             description: Some("Parallel B"),
+            group: "",
             watch: None,
             depends_on: &[],
             func: task_b,

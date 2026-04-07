@@ -155,14 +155,18 @@ The `#[task]` macro reads `__RUNME_GROUP` (injected by the code generator) and s
 
 The runner crate is a binary crate in the generated workspace. It depends on all RUNME.rs lib crates via `[dependencies]` in its `Cargo.toml`. Cargo handles linking.
 
-One concern: if the runner crate never *references* a dependency, the linker may dead-strip its object files, causing `inventory` registrations to silently vanish. To prevent this, the runner's `main.rs` includes a `use` for each crate to ensure they're linked:
+The linker only includes a crate's object files when actual symbols are referenced. `use x as _;` is a compiler-level construct that doesn't create linker-visible references — `inventory` registrations would be silently dropped. To prevent this, each generated lib crate exports a dummy function, and the runner calls it:
 
 ```rust
-use root as _;
-use services_auth as _;
-use web_app as _;
+// Generated in each lib crate's lib.rs
+pub fn __runme_link() {}
 
+// Generated in runner's main.rs
 fn main() {
+    root::__runme_link();
+    services_auth::__runme_link();
+    web_app::__runme_link();
+
     // Build tokio runtime
     // Collect InitDefs from inventory, run them leaf-to-root
     // Collect GroupDefs from inventory, apply display name overrides from init
@@ -172,7 +176,7 @@ fn main() {
 }
 ```
 
-Whether `use x as _;` is sufficient to prevent dead-stripping with `inventory` needs to be verified. If not, each RUNME.rs lib crate can export a dummy symbol that the runner references.
+The code generator already knows all crate names, so emitting these calls is trivial.
 
 ### Generated Crate Cargo.toml
 
@@ -268,5 +272,4 @@ Pass the full `DiscoveryResult` to the compilation pipeline instead of a single 
 
 ## Open Questions
 
-1. **`use x as _;` and inventory**: does this prevent dead-stripping, or do we need a stronger reference? Needs testing.
-2. **Root init API**: the root RUNME.rs may want to inspect/operate on child tasks and groups. Not needed now — `InitContext` is scoped to own-file config. Revisit when we have concrete use cases.
+1. **Root init API**: the root RUNME.rs may want to inspect/operate on child tasks and groups. Not needed now — `InitContext` is scoped to own-file config. Revisit when we have concrete use cases.

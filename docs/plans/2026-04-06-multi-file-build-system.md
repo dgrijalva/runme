@@ -530,11 +530,11 @@ validation:
 
 ## Findings
 
-*(populated during execution)*
-
 ### `research-inventory-linking`
 
-*(pending)*
+**Result:** `use x as _;` is **NOT sufficient**. The linker doesn't see `use` statements — it only includes crate object files when actual symbols are referenced. Without a real symbol reference, `inventory` registrations are silently dropped. This is confirmed by `inventory` crate discussions, `ctor` crate issues, and Rust linkage docs.
+
+**Solution:** Each generated lib crate exports `pub fn __runme_link() {}`. The runner's `main()` calls `crate_name::__runme_link()` for each crate. The code generator already knows all crate names, so this is trivial to emit. `build_system_design.md` updated with this approach.
 
 ---
 
