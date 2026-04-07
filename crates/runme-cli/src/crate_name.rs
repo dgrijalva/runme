@@ -60,6 +60,7 @@ pub fn crate_name_from_path(rel_path: &Path) -> String {
 /// Given a list of relative paths to RUNME.rs files, compute a map from path to crate name.
 ///
 /// Panics if two paths produce the same crate name (collision).
+#[allow(dead_code)]
 pub fn assign_crate_names<'a>(paths: &'a [&'a Path]) -> HashMap<&'a Path, String> {
     let mut result: HashMap<&'a Path, String> = HashMap::new();
     let mut seen: HashMap<String, &'a Path> = HashMap::new();
