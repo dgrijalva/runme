@@ -13,6 +13,11 @@ nix = { version = "0.29", features = ["signal", "process"] }
 regex = "1"
 bytes = "1"
 winnow = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

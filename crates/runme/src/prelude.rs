@@ -10,6 +10,12 @@ pub use crate::log::parse::{
 pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawRecord};
 pub use crate::process::{ExecOutput, ExecOutputExt, ProcessError, ProcessHandle};
 pub use crate::signal::SignalHandler;
-pub use crate::task::{Registry, TaskContext, TaskDef, TaskFn};
+pub use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef, TaskFn};
 pub use runme_macros::init;
 pub use runme_macros::task;
+
+// Tracing macros for task function logging
+pub use tracing::{debug, error, info, trace, warn};
+
+// The tracing layer for wiring into a subscriber
+pub use crate::tracing_layer::LogEntryLayer;

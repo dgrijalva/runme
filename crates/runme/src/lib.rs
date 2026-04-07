@@ -6,6 +6,8 @@ pub mod prelude;
 pub mod process;
 pub mod signal;
 pub mod task;
+pub mod tracing_layer;
+pub mod tui;
 
 // Re-export macros at the crate root so users can write #[runme::task], #[runme::init]
 pub use runme_macros::init;

@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 
 use crate::cmd::Cmd;
@@ -46,6 +46,27 @@ inventory::collect!(TaskDef);
 pub struct TaskContext {
     pub name: String,
     output: Mutex<OutputBuffer>,
+    /// Process group IDs of all processes spawned through this context.
+    /// Used by `stop_all()` to signal every spawned process group.
+    spawned_pgids: Mutex<Vec<i32>>,
+    /// Optional channel to notify an observer (e.g., the TUI runner) when a
+    /// process is spawned. The receiver gets the `ProcessHandle`'s output buffer
+    /// and task name so it can register the process for display.
+    spawn_tx: Option<mpsc::UnboundedSender<SpawnEvent>>,
+}
+
+/// Event emitted when a process is spawned through a TaskContext.
+///
+/// Contains the information the TUI runner needs to track and display the process.
+pub struct SpawnEvent {
+    /// The output buffer for the spawned process.
+    pub buffer: Arc<Mutex<OutputBuffer>>,
+    /// The task name associated with this process.
+    pub task_name: String,
+    /// The process group ID, if available.
+    pub pgid: Option<i32>,
+    /// The process ID, if available.
+    pub pid: Option<u32>,
 }
 
 impl TaskContext {
@@ -54,6 +75,8 @@ impl TaskContext {
         Self {
             name: name.into(),
             output: Mutex::new(OutputBuffer::new(10_000)),
+            spawned_pgids: Mutex::new(Vec::new()),
+            spawn_tx: None,
         }
     }
 
@@ -62,7 +85,24 @@ impl TaskContext {
         Self {
             name: name.into(),
             output: Mutex::new(OutputBuffer::new(capacity)),
+            spawned_pgids: Mutex::new(Vec::new()),
+            spawn_tx: None,
         }
+    }
+
+    /// Set a channel sender that will be notified whenever `spawn()` is called.
+    ///
+    /// The TUI runner uses this to learn about new processes and register their
+    /// output buffers for display.
+    pub fn set_spawn_notifier(&mut self, tx: mpsc::UnboundedSender<SpawnEvent>) {
+        self.spawn_tx = Some(tx);
+    }
+
+    /// Access the task's output buffer (contains output from `exec()` calls).
+    ///
+    /// The TUI runner uses this to forward exec output to the LogStore.
+    pub fn output_buffer(&self) -> &Mutex<OutputBuffer> {
+        &self.output
     }
 
     /// Run a command and wait for it to complete. Captures output.
@@ -75,10 +115,58 @@ impl TaskContext {
 
     /// Spawn a long-running command. Returns a handle for monitoring/control.
     ///
+    /// The process group ID is tracked internally so that `stop_all()` can
+    /// shut down every process spawned through this context.
+    ///
     /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
     pub async fn spawn(&self, command: impl Into<Cmd>) -> Result<ProcessHandle, ProcessError> {
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(10_000)));
-        process::spawn(command, &self.name, buffer).await
+        let handle = process::spawn(command, &self.name, buffer).await?;
+
+        // Track the process group so stop_all() can signal it
+        if let Some(pgid) = handle.pgid() {
+            self.spawned_pgids.lock().await.push(pgid);
+        } else if let Some(pid) = handle.pid() {
+            self.spawned_pgids.lock().await.push(pid as i32);
+        }
+
+        // Notify the TUI runner (if connected) about the new process
+        if let Some(tx) = &self.spawn_tx {
+            let _ = tx.send(SpawnEvent {
+                buffer: handle.buffer.clone(),
+                task_name: handle.task_name().to_string(),
+                pgid: handle.pgid(),
+                pid: handle.pid(),
+            });
+        }
+
+        Ok(handle)
+    }
+
+    /// Stop all processes spawned through this context.
+    ///
+    /// Sends SIGTERM to each process group, waits for the timeout, then
+    /// sends SIGKILL to any that are still alive.
+    pub async fn stop_all(&self, timeout: std::time::Duration) {
+        let pgids = self.spawned_pgids.lock().await;
+        for &pgid in pgids.iter() {
+            // Send SIGTERM to the process group
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                Some(nix::sys::signal::Signal::SIGTERM),
+            );
+        }
+
+        // Wait for the grace period
+        tokio::time::sleep(timeout).await;
+
+        // SIGKILL any survivors
+        for &pgid in pgids.iter() {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(pgid),
+                Some(nix::sys::signal::Signal::SIGKILL),
+            );
+        }
     }
 
     /// Access the output buffer (read the captured log entries).

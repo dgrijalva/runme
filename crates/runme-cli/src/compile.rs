@@ -356,10 +356,10 @@ fn generate_runner_main(entries: &[CrateEntry]) -> String {
 
                 match resolved {
                     Ok(task) => {
-                        let ctx = runme::task::TaskContext::new(task.name);
-                        if let Err(e) = (task.func)(&ctx).await {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(e.exit_code());
+                        let mut app = runme::tui::App::with_task(task);
+                        if let Err(e) = app.run().await {
+                            eprintln!("TUI error: {}", e);
+                            std::process::exit(1);
                         }
                     }
                     Err(msg) => {
@@ -368,14 +368,11 @@ fn generate_runner_main(entries: &[CrateEntry]) -> String {
                     }
                 }
             } else {
-                println!("Available tasks:");
-                for task in registry.list() {
-                    let group_display = group_names.get(task.group).map(|s| s.as_str()).unwrap_or(task.group);
-                    if group_display.is_empty() {
-                        println!("  {}: {}", task.name, task.description.unwrap_or(""));
-                    } else {
-                        println!("  [{}] {}: {}", group_display, task.name, task.description.unwrap_or(""));
-                    }
+                // No task specified — launch TUI (task picker will come later)
+                let mut app = runme::tui::App::new();
+                if let Err(e) = app.run().await {
+                    eprintln!("TUI error: {}", e);
+                    std::process::exit(1);
                 }
             }
         });
