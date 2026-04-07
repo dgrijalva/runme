@@ -683,6 +683,7 @@ These are things to figure out during implementation, not blockers:
 7. **Re-runs**: returning to the task picker and re-launching the same task. Clear previous state? Append to existing logs?
 8. **Selective expansion**: expand entries matching a pattern while keeping the rest truncated. Interaction model TBD.
 9. **Process detail panel**: Enter on a sidebar process entry opens a detail overlay showing full command, PID/PGID, status, CWD, source name, start time/duration. Live-polling `lsof -p <pid>` to show open sockets/listeners — extremely useful for service processes. Should also expose process controls (stop, restart, signal) directly from the detail view.
+10. **Command bar**: `:` opens a command input bar (same UI pattern as filter/search). Provides an extensible command surface without consuming keybindings. Initial commands: `:export` (dump visible log to file), `:export json` (JSON lines), `:quit`, `:clear` (clear log buffer), `:help`. Future: `:set wrap`, `:set raw`, `:set margin N`, etc.
 
 ## Implementation Order
 
