@@ -276,6 +276,52 @@ The key idea: output is always captured, and you can get at it after the fact wi
 
 The exact boundary between "defined in code" and "exposed at runtime" is still being worked out. The goal is that writing the code is sufficient — you shouldn't have to write the orchestration *and* separately write UI metadata for it. The runtime should be able to introspect the task graph and make it interactive automatically. How much runtime control to expose (and how) is a design problem to solve as we build.
 
+## Task Execution Model
+
+### Task Functions Are Setup Functions
+
+A task function is an async Rust function that runs in-process. Its primary job is to **set up** whatever should be running — spawning child processes, configuring state, emitting initial logs. When the task function returns, its spawned processes **continue running**. The function returning is not the end of the task; it's the transition from "setting up" to "monitoring."
+
+This is the natural model for a task runner. Writing `ctx.spawn("npm run dev")` means "this should be running," not "run this until my function exits." The alternative — terminating processes on return — would require boilerplate `ctx.wait_for_processes().await` in nearly every task.
+
+For tasks that want teardown-on-return behavior, the task function can explicitly stop its processes before returning: individual `ProcessHandle::stop()` calls for specific processes, or `ctx.stop_all()` to terminate everything it spawned. `ctx.exec()` (synchronous, single-command) naturally provides run-and-return semantics.
+
+### Task Status
+
+A task progresses through these states:
+
+- **Setup** — the task function is executing (spawning processes, doing initialization)
+- **Ready** — the task function has returned; spawned processes continue running
+- **Done** — the task function returned and had no long-running processes (or all have since exited)
+- **Failed** — the task function returned an error or panicked
+
+The transition from Setup to Ready is meaningful information — it tells the user (or agent) that initialization is complete.
+
+### One Task at a Time
+
+The current design assumes one task runs at a time. The task may spawn multiple child processes, but only one task function is active. This simplifies lifecycle management and UI state. Multi-task orchestration (running multiple task functions concurrently) is a future consideration.
+
+### Task Logging via `tracing`
+
+Task functions emit structured logs via the `tracing` crate. The prelude re-exports `tracing` macros (`info!`, `error!`, `warn!`, `debug!`, `trace!`) so task authors write idiomatic Rust:
+
+```rust
+#[runme::task]
+async fn deploy(ctx: &TaskContext) -> TaskResult {
+    info!("starting deployment");
+    let handle = ctx.spawn("docker compose up -d").await?;
+    info!(service = "docker", "containers started");
+}
+```
+
+At task launch, a custom `tracing::Layer` converts `tracing::Event`s into `LogEntry`s and pushes them into an `OutputBuffer`. This stream is named `"task"` and interleaves with child process output in the log viewer, distinguished by source like any other stream. Structured fields from `tracing` (e.g., `info!(user = "foo", "connected")`) map directly to `LogEntry.fields`.
+
+This means all output — from the task function itself and from every child process it spawns — flows through the same log pipeline and is available for filtering, search, and export.
+
+### Process Observation
+
+All child processes are spawned through `TaskContext`, which gives the runtime full visibility into what's running. The runtime observes process creation, status changes, and output without the task author needing to do anything explicit. A task can optionally report its own status via `ctx` for richer UI feedback, but the baseline observation is automatic.
+
 ## AI Agent Integration
 
 ### Agent Needs
