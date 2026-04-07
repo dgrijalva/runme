@@ -682,6 +682,7 @@ These are things to figure out during implementation, not blockers:
 6. **Completed process accumulation**: if a task spawns hundreds of short-lived processes, the completed section of the sidebar could grow unwieldy. Cap? Collapse? Defer until it's a real problem.
 7. **Re-runs**: returning to the task picker and re-launching the same task. Clear previous state? Append to existing logs?
 8. **Selective expansion**: expand entries matching a pattern while keeping the rest truncated. Interaction model TBD.
+9. **Process detail panel**: Enter on a sidebar process entry opens a detail overlay showing full command, PID/PGID, status, CWD, source name, start time/duration. Live-polling `lsof -p <pid>` to show open sockets/listeners — extremely useful for service processes. Should also expose process controls (stop, restart, signal) directly from the detail view.
 
 ## Implementation Order
 
