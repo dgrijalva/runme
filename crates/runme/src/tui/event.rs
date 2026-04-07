@@ -1201,26 +1201,31 @@ async fn poll_lsof(state: &mut AppState) {
         match output {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
-                // Parse lsof output into a cleaner format
-                let mut socket_lines: Vec<String> = Vec::new();
+                // Extract only listening ports from lsof output
+                let mut ports: Vec<String> = Vec::new();
                 for line in stdout.lines().skip(1) {
+                    if !line.contains("LISTEN") {
+                        continue;
+                    }
                     // lsof columns: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 10 {
-                        let fd = parts[3];
-                        let node_type = parts[7]; // TCP, UDP, etc.
-                        let name = parts[8..].join(" ");
-                        // Check for state info like (LISTEN), (ESTABLISHED)
-                        if name.contains("LISTEN") {
-                            socket_lines.push(format!("  LISTEN {} (fd {})", name.replace("(LISTEN)", "").trim(), fd));
-                        } else if name.contains("ESTABLISHED") {
-                            socket_lines.push(format!("  ESTABLISHED {} (fd {})", name.replace("(ESTABLISHED)", "").trim(), fd));
-                        } else {
-                            socket_lines.push(format!("  {} {} (fd {})", node_type, name, fd));
+                    if parts.len() >= 9 {
+                        let name = parts[8];
+                        // name looks like "*:8080" or "127.0.0.1:3000" or "[::]:443"
+                        // extract the port (after the last colon)
+                        if let Some(port) = name.rsplit(':').next() {
+                            let port_str = port.to_string();
+                            if !ports.contains(&port_str) {
+                                ports.push(port_str);
+                            }
                         }
                     }
                 }
-                state.process_detail_sockets = Some(socket_lines.join("\n"));
+                if ports.is_empty() {
+                    state.process_detail_sockets = Some("(none)".to_string());
+                } else {
+                    state.process_detail_sockets = Some(ports.join(", "));
+                }
             }
             Err(_) => {
                 state.process_detail_sockets = Some("(lsof not available)".to_string());

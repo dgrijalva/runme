@@ -942,29 +942,18 @@ fn render_process_detail(
         }
     }
 
-    // Open sockets section
+    // Listening ports
     detail_lines.push(Line::from(""));
-    detail_lines.push(Line::from(Span::styled(
-        "--- open sockets ---",
-        Style::default().fg(Color::DarkGray),
-    )));
-
     if let Some(ref sockets) = state.process_detail_sockets {
-        if sockets.is_empty() {
-            detail_lines.push(Line::from(Span::styled(
-                "  (none)",
-                Style::default().fg(Color::DarkGray),
-            )));
-        } else {
-            for line in sockets.lines() {
-                detail_lines.push(Line::from(line.to_string()));
-            }
-        }
+        detail_lines.push(Line::from(vec![
+            Span::styled("Ports:   ", Style::default().fg(Color::Cyan)),
+            Span::raw(sockets.clone()),
+        ]));
     } else {
-        detail_lines.push(Line::from(Span::styled(
-            "  Refreshing...",
-            Style::default().fg(Color::Yellow),
-        )));
+        detail_lines.push(Line::from(vec![
+            Span::styled("Ports:   ", Style::default().fg(Color::Cyan)),
+            Span::styled("scanning...", Style::default().fg(Color::Yellow)),
+        ]));
     }
 
     // Controls hint at bottom
