@@ -10,7 +10,7 @@ use tokio_stream::StreamExt;
 
 use crate::log::LogEntry;
 
-use super::app::{AppState, render_frame};
+use super::app::{AppMode, AppState, render_frame};
 use super::render::DisplayMode;
 use super::runner::TaskStatus;
 use super::sidebar;
@@ -204,6 +204,13 @@ fn handle_key(
             .collect()
     };
 
+    // Filter input mode gets its own key handling — only Esc and Ctrl-C escape
+    if state.mode == AppMode::FilterInput {
+        handle_filter_input_key(key, state);
+        state.dirty = true;
+        return;
+    }
+
     // Global keys (work regardless of focus)
     match key.code {
         // 'q' quits the application
@@ -395,6 +402,12 @@ fn handle_log_viewer_key(
             state.show_all_sources();
         }
 
+        // f: enter filter input mode
+        KeyCode::Char('f') => {
+            state.filter_input.save_current();
+            state.mode = AppMode::FilterInput;
+        }
+
         // 1-9: toggle source N
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
@@ -402,6 +415,55 @@ fn handle_log_viewer_key(
                 let source = source.to_string();
                 state.toggle_source_visibility(&source);
             }
+        }
+
+        _ => {}
+    }
+}
+
+/// Handle keys when in filter input mode.
+fn handle_filter_input_key(key: KeyEvent, state: &mut AppState) {
+    match key.code {
+        // Enter: confirm filter and return to Normal mode
+        KeyCode::Enter => {
+            state.mode = AppMode::Normal;
+        }
+
+        // Esc: cancel (revert) and return to Normal mode
+        KeyCode::Esc => {
+            state.filter_input.revert();
+            state.mode = AppMode::Normal;
+        }
+
+        // Ctrl-u: clear the input
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.filter_input.clear();
+        }
+
+        // Ctrl-c: cancel and return to Normal mode
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            state.filter_input.revert();
+            state.mode = AppMode::Normal;
+        }
+
+        // Left arrow: move cursor left
+        KeyCode::Left => {
+            state.filter_input.move_left();
+        }
+
+        // Right arrow: move cursor right
+        KeyCode::Right => {
+            state.filter_input.move_right();
+        }
+
+        // Backspace: delete character before cursor
+        KeyCode::Backspace => {
+            state.filter_input.delete_char_before();
+        }
+
+        // Any other character: insert into the filter text
+        KeyCode::Char(ch) => {
+            state.filter_input.insert_char(ch);
         }
 
         _ => {}

@@ -18,10 +18,12 @@ use ratatui::{
 use tokio::sync::Mutex;
 
 use crate::log::LogEntry;
+use crate::log::filter as log_filter;
 use crate::log::store::LogStore;
 use crate::task::TaskDef;
 
 use super::event::run_event_loop;
+use super::filter::{FilterInputState, filter_status_spans, render_filter_input};
 use super::render::{DisplayMode, SourceColors};
 use super::runner::{ProcessInfo, TaskRunner, TaskStatus};
 use super::sidebar::{self, SidebarEntry, SidebarState, SIDEBAR_WIDTH};
@@ -32,6 +34,8 @@ use super::viewport::{self, ScrollState, new_entries_since_pin};
 pub enum AppMode {
     /// Log viewer, navigating with keyboard
     Normal,
+    /// Filter expression input mode
+    FilterInput,
 }
 
 /// Core application state, shared across the event loop and rendering.
@@ -68,6 +72,8 @@ pub struct AppState {
     pub sidebar_entries: Vec<SidebarEntry>,
     /// Process info from the runner, shared for status monitoring.
     pub processes: Option<Arc<Mutex<Vec<ProcessInfo>>>>,
+    /// Filter input state for the filter bar.
+    pub filter_input: FilterInputState,
 }
 
 impl Default for AppState {
@@ -94,35 +100,53 @@ impl AppState {
             source_filter: HashSet::new(),
             sidebar_entries: Vec::new(),
             processes: None,
+            filter_input: FilterInputState::new(),
         }
     }
 
-    /// Get the visible log lines (filtered by source_filter).
-    /// Returns indices into self.log_lines for entries that pass the filter.
+    /// Get the visible log lines (filtered by source_filter AND expression filter).
+    /// Returns indices into self.log_lines for entries that pass both filters.
     pub fn visible_line_indices(&self) -> Vec<usize> {
-        if self.source_filter.is_empty() {
-            // No filter: all entries visible
-            (0..self.log_lines.len()).collect()
-        } else {
-            self.log_lines
-                .iter()
-                .enumerate()
-                .filter(|(_, entry)| self.source_filter.contains(&entry.source))
-                .map(|(i, _)| i)
-                .collect()
-        }
+        let expr = self.filter_input.active_expr();
+        self.log_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| {
+                // Source filter
+                if !self.source_filter.is_empty() && !self.source_filter.contains(&entry.source) {
+                    return false;
+                }
+                // Expression filter
+                if let Some(expr) = expr {
+                    if !log_filter::matches(expr, entry) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
-    /// Get the filtered log lines based on source_filter.
+    /// Get the filtered log lines based on source_filter AND expression filter.
     pub fn visible_log_lines(&self) -> Vec<&LogEntry> {
-        if self.source_filter.is_empty() {
-            self.log_lines.iter().collect()
-        } else {
-            self.log_lines
-                .iter()
-                .filter(|entry| self.source_filter.contains(&entry.source))
-                .collect()
-        }
+        let expr = self.filter_input.active_expr();
+        self.log_lines
+            .iter()
+            .filter(|entry| {
+                // Source filter
+                if !self.source_filter.is_empty() && !self.source_filter.contains(&entry.source) {
+                    return false;
+                }
+                // Expression filter
+                if let Some(expr) = expr {
+                    if !log_filter::matches(expr, entry) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect()
     }
 
     /// Toggle visibility of a source. If source_filter is empty (show all),
@@ -303,6 +327,11 @@ pub fn render_frame(
                         "  Waiting for output...",
                         Style::default().fg(Color::DarkGray),
                     ))]
+                } else if state.filter_input.has_active_filter() {
+                    vec![Line::from(Span::styled(
+                        "  No entries match the current filter. Press 'f' to edit.",
+                        Style::default().fg(Color::DarkGray),
+                    ))]
                 } else {
                     vec![Line::from(Span::styled(
                         "  All sources filtered out. Press 'a' to show all.",
@@ -359,96 +388,101 @@ pub fn render_frame(
         frame.render_widget(log_paragraph, log_area);
 
         // -- Status bar --
-        let mode_text = match state.mode {
-            AppMode::Normal => "NORMAL",
-        };
-
-        let focus_text = if state.sidebar.focused {
-            "SIDEBAR"
+        if state.mode == AppMode::FilterInput {
+            // Render the filter input bar instead of the normal status bar
+            render_filter_input(frame, vert_chunks[1], &state.filter_input);
         } else {
-            mode_text
-        };
+            let mode_text = match state.mode {
+                AppMode::Normal => "NORMAL",
+                AppMode::FilterInput => "FILTER", // won't reach here, but exhaustive
+            };
 
-        // Build status line with task info
-        let mut spans = vec![
-            Span::styled(" runme ", Style::default().fg(Color::Black).bg(Color::Cyan)),
-            Span::raw(" "),
-            Span::styled(
-                format!(" {} ", focus_text),
-                Style::default().fg(Color::Black).bg(Color::DarkGray),
-            ),
-        ];
+            let focus_text = if state.sidebar.focused {
+                "SIDEBAR"
+            } else {
+                mode_text
+            };
 
-        // Add task name if running
-        if let Some(name) = &state.task_name {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!(" {} ", name),
-                Style::default().fg(Color::White).bg(Color::DarkGray),
-            ));
-        }
+            // Build status line with task info
+            let mut spans = vec![
+                Span::styled(" runme ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                Span::raw(" "),
+                Span::styled(
+                    format!(" {} ", focus_text),
+                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                ),
+            ];
 
-        // Display mode indicator
-        let mode_indicator = match state.display_mode {
-            DisplayMode::Preview => "preview",
-            DisplayMode::Raw => "raw",
-        };
-        let wrap_indicator = if state.wrap { "wrap" } else { "truncate" };
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!(" {} {} ", mode_indicator, wrap_indicator),
-            Style::default().fg(Color::DarkGray),
-        ));
-
-        // Source filter indicator
-        if !state.source_filter.is_empty() {
-            let hidden_count = state
-                .sidebar_entries
-                .iter()
-                .filter(|e| !e.visible)
-                .count();
-            if hidden_count > 0 {
+            // Add task name if running
+            if let Some(name) = &state.task_name {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
-                    format!(" {} hidden ", hidden_count),
-                    Style::default().fg(Color::Yellow),
+                    format!(" {} ", name),
+                    Style::default().fg(Color::White).bg(Color::DarkGray),
                 ));
             }
-        }
 
-        // Scroll position / entry count — use visible count
-        let visible_count = if state.source_filter.is_empty() {
-            state.log_lines.len()
-        } else {
-            state.visible_line_indices().len()
-        };
-        if visible_count > 0 {
+            // Display mode indicator
+            let mode_indicator = match state.display_mode {
+                DisplayMode::Preview => "preview",
+                DisplayMode::Raw => "raw",
+            };
+            let wrap_indicator = if state.wrap { "wrap" } else { "truncate" };
             spans.push(Span::raw(" "));
-            match state.scroll {
-                ScrollState::Tail => {
+            spans.push(Span::styled(
+                format!(" {} {} ", mode_indicator, wrap_indicator),
+                Style::default().fg(Color::DarkGray),
+            ));
+
+            // Source filter indicator
+            if !state.source_filter.is_empty() {
+                let hidden_count = state
+                    .sidebar_entries
+                    .iter()
+                    .filter(|e| !e.visible)
+                    .count();
+                if hidden_count > 0 {
+                    spans.push(Span::raw(" "));
                     spans.push(Span::styled(
-                        format!(" TAIL | {} ", visible_count),
-                        Style::default().fg(Color::DarkGray),
+                        format!(" {} hidden ", hidden_count),
+                        Style::default().fg(Color::Yellow),
                     ));
                 }
-                ScrollState::Pinned { cursor, .. } => {
-                    let new_count = new_entries_since_pin(&state.scroll, visible_count);
-                    let pos_text = if new_count > 0 {
-                        format!(" {} / {} (+{} new) ", cursor + 1, visible_count, new_count)
-                    } else {
-                        format!(" {} / {} ", cursor + 1, visible_count)
-                    };
-                    spans.push(Span::styled(pos_text, Style::default().fg(Color::DarkGray)));
+            }
+
+            // Active expression filter indicator
+            spans.extend(filter_status_spans(&state.filter_input));
+
+            // Scroll position / entry count — use visible count
+            let visible_count = state.visible_line_indices().len();
+            if visible_count > 0 {
+                spans.push(Span::raw(" "));
+                match state.scroll {
+                    ScrollState::Tail => {
+                        spans.push(Span::styled(
+                            format!(" TAIL | {} ", visible_count),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    ScrollState::Pinned { cursor, .. } => {
+                        let new_count = new_entries_since_pin(&state.scroll, visible_count);
+                        let pos_text = if new_count > 0 {
+                            format!(" {} / {} (+{} new) ", cursor + 1, visible_count, new_count)
+                        } else {
+                            format!(" {} / {} ", cursor + 1, visible_count)
+                        };
+                        spans.push(Span::styled(pos_text, Style::default().fg(Color::DarkGray)));
+                    }
                 }
             }
+
+            let status_line = Line::from(spans);
+
+            let status_bar = Paragraph::new(status_line)
+                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+
+            frame.render_widget(status_bar, vert_chunks[1]);
         }
-
-        let status_line = Line::from(spans);
-
-        let status_bar = Paragraph::new(status_line)
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
-
-        frame.render_widget(status_bar, vert_chunks[1]);
     })?;
 
     Ok(())
