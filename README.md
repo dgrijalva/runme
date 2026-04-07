@@ -215,6 +215,7 @@ These flow through the same pipeline as child process output.
 | `q` | Quit |
 | `Ctrl-c` | Quit |
 | `Tab` | Toggle focus between sidebar and log viewer |
+| `?` | Toggle help overlay |
 
 ### Log Viewer
 
@@ -228,8 +229,21 @@ These flow through the same pipeline as child process output.
 | `G` / `End` | Jump to last entry (tail mode) |
 | `v` / `m` | Toggle preview/raw display mode |
 | `w` | Toggle line wrap/truncate |
+| `f` | Open filter bar |
+| `/` | Open search |
+| `n` / `N` | Next / previous search match |
 | `a` | Show all sources (clear filter) |
 | `1`-`9` | Toggle visibility of source N |
+
+### Filter / Search Input
+
+| Key | Action |
+|-----|--------|
+| typing | Updates filter expression or search pattern |
+| `Enter` | Confirm and return to normal mode |
+| `Esc` | Cancel (revert) and return to normal mode |
+| `Ctrl-u` | Clear input |
+| `Left` / `Right` | Move cursor within input |
 
 ### Sidebar
 

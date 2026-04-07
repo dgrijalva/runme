@@ -39,6 +39,8 @@ pub enum AppMode {
     FilterInput,
     /// Search pattern input mode
     SearchInput,
+    /// Help overlay
+    Help,
 }
 
 /// Core application state, shared across the event loop and rendering.
@@ -275,14 +277,27 @@ pub fn render_frame(
     terminal.draw(|frame| {
         let area = frame.area();
 
-        // Vertical layout: main content (fills) + status bar (1 line)
-        let vert_chunks = Layout::vertical([
-            Constraint::Min(0),    // main content area
-            Constraint::Length(1), // status bar
-        ])
-        .split(area);
+        // Vertical layout: main content + optional input bar + status bar
+        let has_input_bar = matches!(state.mode, AppMode::FilterInput | AppMode::SearchInput);
+        let vert_chunks = if has_input_bar {
+            Layout::vertical([
+                Constraint::Min(0),    // main content area
+                Constraint::Length(1), // input bar
+                Constraint::Length(1), // status bar
+            ])
+            .split(area)
+        } else {
+            Layout::vertical([
+                Constraint::Min(0),    // main content area
+                Constraint::Length(0), // no input bar
+                Constraint::Length(1), // status bar
+            ])
+            .split(area)
+        };
 
         let content_area = vert_chunks[0];
+        let input_bar_area = vert_chunks[1];
+        let status_bar_area = vert_chunks[2];
 
         // Horizontal layout: sidebar (fixed width) + log viewer (fills)
         let has_task = state.task_name.is_some();
@@ -411,18 +426,19 @@ pub fn render_frame(
         let log_paragraph = Paragraph::new(lines).block(Block::default());
         frame.render_widget(log_paragraph, log_area);
 
-        // -- Status bar --
+        // -- Input bar (above status bar, only when filter/search input is active) --
         if state.mode == AppMode::FilterInput {
-            // Render the filter input bar instead of the normal status bar
-            render_filter_input(frame, vert_chunks[1], &state.filter_input);
+            render_filter_input(frame, input_bar_area, &state.filter_input);
         } else if state.mode == AppMode::SearchInput {
-            // Render the search input bar instead of the normal status bar
-            render_search_input(frame, vert_chunks[1], &state.search);
-        } else {
+            render_search_input(frame, input_bar_area, &state.search);
+        }
+
+        // -- Status bar (always visible) --
+        {
             let mode_text = match state.mode {
-                AppMode::Normal => "NORMAL",
-                AppMode::FilterInput => "FILTER", // won't reach here, but exhaustive
-                AppMode::SearchInput => "SEARCH", // won't reach here, but exhaustive
+                AppMode::Normal | AppMode::Help => "NORMAL",
+                AppMode::FilterInput => "FILTER",
+                AppMode::SearchInput => "SEARCH",
             };
 
             let focus_text = if state.sidebar.focused {
@@ -512,11 +528,76 @@ pub fn render_frame(
             let status_bar = Paragraph::new(status_line)
                 .style(Style::default().bg(Color::DarkGray).fg(Color::White));
 
-            frame.render_widget(status_bar, vert_chunks[1]);
+            frame.render_widget(status_bar, status_bar_area);
+        }
+
+        // -- Help overlay --
+        if state.mode == AppMode::Help {
+            render_help_overlay(frame, area);
         }
     })?;
 
     Ok(())
+}
+
+/// Render a centered help overlay showing keyboard shortcuts.
+fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::widgets::{Borders, Clear, Wrap};
+
+    let help_text = vec![
+        Line::from(Span::styled("Keyboard Shortcuts", Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![Span::styled("Navigation", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  j/k  "), Span::styled("Move cursor down/up", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  [/]  "), Span::styled("Page up/down", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  g/G  "), Span::styled("Jump to top / bottom (tail)", Style::default().fg(Color::DarkGray))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Display", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  v    "), Span::styled("Toggle preview/raw mode", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  w    "), Span::styled("Toggle wrap/truncate", Style::default().fg(Color::DarkGray))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Filter & Search", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  f    "), Span::styled("Open filter bar (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  /    "), Span::styled("Open search (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  n/N  "), Span::styled("Next/previous search match", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  1-9  "), Span::styled("Toggle source N visibility", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  a    "), Span::styled("Show all sources", Style::default().fg(Color::DarkGray))]),
+        Line::from(""),
+        Line::from(vec![Span::styled("Sidebar", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  Tab  "), Span::styled("Toggle sidebar focus", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  s    "), Span::styled("Stop selected process", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  r    "), Span::styled("Restart selected process", Style::default().fg(Color::DarkGray))]),
+        Line::from(""),
+        Line::from(vec![Span::raw("  q    "), Span::styled("Quit", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  ?    "), Span::styled("Toggle this help", Style::default().fg(Color::DarkGray))]),
+    ];
+
+    let help_height = (help_text.len() + 2) as u16; // +2 for border
+    let help_width = 52u16;
+
+    // Center the popup
+    let x = area.width.saturating_sub(help_width) / 2;
+    let y = area.height.saturating_sub(help_height) / 2;
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + x,
+        area.y + y,
+        help_width.min(area.width),
+        help_height.min(area.height),
+    );
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    let help_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" Help ", Style::default().fg(Color::Cyan)));
+
+    let help_paragraph = Paragraph::new(help_text)
+        .block(help_block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(help_paragraph, popup_area);
 }
 
 /// Apply search highlighting to a rendered line.

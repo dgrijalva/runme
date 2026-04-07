@@ -237,8 +237,21 @@ fn handle_key(
         return;
     }
 
+    // Help mode: any key dismisses
+    if state.mode == AppMode::Help {
+        state.mode = AppMode::Normal;
+        state.dirty = true;
+        return;
+    }
+
     // Global keys (work regardless of focus)
     match key.code {
+        // '?' toggles help overlay
+        KeyCode::Char('?') => {
+            state.mode = AppMode::Help;
+            state.dirty = true;
+            return;
+        }
         // 'q' quits the application
         KeyCode::Char('q') => {
             state.running = false;
