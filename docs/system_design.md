@@ -249,16 +249,16 @@ The TUI owns stdio while it's running. When it closes, a `TuiOutput` buffer is f
 let tui_out = ctx.tui_output();
 
 // Copy current entries from a process output snapshot
-tui_out.append(result.output());            // preserves stdout/stderr mapping
-tui_out.stderr().append(result.output());   // force everything to stderr
-tui_out.stdout().append(result.output());   // force everything to stdout
+tui_out.append(result.output()).await;            // preserves stdout/stderr mapping
+tui_out.stderr().append(result.output()).await;   // force everything to stderr
+tui_out.stdout().append(result.output()).await;   // force everything to stdout
 
 // Subscribe to live output (for spawn, where process is still running)
-tui_out.subscribe(handle.output());            // preserves mapping
-tui_out.stderr().subscribe(handle.output());   // force to stderr
+tui_out.subscribe(&handle.output()).await;            // preserves mapping
+tui_out.stderr().subscribe(&handle.output()).await;   // force to stderr
 
 // Task's own tracing output
-tui_out.stderr().append(ctx.task_output());
+tui_out.stderr().append(&ctx.task_output()).await;
 
 // Literal text
 tui_out.stderr().write("done!\n");
@@ -275,10 +275,10 @@ In non-TUI modes, process output is already written directly to stdio, so these 
 #[runme::task]
 async fn install(ctx: &TaskContext) -> TaskResult {
     ctx.tui_wait(false);
-    ctx.tui_output().stderr().subscribe(ctx.task_output());
+    ctx.tui_output().stderr().subscribe(&ctx.task_output()).await;
 
     info!("starting");
-    let result = ctx.exec("cargo install --path .").await;
+    let result = ctx.exec("cargo install --path .").await?;
     if !result.success() {
         ctx.tui_wait(true);
     }
@@ -617,7 +617,7 @@ ctx.exec("cargo build").await?.ok()?;
 
 // Propagate spawn failure, but capture output on non-zero exit
 let result = ctx.exec("cargo build").await?;
-ctx.tui_output().stderr().append(result.output());
+ctx.tui_output().stderr().append(result.output()).await;
 result.ok()?;
 ```
 

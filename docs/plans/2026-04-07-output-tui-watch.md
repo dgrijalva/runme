@@ -18,16 +18,16 @@ Sequential phases because `task.rs` and `process.rs` are modified by all three f
 - [x] `Output` type exposes `.entries()`, `.subscribe()`, `.stdout()`, `.stderr()`
 - [x] `ctx.exec()` returns `ProcessResult` with `.ok()` returning `Result<ProcessResult, ProcessResult>`
 - [x] `ProcessHandle` exposes `.output() -> Output` (replaces public `buffer` field)
-- [ ] `ctx.tui_wait(false)` causes TUI to auto-exit on task completion
-- [ ] `ctx.tui_output()` returns `TuiOutput` with `.append(&Output)` and `.subscribe(&Output)` on both stdout/stderr streams
-- [ ] Post-TUI output is flushed to real stdio after `restore_terminal()`
-- [ ] `ctx.watch("glob")` returns `Watch<Vec<PathBuf>>` with `.next().await` and `.label()`
-- [ ] `ctx.watch_with(f)` returns `Watch<T>` with generic filter/map
-- [ ] `ctx.watch_channel::<T>()` returns `(Sender<T>, Watch<T>)`
-- [ ] `glob_filter` is a public utility function
-- [ ] `watch` attribute removed from `#[runme::task]` macro and `TaskDef`
-- [ ] All existing tests pass; new tests cover new types
-- [ ] `cargo build` and `cargo test` pass
+- [x] `ctx.tui_wait(false)` causes TUI to auto-exit on task completion
+- [x] `ctx.tui_output()` returns `TuiOutput` with `.append(&Output)` and `.subscribe(&Output)` on both stdout/stderr streams
+- [x] Post-TUI output is flushed to real stdio after `restore_terminal()`
+- [x] `ctx.watch("glob")` returns `Watch<Vec<PathBuf>>` with `.next().await` and `.label()`
+- [x] `ctx.watch_with(f)` returns `Watch<T>` with generic filter/map
+- [x] `ctx.watch_channel::<T>()` returns `(Sender<T>, Watch<T>)`
+- [x] `glob_filter` is a public utility function
+- [x] `watch` attribute removed from `#[runme::task]` macro and `TaskDef`
+- [x] All existing tests pass; new tests cover new types
+- [x] `cargo build` and `cargo test` pass
 
 ## Human Review Gates
 
@@ -38,7 +38,7 @@ Sequential phases because `task.rs` and `process.rs` are modified by all three f
 
 ## Status
 
-`implementation` — Phase 1 (Output) complete. Phases 2+3 (TUI, Watch) in progress.
+`complete` — All phases implemented and validated.
 
 ## Context
 
