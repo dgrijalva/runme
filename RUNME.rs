@@ -7,5 +7,6 @@ use runme::prelude::*;
 async fn install(ctx: &TaskContext) -> TaskResult {
     info!("Installing runme CLI");
     ctx.exec("cargo install --path crates/runme-cli").await?;
+    info!("Done!");
     Ok(())
 }

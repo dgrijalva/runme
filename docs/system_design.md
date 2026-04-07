@@ -19,9 +19,9 @@ Each RUNME.rs is a Rust source file with a shebang pointing at the `runme` binar
 use runme::prelude::*;
 
 /// Build the project
-#[runme::task(watch = "src/**/*.rs")]
+#[runme::task]
 async fn build(ctx: &TaskContext) -> TaskResult {
-    ctx.exec("cargo build").await?;
+    ctx.exec("cargo build").await.ok()?;
     Ok(())
 }
 ```
@@ -106,7 +106,7 @@ Task arguments use progressive complexity based on the function signature. The `
 /// Build the project
 #[runme::task]
 async fn build(ctx: &TaskContext) -> TaskResult {
-    ctx.exec("cargo build").await?;
+    ctx.exec("cargo build").await.ok()?;
     Ok(())
 }
 ```
@@ -118,7 +118,7 @@ async fn build(ctx: &TaskContext) -> TaskResult {
 #[runme::task]
 async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
     // runme deploy --env staging --port 8080 --verbose
-    ctx.exec(format!("deploy --target {} -p {}", env, port)).await?;
+    ctx.exec(format!("deploy --target {} -p {}", env, port)).await.ok()?;
     Ok(())
 }
 ```
@@ -142,7 +142,7 @@ struct DeployArgs {
 /// Deploy to an environment
 #[runme::task]
 async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult {
-    ctx.exec(format!("deploy --target {} -p {}", args.env, args.port)).await?;
+    ctx.exec(format!("deploy --target {} -p {}", args.env, args.port)).await.ok()?;
     Ok(())
 }
 ```
@@ -217,6 +217,80 @@ Once a task is triggered, behavior depends on mode:
   - Log-only mode (streaming stdout/stderr)
   - Piping-friendly formats (JSON lines, etc.)
   - Whatever makes sense for the consumer on the other end
+
+### TUI Behavior Control
+
+Task code can control TUI behavior through primitives on `TaskContext`. These are TUI-specific — other modes (CLI, agent) silently ignore them.
+
+#### Wait Behavior
+
+By default, the TUI stays open after a task returns (the "service" case — spawned processes continue running). Tasks that are "do a thing and finish" can opt out:
+
+```rust
+ctx.tui_wait(false);  // TUI closes when task returns
+```
+
+This is mutable — the task can change its mind based on what happened:
+
+```rust
+ctx.tui_wait(false);
+let result = ctx.exec("cargo install --path .").await;
+if !result.success() {
+    ctx.tui_wait(true);  // stay open on failure
+}
+result.ok()?;
+```
+
+#### Post-TUI Output
+
+The TUI owns stdio while it's running. When it closes, a `TuiOutput` buffer is flushed to the real stdout/stderr. Task code controls what ends up in this buffer.
+
+```rust
+let tui_out = ctx.tui_output();
+
+// Copy current entries from a process output snapshot
+tui_out.append(result.output());            // preserves stdout/stderr mapping
+tui_out.stderr().append(result.output());   // force everything to stderr
+tui_out.stdout().append(result.output());   // force everything to stdout
+
+// Subscribe to live output (for spawn, where process is still running)
+tui_out.subscribe(handle.output());            // preserves mapping
+tui_out.stderr().subscribe(handle.output());   // force to stderr
+
+// Task's own tracing output
+tui_out.stderr().append(ctx.task_output());
+
+// Literal text
+tui_out.stderr().write("done!\n");
+```
+
+`append()` copies a snapshot of the `Output` at call time. `subscribe()` follows live output and continues capturing until the TUI closes. Both accept `&Output`.
+
+In non-TUI modes, process output is already written directly to stdio, so these calls are no-ops.
+
+#### Example: Transient Task
+
+```rust
+/// Install the runme binary
+#[runme::task]
+async fn install(ctx: &TaskContext) -> TaskResult {
+    ctx.tui_wait(false);
+    ctx.tui_output().stderr().subscribe(ctx.task_output());
+
+    info!("starting");
+    let result = ctx.exec("cargo install --path .").await;
+    if !result.success() {
+        ctx.tui_wait(true);
+    }
+    result.ok()?;
+    info!("done!");
+    Ok(())
+}
+```
+
+- TUI opens, task runs as normal
+- On success: TUI closes, task tracing output ("starting\ndone!") written to stderr
+- On failure: TUI stays open for inspection
 
 ### Log Viewing & Exploration
 
@@ -322,6 +396,88 @@ This means all output — from the task function itself and from every child pro
 
 All child processes are spawned through `TaskContext`, which gives the runtime full visibility into what's running. The runtime observes process creation, status changes, and output without the task author needing to do anything explicit. A task can optionally report its own status via `ctx` for richer UI feedback, but the baseline observation is automatic.
 
+### Watch API
+
+Watches are runtime primitives, not macro attributes. A watch is created through `TaskContext`, starts listening immediately, and returns a `Watch<T>` handle. The task consumes events from it via `.next().await`. All watches registered through `ctx` are visible to the TUI (status, label, trigger count).
+
+#### Constructors
+
+| Constructor | `T` | Notes |
+|---|---|---|
+| `ctx.watch("glob")` | `Vec<PathBuf>` | Debounced, glob-filtered |
+| `ctx.watch_with(f)` | whatever `f` returns | `F: Fn(&[PathBuf]) -> Option<T>` |
+| `ctx.watch_channel::<T>()` | `T` | Bring your own signal |
+
+All support `.label("name")` for TUI display.
+
+**File watch** — the common case. Debounce is built into the watch type, not the caller's problem:
+
+```rust
+let w = ctx.watch("src/**/*.rs").label("rust sources");
+loop {
+    ctx.exec("cargo build").await.ok()?;
+    w.next().await;  // blocks until files change
+}
+```
+
+**Custom filter** — the closure receives all changed paths and returns `Option<T>`. `None` means "not interesting, keep waiting." The return value becomes what `.next()` yields:
+
+```rust
+let w = ctx.watch_with(|changed: &[PathBuf]| {
+    let rs = glob_filter("src/**/*.rs", changed);
+    let toml = glob_filter("**/Cargo.toml", changed);
+    if rs.is_empty() && toml.is_empty() { None }
+    else { Some((rs, toml)) }
+});
+
+loop {
+    let (rs_files, toml_files) = w.next().await;
+    if !toml_files.is_empty() {
+        ctx.exec("cargo update").await.ok()?;
+    }
+    ctx.exec("cargo build").await.ok()?;
+}
+```
+
+`glob_filter` is a public utility so custom filters can compose with the same glob matching used by `ctx.watch()`.
+
+**Arbitrary signal** — for polling a command, waiting for a port, health checks, or any non-filesystem trigger:
+
+```rust
+let (tx, w) = ctx.watch_channel::<HealthStatus>();
+w.label("health check");
+
+tokio::spawn(async move {
+    loop {
+        let status = poll_health_endpoint().await;
+        if status.changed() {
+            tx.send(status).await;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+});
+
+loop {
+    let status = w.next().await;
+    info!("health changed: {:?}", status);
+    // react...
+}
+```
+
+#### Watch + Process Lifecycle
+
+The watch is set up outside the loop, so events that arrive while a build or process is running are not lost — they're buffered (and coalesced for file watches) until the next `.next()` call:
+
+```rust
+// Restart a server on file change
+let w = ctx.watch("src/**/*.rs");
+loop {
+    let h = ctx.spawn("cargo run --release").await?;
+    w.next().await;
+    h.stop();
+}
+```
+
 ## AI Agent Integration
 
 ### Agent Needs
@@ -382,7 +538,7 @@ async fn build(ctx: &TaskContext) -> TaskResult {
         .args(["build", "--release"])
         .env("RUSTFLAGS", "-C target-cpu=native")
         .cwd("./crates/server");
-    ctx.exec(cmd).await?;
+    ctx.exec(cmd).await.ok()?;
     Ok(())
 }
 ```
@@ -395,8 +551,8 @@ For one-liners and cases where shell features are genuinely wanted (pipes, globb
 
 ```rust
 // These are equivalent
-ctx.exec(Cmd::shell("cargo build && cargo test")).await?;
-ctx.exec("cargo build && cargo test").await?;  // convenience: &str → Cmd::shell()
+ctx.exec(Cmd::shell("cargo build && cargo test")).await.ok()?;
+ctx.exec("cargo build && cargo test").await.ok()?;  // convenience: &str → Cmd::shell()
 ```
 
 `Cmd::shell()` wraps the string in `sh -c`. This is the escape hatch, not the default. It reintroduces shell escaping concerns, but sometimes that's what you want.
@@ -410,7 +566,7 @@ let mut std_cmd = std::process::Command::new("cargo");
 std_cmd.arg("build").env("CARGO_INCREMENTAL", "0");
 
 let cmd = Cmd::from(std_cmd);
-ctx.exec(cmd).await?;
+ctx.exec(cmd).await.ok()?;
 ```
 
 The conversion extracts what `std::process::Command` carries (program, args, env) into a runme `Cmd`. From there the full builder API is available — you can keep chaining runme-specific methods after conversion:
@@ -420,6 +576,52 @@ let cmd = Cmd::from(std_cmd)
     .cwd("./subdir")
     .env("EXTRA", "yes");
 ```
+
+### Process Output
+
+All process output flows through the log pipeline (`RecordParser` → `LogEntry` → `OutputBuffer`). The `Output` type provides a unified handle to this data, used by both `exec()` (completed process) and `spawn()` (running process):
+
+```rust
+pub struct Output(Arc<Mutex<OutputBuffer>>);
+
+impl Output {
+    /// Snapshot of all entries captured so far
+    pub fn entries(&self) -> Vec<LogEntry> { ... }
+    /// Live subscription to new entries
+    pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> { ... }
+    /// Convenience: raw stdout lines as strings
+    pub fn stdout(&self) -> Vec<String> { ... }
+    /// Convenience: raw stderr lines as strings
+    pub fn stderr(&self) -> Vec<String> { ... }
+}
+```
+
+Both `ProcessResult` (from `exec`) and `ProcessHandle` (from `spawn`) expose `.output() -> Output`. There is no separate `ExecOutput` type — the same `Output` backed by `OutputBuffer` serves all access patterns.
+
+### Execution Results
+
+`ctx.exec()` returns a `ProcessResult` — not a `Result`. The process always runs; the question is whether it succeeded. Output is always accessible regardless of exit status.
+
+```rust
+let result = ctx.exec("cargo build").await;
+result.output().entries();   // always works
+result.success();            // true/false
+result.exit_code();          // i32
+```
+
+For `?` ergonomics, `ProcessResult::ok()` converts to a `Result`:
+
+```rust
+// Propagate failure, discard output
+ctx.exec("cargo build").await.ok()?;
+
+// Propagate failure, but capture output first
+let result = ctx.exec("cargo build").await;
+ctx.tui_output().stderr().append(result.output());
+result.ok()?;
+```
+
+`ok()` returns `Result<ProcessResult, ProcessResult>`. On the error path, `ProcessResult` converts into `TaskError` via the standard `From` trait, carrying exit code and output with it.
 
 ### Design Decisions
 
