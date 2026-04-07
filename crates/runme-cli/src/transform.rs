@@ -86,4 +86,39 @@ mod tests {
         let result = transform_source("fn foo() {}\n", "test");
         assert!(result.contains("pub fn __runme_link() {}"));
     }
+
+    #[test]
+    fn test_shebang_and_frontmatter_comments_both_present() {
+        // When both shebang and //! frontmatter comments are present, only the
+        // shebang is stripped; the //! lines remain in the transformed output.
+        let source = "#!/usr/bin/env runme\n//! [dependencies]\n//! tokio = \"1\"\n\nfn work() {}\n";
+        let result = transform_source(source, "infra");
+        assert!(result.starts_with("const __RUNME_GROUP: &str = \"infra\";\n"));
+        assert!(!result.contains("#!/usr/bin/env runme"));
+        assert!(result.contains("//! [dependencies]"));
+        assert!(result.contains("//! tokio = \"1\""));
+        assert!(result.ends_with("pub fn __runme_link() {}\n"));
+    }
+
+    #[test]
+    fn test_idempotent_double_transform() {
+        // Applying transform_source twice should still produce a compilable-ish
+        // result — the outer __RUNME_GROUP constant will come first, so the
+        // second application does NOT collapse them; just verify no panic and
+        // that the outermost constant reflects the second group argument.
+        let source = "fn task_a() {}\n";
+        let once = transform_source(source, "group_a");
+        let twice = transform_source(&once, "group_b");
+        // The outermost constant should reflect group_b
+        assert!(twice.starts_with("const __RUNME_GROUP: &str = \"group_b\";\n"));
+        // The inner constant from the first pass is still present
+        assert!(twice.contains("const __RUNME_GROUP: &str = \"group_a\";"));
+    }
+
+    #[test]
+    fn test_group_with_quotes_and_backslash() {
+        // Both escaping types in a single group string
+        let result = transform_source("fn f() {}\n", "foo\\\"bar");
+        assert!(result.contains(r#"const __RUNME_GROUP: &str = "foo\\\"bar";"#));
+    }
 }

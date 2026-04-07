@@ -430,4 +430,72 @@ use runme::prelude::*;
     fn test_find_path_key_after_comma() {
         assert!(find_path_key("{ version = \"1\", path = \"../foo\" }").is_some());
     }
+
+    #[test]
+    fn test_rewrite_path_with_spaces() {
+        // Paths containing spaces should be rewritten correctly
+        let deps = vec![(
+            "my-lib".to_string(),
+            "{ path = \"../my lib/tools\" }".to_string(),
+        )];
+        let original_dir = std::path::Path::new("/home/user/project");
+        let result = rewrite_path_deps(&deps, original_dir);
+        assert_eq!(result.len(), 1);
+        // The resolved path should contain the joined directory
+        assert!(
+            result[0].1.contains("/home/user/project"),
+            "Expected resolved path in: {}",
+            result[0].1
+        );
+        assert!(
+            result[0].1.contains("my lib"),
+            "Expected space preserved in path: {}",
+            result[0].1
+        );
+    }
+
+    #[test]
+    fn test_rewrite_multiple_path_deps() {
+        // Multiple deps that both have path keys should both be rewritten
+        let deps = vec![
+            (
+                "lib-a".to_string(),
+                "{ path = \"../lib-a\" }".to_string(),
+            ),
+            (
+                "lib-b".to_string(),
+                "{ path = \"../lib-b\", features = [\"extra\"] }".to_string(),
+            ),
+        ];
+        let original_dir = std::path::Path::new("/home/user/project/services");
+        let result = rewrite_path_deps(&deps, original_dir);
+        assert_eq!(result.len(), 2);
+        assert!(
+            result[0].1.contains("/home/user/project/services"),
+            "lib-a path not rewritten: {}",
+            result[0].1
+        );
+        assert!(
+            result[1].1.contains("/home/user/project/services"),
+            "lib-b path not rewritten: {}",
+            result[1].1
+        );
+        assert!(
+            result[1].1.contains("features = [\"extra\"]"),
+            "lib-b features not preserved: {}",
+            result[1].1
+        );
+    }
+
+    #[test]
+    fn test_rewrite_passthrough_no_path_key() {
+        // A dep with no path key at all is returned unchanged
+        let deps = vec![
+            ("serde".to_string(), "{ version = \"1\", features = [\"derive\"] }".to_string()),
+            ("tokio".to_string(), "\"1\"".to_string()),
+        ];
+        let original_dir = std::path::Path::new("/home/user/project");
+        let result = rewrite_path_deps(&deps, original_dir);
+        assert_eq!(result, deps);
+    }
 }

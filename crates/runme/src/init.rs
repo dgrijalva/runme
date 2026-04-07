@@ -79,4 +79,28 @@ mod tests {
         let ctx = InitContext::new("");
         assert_eq!(ctx.group_name(), "");
     }
+
+    #[test]
+    fn test_set_group_name_multiple_times_last_wins() {
+        let mut ctx = InitContext::new("initial");
+        ctx.set_group_name("second");
+        ctx.set_group_name("third");
+        assert_eq!(ctx.group_name(), "third");
+    }
+
+    #[test]
+    fn test_group_name_returns_reference() {
+        let ctx = InitContext::new("my-group");
+        // group_name() returns &str — verify it's borrowing from the struct
+        let name: &str = ctx.group_name();
+        assert_eq!(name, "my-group");
+    }
+
+    #[test]
+    fn test_new_with_empty_string() {
+        let ctx = InitContext::new("");
+        // Explicit test that empty-string construction produces an empty group name
+        assert_eq!(ctx.group_name(), "");
+        assert!(ctx.group_name().is_empty());
+    }
 }

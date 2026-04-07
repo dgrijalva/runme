@@ -582,4 +582,433 @@ mod tests {
         assert!(runner_main.contains("root::__runme_link();"));
         assert!(runner_main.contains("services_auth::__runme_link();"));
     }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: full pipeline from RUNME.rs files → workspace
+    // -----------------------------------------------------------------------
+
+    /// Helper: resolve the real runme library path from this repo.
+    /// Returns None if the library can't be found (skips the test).
+    fn runme_lib_path() -> Option<PathBuf> {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let runme_lib = workspace_root.join("crates").join("runme");
+        if runme_lib.join("Cargo.toml").is_file() {
+            Some(runme_lib)
+        } else {
+            None
+        }
+    }
+
+    /// Test 1: Single-file workspace generation.
+    ///
+    /// Creates a temp dir with one RUNME.rs, builds a DiscoveryResult,
+    /// processes files, generates workspace, and verifies structure.
+    #[test]
+    fn test_integration_single_file_workspace() {
+        let runme_lib = match runme_lib_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test: runme lib not found");
+                return;
+            }
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create a single RUNME.rs at root
+        let runme_path = tmp.path().join("RUNME.rs");
+        fs::write(
+            &runme_path,
+            "#!/usr/bin/env runme\n\nfn hello() {}\n",
+        )
+        .unwrap();
+
+        // Build DiscoveryResult with just this file
+        let discovery = DiscoveryResult {
+            nearest: Some(runme_path.clone()),
+            children: vec![],
+        };
+
+        // Process files through the pipeline
+        let root_dir = runme_path.parent().unwrap();
+        let mut all_files: Vec<PathBuf> = vec![runme_path.clone()];
+        all_files.extend(discovery.children.iter().cloned());
+
+        let mut entries: Vec<CrateEntry> = Vec::new();
+        for file in &all_files {
+            let entry = process_runme_file(file, root_dir, &runme_lib).unwrap();
+            entries.push(entry);
+        }
+
+        // Should have exactly 1 entry
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].crate_name, "root");
+        assert_eq!(entries[0].group_key, "");
+
+        // Generate workspace
+        let cache_dir = tmp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        generate_workspace(&cache_dir, &entries, &runme_lib).unwrap();
+
+        // Verify workspace Cargo.toml exists and lists "root" and "runner"
+        let ws_toml = fs::read_to_string(cache_dir.join("Cargo.toml")).unwrap();
+        assert!(ws_toml.contains("[workspace]"));
+        assert!(ws_toml.contains("\"root\""));
+        assert!(ws_toml.contains("\"runner\""));
+        assert!(ws_toml.contains("resolver = \"3\""));
+
+        // Verify one lib crate named "root"
+        assert!(cache_dir.join("root").is_dir());
+        assert!(cache_dir.join("root/Cargo.toml").is_file());
+        assert!(cache_dir.join("root/src/lib.rs").is_file());
+
+        // Verify lib.rs has __RUNME_GROUP injected with empty group for root
+        let lib_rs = fs::read_to_string(cache_dir.join("root/src/lib.rs")).unwrap();
+        assert!(
+            lib_rs.contains("const __RUNME_GROUP: &str = \"\";"),
+            "lib.rs should contain __RUNME_GROUP injection, got: {}",
+            lib_rs,
+        );
+        assert!(lib_rs.contains("pub fn __runme_link() {}"));
+
+        // Verify runner crate
+        assert!(cache_dir.join("runner").is_dir());
+        assert!(cache_dir.join("runner/Cargo.toml").is_file());
+        assert!(cache_dir.join("runner/src/main.rs").is_file());
+
+        // Verify runner Cargo.toml depends on "root"
+        let runner_toml = fs::read_to_string(cache_dir.join("runner/Cargo.toml")).unwrap();
+        assert!(
+            runner_toml.contains("root = { path = \"../root\" }"),
+            "runner Cargo.toml should depend on root, got: {}",
+            runner_toml,
+        );
+
+        // Verify no other lib crates exist (only root + runner)
+        let members: Vec<_> = fs::read_dir(&cache_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(members.len(), 2, "Expected root + runner dirs, got: {:?}", members);
+        assert!(members.contains(&"root".to_string()));
+        assert!(members.contains(&"runner".to_string()));
+    }
+
+    /// Test 2: Multi-file workspace structure.
+    ///
+    /// Creates 3 RUNME.rs files (root, services/auth, web), processes them,
+    /// generates workspace, and verifies 3 lib crates + runner with correct
+    /// crate names and __RUNME_GROUP values.
+    #[test]
+    fn test_integration_multi_file_workspace() {
+        let runme_lib = match runme_lib_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test: runme lib not found");
+                return;
+            }
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create root RUNME.rs
+        let root_runme = tmp.path().join("RUNME.rs");
+        fs::write(&root_runme, "#!/usr/bin/env runme\nfn deploy() {}\n").unwrap();
+
+        // Create services/auth/RUNME.rs
+        let auth_dir = tmp.path().join("services").join("auth");
+        fs::create_dir_all(&auth_dir).unwrap();
+        let auth_runme = auth_dir.join("RUNME.rs");
+        fs::write(&auth_runme, "fn migrate() {}\n").unwrap();
+
+        // Create web/RUNME.rs
+        let web_dir = tmp.path().join("web");
+        fs::create_dir_all(&web_dir).unwrap();
+        let web_runme = web_dir.join("RUNME.rs");
+        fs::write(&web_runme, "fn build() {}\n").unwrap();
+
+        // Build DiscoveryResult
+        let discovery = DiscoveryResult {
+            nearest: Some(root_runme.clone()),
+            children: vec![auth_runme.clone(), web_runme.clone()],
+        };
+
+        // Process all files
+        let root_dir = root_runme.parent().unwrap();
+        let mut all_files: Vec<PathBuf> = vec![root_runme.clone()];
+        all_files.extend(discovery.children.iter().cloned());
+
+        let mut entries: Vec<CrateEntry> = Vec::new();
+        for file in &all_files {
+            let entry = process_runme_file(file, root_dir, &runme_lib).unwrap();
+            entries.push(entry);
+        }
+
+        // Should have 3 entries
+        assert_eq!(entries.len(), 3);
+
+        // Verify crate names
+        let crate_names: Vec<&str> = entries.iter().map(|e| e.crate_name.as_str()).collect();
+        assert!(crate_names.contains(&"root"), "Expected 'root' in crate names: {:?}", crate_names);
+        assert!(crate_names.contains(&"services_auth"), "Expected 'services_auth' in crate names: {:?}", crate_names);
+        assert!(crate_names.contains(&"web"), "Expected 'web' in crate names: {:?}", crate_names);
+
+        // Verify group keys
+        let root_entry = entries.iter().find(|e| e.crate_name == "root").unwrap();
+        assert_eq!(root_entry.group_key, "");
+        let auth_entry = entries.iter().find(|e| e.crate_name == "services_auth").unwrap();
+        assert_eq!(auth_entry.group_key, "services/auth");
+        let web_entry = entries.iter().find(|e| e.crate_name == "web").unwrap();
+        assert_eq!(web_entry.group_key, "web");
+
+        // Generate workspace
+        let cache_dir = tmp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        generate_workspace(&cache_dir, &entries, &runme_lib).unwrap();
+
+        // Verify 3 lib crates + runner generated
+        assert!(cache_dir.join("root/src/lib.rs").is_file());
+        assert!(cache_dir.join("services_auth/src/lib.rs").is_file());
+        assert!(cache_dir.join("web/src/lib.rs").is_file());
+        assert!(cache_dir.join("runner/src/main.rs").is_file());
+
+        // Verify each lib.rs has correct __RUNME_GROUP value
+        let root_lib = fs::read_to_string(cache_dir.join("root/src/lib.rs")).unwrap();
+        assert!(
+            root_lib.contains("const __RUNME_GROUP: &str = \"\";"),
+            "root lib.rs should have empty group, got: {}",
+            root_lib,
+        );
+
+        let auth_lib = fs::read_to_string(cache_dir.join("services_auth/src/lib.rs")).unwrap();
+        assert!(
+            auth_lib.contains("const __RUNME_GROUP: &str = \"services/auth\";"),
+            "auth lib.rs should have services/auth group, got: {}",
+            auth_lib,
+        );
+
+        let web_lib = fs::read_to_string(cache_dir.join("web/src/lib.rs")).unwrap();
+        assert!(
+            web_lib.contains("const __RUNME_GROUP: &str = \"web\";"),
+            "web lib.rs should have web group, got: {}",
+            web_lib,
+        );
+
+        // Verify workspace Cargo.toml lists all members
+        let ws_toml = fs::read_to_string(cache_dir.join("Cargo.toml")).unwrap();
+        assert!(ws_toml.contains("\"root\""));
+        assert!(ws_toml.contains("\"services_auth\""));
+        assert!(ws_toml.contains("\"web\""));
+        assert!(ws_toml.contains("\"runner\""));
+
+        // Verify runner depends on all 3 lib crates
+        let runner_toml = fs::read_to_string(cache_dir.join("runner/Cargo.toml")).unwrap();
+        assert!(runner_toml.contains("root = { path = \"../root\" }"));
+        assert!(runner_toml.contains("services_auth = { path = \"../services_auth\" }"));
+        assert!(runner_toml.contains("web = { path = \"../web\" }"));
+    }
+
+    /// Test 3: Path dependency rewriting in generated workspace.
+    ///
+    /// Creates a RUNME.rs with frontmatter declaring a path dependency to a
+    /// local crate, then verifies the generated Cargo.toml has the resolved
+    /// absolute path.
+    #[test]
+    fn test_integration_path_dependency_rewriting() {
+        let runme_lib = match runme_lib_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test: runme lib not found");
+                return;
+            }
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create a local crate that the RUNME.rs will depend on
+        let tools_dir = tmp.path().join("shared").join("tools");
+        fs::create_dir_all(tools_dir.join("src")).unwrap();
+        fs::write(
+            tools_dir.join("Cargo.toml"),
+            "[package]\nname = \"tools\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(tools_dir.join("src/lib.rs"), "pub fn helper() {}\n").unwrap();
+
+        // Create a RUNME.rs with a path dependency referencing ../shared/tools
+        let project_dir = tmp.path().join("project");
+        fs::create_dir_all(&project_dir).unwrap();
+        let runme_path = project_dir.join("RUNME.rs");
+        fs::write(
+            &runme_path,
+            r#"#!/usr/bin/env runme
+//! [dependencies]
+//! tools = { path = "../shared/tools" }
+
+fn build() {}
+"#,
+        )
+        .unwrap();
+
+        // Process the file
+        let root_dir = runme_path.parent().unwrap();
+        let entry = process_runme_file(&runme_path, root_dir, &runme_lib).unwrap();
+
+        // Verify the Cargo.toml has an absolute path for the tools dependency
+        // The path should be resolved relative to the original RUNME.rs directory
+        let expected_abs_prefix = tmp.path().to_string_lossy().to_string();
+        assert!(
+            entry.cargo_toml.contains("tools = "),
+            "Cargo.toml should contain tools dependency, got: {}",
+            entry.cargo_toml,
+        );
+        assert!(
+            entry.cargo_toml.contains(&expected_abs_prefix),
+            "Cargo.toml path dep should be resolved to absolute path under {}, got: {}",
+            expected_abs_prefix,
+            entry.cargo_toml,
+        );
+
+        // Generate workspace and verify the on-disk Cargo.toml
+        let cache_dir = tmp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        let entries = vec![entry];
+        generate_workspace(&cache_dir, &entries, &runme_lib).unwrap();
+
+        let lib_toml = fs::read_to_string(cache_dir.join("root/Cargo.toml")).unwrap();
+        assert!(
+            lib_toml.contains(&expected_abs_prefix),
+            "Generated Cargo.toml should have absolute path, got: {}",
+            lib_toml,
+        );
+        // Verify it does NOT contain the relative path "../shared/tools" literally
+        assert!(
+            !lib_toml.contains("\"../shared/tools\""),
+            "Generated Cargo.toml should NOT contain relative path, got: {}",
+            lib_toml,
+        );
+    }
+
+    /// Test 4: Runner main.rs content for a multi-file tree.
+    ///
+    /// Generates a workspace for a multi-file tree and verifies the runner's
+    /// main.rs contains __runme_link() calls for each crate, init hook
+    /// collection/sorting logic, and registry building.
+    #[test]
+    fn test_integration_runner_main_content() {
+        let runme_lib = match runme_lib_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("Skipping test: runme lib not found");
+                return;
+            }
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create 3 RUNME.rs files
+        let root_runme = tmp.path().join("RUNME.rs");
+        fs::write(&root_runme, "fn deploy() {}\n").unwrap();
+
+        let svc_dir = tmp.path().join("services").join("api");
+        fs::create_dir_all(&svc_dir).unwrap();
+        let svc_runme = svc_dir.join("RUNME.rs");
+        fs::write(&svc_runme, "fn serve() {}\n").unwrap();
+
+        let infra_dir = tmp.path().join("infra");
+        fs::create_dir_all(&infra_dir).unwrap();
+        let infra_runme = infra_dir.join("RUNME.rs");
+        fs::write(&infra_runme, "fn provision() {}\n").unwrap();
+
+        // Process files
+        let root_dir = root_runme.parent().unwrap();
+        let all_files = vec![root_runme.clone(), svc_runme.clone(), infra_runme.clone()];
+
+        let mut entries: Vec<CrateEntry> = Vec::new();
+        for file in &all_files {
+            let entry = process_runme_file(file, root_dir, &runme_lib).unwrap();
+            entries.push(entry);
+        }
+
+        // Generate workspace
+        let cache_dir = tmp.path().join("cache");
+        fs::create_dir_all(&cache_dir).unwrap();
+        generate_workspace(&cache_dir, &entries, &runme_lib).unwrap();
+
+        // Read the generated runner main.rs
+        let runner_main = fs::read_to_string(cache_dir.join("runner/src/main.rs")).unwrap();
+
+        // Verify __runme_link() calls for each crate
+        assert!(
+            runner_main.contains("root::__runme_link();"),
+            "runner main should call root::__runme_link(), got:\n{}",
+            runner_main,
+        );
+        assert!(
+            runner_main.contains("services_api::__runme_link();"),
+            "runner main should call services_api::__runme_link(), got:\n{}",
+            runner_main,
+        );
+        assert!(
+            runner_main.contains("infra::__runme_link();"),
+            "runner main should call infra::__runme_link(), got:\n{}",
+            runner_main,
+        );
+
+        // Verify init hook collection from inventory
+        assert!(
+            runner_main.contains("runme::inventory::iter::<runme::init::InitDef>"),
+            "runner main should collect InitDefs from inventory, got:\n{}",
+            runner_main,
+        );
+
+        // Verify init sorting logic (leaf-to-root: deeper groups first)
+        assert!(
+            runner_main.contains("depth_b.cmp(&depth_a)"),
+            "runner main should sort inits leaf-to-root, got:\n{}",
+            runner_main,
+        );
+
+        // Verify group name collection from inventory
+        assert!(
+            runner_main.contains("runme::inventory::iter::<runme::init::GroupDef>"),
+            "runner main should collect GroupDefs from inventory, got:\n{}",
+            runner_main,
+        );
+
+        // Verify registry building
+        assert!(
+            runner_main.contains("runme::task::Registry::from_inventory()"),
+            "runner main should build Registry from inventory, got:\n{}",
+            runner_main,
+        );
+
+        // Verify the runner has a fn main() entry point
+        assert!(
+            runner_main.contains("fn main()"),
+            "runner main should have fn main(), got:\n{}",
+            runner_main,
+        );
+
+        // Verify the tokio runtime is built
+        assert!(
+            runner_main.contains("runme::tokio::runtime::Builder::new_multi_thread()"),
+            "runner main should build tokio runtime, got:\n{}",
+            runner_main,
+        );
+
+        // Verify --list flag handling is present
+        assert!(
+            runner_main.contains("--list"),
+            "runner main should handle --list flag, got:\n{}",
+            runner_main,
+        );
+    }
 }

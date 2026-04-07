@@ -214,4 +214,44 @@ mod tests {
         ];
         assign_crate_names(&paths);
     }
+
+    #[test]
+    fn test_unicode_in_path() {
+        // Unicode chars are not replaced; they pass through as-is
+        let name = crate_name_from_path(Path::new("café/RUNME.rs"));
+        assert_eq!(name, "café");
+    }
+
+    #[test]
+    fn test_unicode_deeply_nested() {
+        let name = crate_name_from_path(Path::new("données/réseau/auth/RUNME.rs"));
+        assert_eq!(name, "données_réseau_auth");
+    }
+
+    #[test]
+    fn test_three_level_deep() {
+        // Explicit 3-level depth
+        assert_eq!(
+            crate_name_from_path(Path::new("a/b/c/RUNME.rs")),
+            "a_b_c"
+        );
+    }
+
+    #[test]
+    fn test_collision_dash_vs_slash() {
+        // Verify that a/b and a-b indeed produce the same crate name
+        assert_eq!(
+            crate_name_from_path(Path::new("a/b/RUNME.rs")),
+            crate_name_from_path(Path::new("a-b/RUNME.rs")),
+        );
+    }
+
+    #[test]
+    fn test_plain_runme_vs_dotslash_runme_same_name() {
+        // "RUNME.rs" and "./RUNME.rs" must both produce "root"
+        assert_eq!(
+            crate_name_from_path(Path::new("RUNME.rs")),
+            crate_name_from_path(Path::new("./RUNME.rs")),
+        );
+    }
 }
