@@ -271,6 +271,7 @@ mod tests {
             level: None,
             message: None,
             fields: HashMap::new(),
+            stream: None,
         }
     }
 
@@ -286,6 +287,7 @@ mod tests {
             level: Some(level.to_string()),
             message: None,
             fields: HashMap::new(),
+            stream: None,
         }
     }
 

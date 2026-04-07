@@ -518,6 +518,7 @@ mod tests {
             level: None,
             message: None,
             fields: HashMap::new(),
+            stream: None,
         }
     }
 
@@ -548,6 +549,7 @@ mod tests {
             level: Some("error".to_string()),
             message: Some("connection refused".to_string()),
             fields,
+            stream: None,
         }
     }
 

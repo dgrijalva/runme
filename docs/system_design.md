@@ -586,13 +586,13 @@ pub struct Output(Arc<Mutex<OutputBuffer>>);
 
 impl Output {
     /// Snapshot of all entries captured so far
-    pub fn entries(&self) -> Vec<LogEntry> { ... }
+    pub async fn entries(&self) -> Vec<LogEntry> { ... }
     /// Live subscription to new entries
-    pub fn subscribe(&self) -> broadcast::Receiver<LogEntry> { ... }
+    pub async fn subscribe(&self) -> broadcast::Receiver<LogEntry> { ... }
     /// Convenience: raw stdout lines as strings
-    pub fn stdout(&self) -> Vec<String> { ... }
+    pub async fn stdout(&self) -> Vec<String> { ... }
     /// Convenience: raw stderr lines as strings
-    pub fn stderr(&self) -> Vec<String> { ... }
+    pub async fn stderr(&self) -> Vec<String> { ... }
 }
 ```
 
@@ -600,10 +600,10 @@ Both `ProcessResult` (from `exec`) and `ProcessHandle` (from `spawn`) expose `.o
 
 ### Execution Results
 
-`ctx.exec()` returns a `ProcessResult` — not a `Result`. The process always runs; the question is whether it succeeded. Output is always accessible regardless of exit status.
+`ctx.exec()` returns `Result<ProcessResult, ProcessError>`. The outer `Result` covers spawn failures (binary not found, timeout, etc.). The `ProcessResult` covers all exit codes — success and failure alike. Output is always accessible regardless of exit status.
 
 ```rust
-let result = ctx.exec("cargo build").await;
+let result = ctx.exec("cargo build").await?;  // ? handles spawn failure
 result.output().entries();   // always works
 result.success();            // true/false
 result.exit_code();          // i32
@@ -612,11 +612,11 @@ result.exit_code();          // i32
 For `?` ergonomics, `ProcessResult::ok()` converts to a `Result`:
 
 ```rust
-// Propagate failure, discard output
-ctx.exec("cargo build").await.ok()?;
+// Propagate both spawn failure and non-zero exit
+ctx.exec("cargo build").await?.ok()?;
 
-// Propagate failure, but capture output first
-let result = ctx.exec("cargo build").await;
+// Propagate spawn failure, but capture output on non-zero exit
+let result = ctx.exec("cargo build").await?;
 ctx.tui_output().stderr().append(result.output());
 result.ok()?;
 ```

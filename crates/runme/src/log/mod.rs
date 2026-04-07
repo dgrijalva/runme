@@ -10,6 +10,13 @@ use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
 
+/// Which output stream a log entry originated from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
 /// Result of attempting to parse a record from the input buffer.
 pub enum ParseResult {
     /// Successfully parsed a complete record. `usize` is bytes consumed from input.
@@ -66,6 +73,10 @@ pub struct LogEntry {
 
     /// Additional extracted fields.
     pub fields: HashMap<String, serde_json::Value>,
+
+    /// Which output stream this entry came from (stdout or stderr).
+    /// `None` for entries not from a process stream (e.g., tracing events).
+    pub stream: Option<Stream>,
 }
 
 impl LogEntry {
@@ -90,6 +101,7 @@ impl LogEntry {
             level,
             message,
             fields,
+            stream: None,
         }
     }
 

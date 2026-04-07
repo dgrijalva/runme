@@ -1126,6 +1126,7 @@ mod tests {
             level: Some("info".to_string()),
             message: Some(format!("entry from {}", source)),
             fields: HashMap::new(),
+            stream: None,
         }
     }
 

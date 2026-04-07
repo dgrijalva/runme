@@ -304,6 +304,7 @@ mod tests {
             level: level.map(|s| s.to_string()),
             message: message.map(|s| s.to_string()),
             fields: HashMap::new(),
+            stream: None,
         }
     }
 

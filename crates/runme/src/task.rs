@@ -9,7 +9,7 @@ use crate::cmd::Cmd;
 use crate::error::TaskError;
 use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
-use crate::process::{self, ExecOutput, ProcessError, ProcessHandle};
+use crate::process::{self, ProcessError, ProcessHandle, ProcessResult};
 
 /// The type of async task functions.
 ///
@@ -109,8 +109,11 @@ impl TaskContext {
 
     /// Run a command and wait for it to complete. Captures output.
     ///
+    /// Returns a `ProcessResult` for any exit code. Use `.ok()?` to propagate
+    /// non-zero exit codes as errors, or inspect `.success()` and `.exit_code()`.
+    ///
     /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
-    pub async fn exec(&self, command: impl Into<Cmd>) -> Result<ExecOutput, ProcessError> {
+    pub async fn exec(&self, command: impl Into<Cmd>) -> Result<ProcessResult, ProcessError> {
         let mut buffer = self.output.lock().await;
         process::exec(command, &self.name, &mut buffer).await
     }
@@ -139,7 +142,7 @@ impl TaskContext {
         // Notify the TUI runner (if connected) about the new process
         if let Some(tx) = &self.spawn_tx {
             let _ = tx.send(SpawnEvent {
-                buffer: handle.buffer.clone(),
+                buffer: handle.output().0.clone(),
                 task_name: handle.task_name().to_string(),
                 pgid: handle.pgid(),
                 pid: handle.pid(),
@@ -367,8 +370,10 @@ mod tests {
     #[tokio::test]
     async fn test_exec_on_context() {
         let ctx = TaskContext::new("test");
-        let output = ctx.exec("echo hello").await.unwrap();
-        assert_eq!(output.stdout, "hello\n");
+        let result = ctx.exec("echo hello").await.unwrap();
+        assert!(result.success());
+        let stdout = result.output().stdout().await;
+        assert_eq!(stdout, vec!["hello"]);
     }
 
     #[tokio::test]

@@ -140,7 +140,7 @@ mod tests {
         let handle = Arc::new(Mutex::new(handle));
 
         // Wait for it to finish
-        handle.lock().await.wait().await.unwrap();
+        let _ = handle.lock().await.wait().await;
 
         handler.track(handle.clone()).await;
         handler.cleanup().await;

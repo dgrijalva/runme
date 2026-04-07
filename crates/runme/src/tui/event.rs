@@ -1482,6 +1482,7 @@ mod tests {
                 level: Some("info".to_string()),
                 message: Some(format!("entry {}", i)),
                 fields: HashMap::new(),
+                stream: None,
             });
         }
 
@@ -1639,6 +1640,7 @@ mod tests {
             level: Some("info".to_string()),
             message: Some(raw.to_string()),
             fields: HashMap::new(),
+            stream: None,
         }
     }
 

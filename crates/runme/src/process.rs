@@ -9,27 +9,19 @@ use tokio::io::AsyncReadExt;
 use crate::cmd::Cmd;
 use crate::log::extract::{self, FieldExtractor};
 use crate::log::parse::{self, RecordParser};
-use crate::log::{LogEntry, ParseResult};
-
-/// Captured output from a process execution.
-#[derive(Debug, Clone)]
-pub struct ExecOutput {
-    pub stdout: String,
-    pub stderr: String,
-}
+use crate::log::{LogEntry, ParseResult, Stream};
 
 /// Errors that can occur during process management.
+///
+/// These represent infrastructure failures — not non-zero exit codes.
+/// A process that runs and exits (even with a non-zero code) produces
+/// a `ProcessResult`, not a `ProcessError`.
 #[derive(Debug)]
 pub enum ProcessError {
     Spawn(std::io::Error),
     Signal(nix::Error),
     Wait(std::io::Error),
     Timeout,
-    /// Process exited with a non-zero exit code.
-    ExitCode {
-        code: i32,
-        output: ExecOutput,
-    },
 }
 
 impl std::fmt::Display for ProcessError {
@@ -39,27 +31,95 @@ impl std::fmt::Display for ProcessError {
             ProcessError::Signal(e) => write!(f, "failed to send signal: {}", e),
             ProcessError::Wait(e) => write!(f, "failed to wait for process: {}", e),
             ProcessError::Timeout => write!(f, "process did not exit within timeout"),
-            ProcessError::ExitCode { code, .. } => write!(f, "process exited with code {}", code),
         }
     }
 }
 
 impl std::error::Error for ProcessError {}
 
-/// Extension trait for accessing output from exec results regardless of exit code.
-pub trait ExecOutputExt {
-    fn output(&self) -> Option<&ExecOutput>;
+/// Unified handle to process output backed by an `OutputBuffer`.
+///
+/// Provides access to captured log entries, broadcast subscription for
+/// live streaming, and convenience methods for extracting raw stdout/stderr text.
+#[derive(Clone)]
+pub struct Output(pub(crate) std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>);
+
+impl std::fmt::Debug for Output {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Output").finish_non_exhaustive()
+    }
 }
 
-impl ExecOutputExt for Result<ExecOutput, ProcessError> {
-    /// Returns the captured output whether the process succeeded or failed
-    /// with a non-zero exit code. Returns `None` only for infrastructure
-    /// errors (spawn failure, signal error, etc.).
-    fn output(&self) -> Option<&ExecOutput> {
-        match self {
-            Ok(output) => Some(output),
-            Err(ProcessError::ExitCode { output, .. }) => Some(output),
-            Err(_) => None,
+impl Output {
+    /// Snapshot of all log entries captured so far.
+    pub async fn entries(&self) -> Vec<LogEntry> {
+        let buf = self.0.lock().await;
+        buf.lines().iter().cloned().collect()
+    }
+
+    /// Subscribe to a live broadcast of new log entries.
+    pub async fn subscribe(&self) -> tokio::sync::broadcast::Receiver<LogEntry> {
+        let buf = self.0.lock().await;
+        buf.subscribe()
+    }
+
+    /// Convenience: raw stdout lines as strings.
+    pub async fn stdout(&self) -> Vec<String> {
+        let buf = self.0.lock().await;
+        buf.lines()
+            .iter()
+            .filter(|e| e.stream == Some(Stream::Stdout))
+            .map(|e| e.raw.clone())
+            .collect()
+    }
+
+    /// Convenience: raw stderr lines as strings.
+    pub async fn stderr(&self) -> Vec<String> {
+        let buf = self.0.lock().await;
+        buf.lines()
+            .iter()
+            .filter(|e| e.stream == Some(Stream::Stderr))
+            .map(|e| e.raw.clone())
+            .collect()
+    }
+}
+
+/// Result of a completed process execution.
+///
+/// Always produced when a process runs to completion (regardless of exit code).
+/// Use `success()` to check the exit code, or `ok()` to convert into a `Result`
+/// for `?` ergonomics.
+#[derive(Debug)]
+pub struct ProcessResult {
+    exit_code: i32,
+    output: Output,
+}
+
+impl ProcessResult {
+    /// Whether the process exited with code 0.
+    pub fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+
+    /// The raw exit code.
+    pub fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    /// Access the process output.
+    pub fn output(&self) -> &Output {
+        &self.output
+    }
+
+    /// Convert into a `Result` for `?` ergonomics.
+    ///
+    /// Returns `Ok(self)` on success (exit code 0), `Err(self)` otherwise.
+    /// On the error path, `ProcessResult` converts into `TaskError` via `From`.
+    pub fn ok(self) -> Result<ProcessResult, ProcessResult> {
+        if self.success() {
+            Ok(self)
+        } else {
+            Err(self)
         }
     }
 }
@@ -73,9 +133,10 @@ fn build_log_entry(
     extractor: &dyn FieldExtractor,
     source: &str,
     seq: &mut u64,
+    stream: Option<Stream>,
 ) -> LogEntry {
     let extracted = extractor.extract(&raw_record);
-    let entry = LogEntry::new(
+    let mut entry = LogEntry::new(
         raw_record.raw,
         raw_record.parsed,
         source.to_string(),
@@ -85,6 +146,7 @@ fn build_log_entry(
         extracted.message,
         extracted.fields,
     );
+    entry.stream = stream;
     *seq += 1;
     entry
 }
@@ -98,6 +160,7 @@ fn drain_records(
     source: &str,
     seq: &mut u64,
     output: &mut OutputBuffer,
+    stream: Option<Stream>,
 ) {
     loop {
         if buf.is_empty() {
@@ -106,7 +169,7 @@ fn drain_records(
         match parser.feed(buf, eof) {
             ParseResult::Record(rec, consumed) => {
                 buf.advance(consumed);
-                let entry = build_log_entry(rec, extractor, source, seq);
+                let entry = build_log_entry(rec, extractor, source, seq, stream);
                 output.push(entry);
                 // continue -- buffer may contain more records
             }
@@ -124,6 +187,7 @@ async fn drain_records_async(
     source: &str,
     seq: &mut u64,
     output: &std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
+    stream: Option<Stream>,
 ) {
     loop {
         if buf.is_empty() {
@@ -132,7 +196,7 @@ async fn drain_records_async(
         match parser.feed(buf, eof) {
             ParseResult::Record(rec, consumed) => {
                 buf.advance(consumed);
-                let entry = build_log_entry(rec, extractor, source, seq);
+                let entry = build_log_entry(rec, extractor, source, seq, stream);
                 output.lock().await.push(entry);
                 // continue -- buffer may contain more records
             }
@@ -149,14 +213,19 @@ pub struct ProcessHandle {
     child: tokio::process::Child,
     task_name: String,
     pgid: Option<i32>,
-    /// The output buffer for this process.
-    pub buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
+    /// The output buffer for this process (private — use `.output()` to access).
+    buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
     /// Background tasks reading stdout/stderr
     _stdout_task: Option<tokio::task::JoinHandle<()>>,
     _stderr_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProcessHandle {
+    /// Access the process output.
+    pub fn output(&self) -> Output {
+        Output(self.buffer.clone())
+    }
+
     /// Send a signal to the child's process group.
     pub fn signal(&self, sig: Signal) -> Result<(), ProcessError> {
         if let Some(pgid) = self.pgid {
@@ -197,20 +266,16 @@ impl ProcessHandle {
     }
 
     /// Wait for the process to exit and return the result.
-    pub async fn wait(&mut self) -> Result<ExecOutput, ProcessError> {
-        let status = self.child.wait().await.map_err(ProcessError::Wait)?;
-        let exit_code = status.code().unwrap_or(-1);
-        let output = ExecOutput {
-            stdout: String::new(), // Output went to the buffer via background tasks
-            stderr: String::new(),
+    pub async fn wait(&mut self) -> ProcessResult {
+        let status = self.child.wait().await;
+        let exit_code = match status {
+            Ok(s) => s.code().unwrap_or(-1),
+            Err(_) => -1,
         };
-        if exit_code != 0 {
-            return Err(ProcessError::ExitCode {
-                code: exit_code,
-                output,
-            });
+        ProcessResult {
+            exit_code,
+            output: Output(self.buffer.clone()),
         }
-        Ok(output)
     }
 
     /// Get the task name associated with this handle.
@@ -253,11 +318,14 @@ fn build_command(cmd: Cmd) -> tokio::process::Command {
 /// and pushed into the provided OutputBuffer. Uses BytesMut accumulation buffers
 /// with read_buf() instead of line-oriented BufReader.
 /// Accepts anything that converts to `Cmd`: a `&str`/`String` (shell mode) or a `Cmd` value.
+///
+/// Returns a `ProcessResult` for any exit code. Only returns `Err(ProcessError)` for
+/// infrastructure failures (spawn, wait).
 pub async fn exec(
     command: impl Into<Cmd>,
     task_name: &str,
     buffer: &mut OutputBuffer,
-) -> Result<ExecOutput, ProcessError> {
+) -> Result<ProcessResult, ProcessError> {
     let mut cmd = command.into();
 
     // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
@@ -279,8 +347,6 @@ pub async fn exec(
 
     let mut stdout_buf = BytesMut::new();
     let mut stderr_buf = BytesMut::new();
-    let mut stdout_text = String::new();
-    let mut stderr_text = String::new();
     let mut seq: u64 = 0;
 
     let mut stdout_done = false;
@@ -298,21 +364,16 @@ pub async fn exec(
                             &mut stdout_buf, true,
                             stdout_parser.as_mut(), extractor.as_ref(),
                             task_name, &mut seq, buffer,
+                            Some(Stream::Stdout),
                         );
-                        // Capture remaining text for ExecOutput
-                        if !stdout_buf.is_empty() {
-                            stdout_text.push_str(&String::from_utf8_lossy(&stdout_buf));
-                            stdout_buf.clear();
-                        }
                     }
-                    Ok(bytes_read) => {
-                        // Accumulate the newly read bytes for ExecOutput
-                        stdout_text.push_str(&String::from_utf8_lossy(&stdout_buf[stdout_buf.len() - bytes_read..]));
+                    Ok(_bytes_read) => {
                         // Drain records
                         drain_records(
                             &mut stdout_buf, false,
                             stdout_parser.as_mut(), extractor.as_ref(),
                             task_name, &mut seq, buffer,
+                            Some(Stream::Stdout),
                         );
                     }
                     Err(_) => {
@@ -328,18 +389,15 @@ pub async fn exec(
                             &mut stderr_buf, true,
                             stderr_parser.as_mut(), extractor.as_ref(),
                             task_name, &mut seq, buffer,
+                            Some(Stream::Stderr),
                         );
-                        if !stderr_buf.is_empty() {
-                            stderr_text.push_str(&String::from_utf8_lossy(&stderr_buf));
-                            stderr_buf.clear();
-                        }
                     }
-                    Ok(bytes_read) => {
-                        stderr_text.push_str(&String::from_utf8_lossy(&stderr_buf[stderr_buf.len() - bytes_read..]));
+                    Ok(_bytes_read) => {
                         drain_records(
                             &mut stderr_buf, false,
                             stderr_parser.as_mut(), extractor.as_ref(),
                             task_name, &mut seq, buffer,
+                            Some(Stream::Stderr),
                         );
                     }
                     Err(_) => {
@@ -351,21 +409,17 @@ pub async fn exec(
     }
 
     let status = child.wait().await.map_err(ProcessError::Wait)?;
-
     let exit_code = status.code().unwrap_or(-1);
-    let output = ExecOutput {
-        stdout: stdout_text,
-        stderr: stderr_text,
-    };
 
-    if exit_code != 0 {
-        return Err(ProcessError::ExitCode {
-            code: exit_code,
-            output,
-        });
+    // Wrap the buffer in an Output. For exec(), we create a new Arc<Mutex<OutputBuffer>>
+    // by moving the buffer contents into a fresh buffer.
+    let mut result_buffer = OutputBuffer::new(buffer.capacity());
+    for entry in buffer.lines().iter() {
+        result_buffer.push(entry.clone());
     }
+    let output = Output(std::sync::Arc::new(tokio::sync::Mutex::new(result_buffer)));
 
-    Ok(output)
+    Ok(ProcessResult { exit_code, output })
 }
 
 /// Spawn a command in the background, returning a handle for monitoring and control.
@@ -430,6 +484,7 @@ pub async fn spawn(
                     &source_clone,
                     &mut s,
                     &buf_clone,
+                    Some(Stream::Stdout),
                 )
                 .await;
             }
@@ -462,6 +517,7 @@ pub async fn spawn(
                     &source_clone,
                     &mut s,
                     &buf_clone,
+                    Some(Stream::Stderr),
                 )
                 .await;
             }
@@ -491,15 +547,19 @@ mod tests {
     #[tokio::test]
     async fn test_exec_captures_stdout() {
         let mut buffer = OutputBuffer::new(100);
-        let output = exec("echo hello", "test", &mut buffer).await.unwrap();
-        assert_eq!(output.stdout, "hello\n");
+        let result = exec("echo hello", "test", &mut buffer).await.unwrap();
+        assert!(result.success());
+        let stdout = result.output().stdout().await;
+        assert_eq!(stdout, vec!["hello"]);
     }
 
     #[tokio::test]
     async fn test_exec_captures_stderr() {
         let mut buffer = OutputBuffer::new(100);
-        let output = exec("echo error >&2", "test", &mut buffer).await.unwrap();
-        assert_eq!(output.stderr, "error\n");
+        let result = exec("echo error >&2", "test", &mut buffer).await.unwrap();
+        assert!(result.success());
+        let stderr = result.output().stderr().await;
+        assert_eq!(stderr, vec!["error"]);
     }
 
     #[tokio::test]
@@ -539,11 +599,9 @@ mod tests {
     #[tokio::test]
     async fn test_exec_nonzero_exit() {
         let mut buffer = OutputBuffer::new(100);
-        let err = exec("exit 42", "test", &mut buffer).await.unwrap_err();
-        match err {
-            ProcessError::ExitCode { code, .. } => assert_eq!(code, 42),
-            other => panic!("expected ExitCode, got: {:?}", other),
-        }
+        let result = exec("exit 42", "test", &mut buffer).await.unwrap();
+        assert!(!result.success());
+        assert_eq!(result.exit_code(), 42);
     }
 
     #[tokio::test]
@@ -567,7 +625,7 @@ mod tests {
             .unwrap();
 
         // Wait for the process to finish
-        let _result = handle.wait().await.unwrap();
+        let _result = handle.wait().await;
 
         // Give the background tasks a moment to flush
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -607,6 +665,7 @@ mod tests {
             level: None,
             message: None,
             fields: HashMap::new(),
+            stream: None,
         };
         buffer.push(make_entry("line1", 0));
         buffer.push(make_entry("line2", 1));
@@ -636,6 +695,7 @@ mod tests {
             level: None,
             message: None,
             fields: HashMap::new(),
+            stream: None,
         });
 
         let received = rx.recv().await.unwrap();
@@ -718,23 +778,18 @@ mod tests {
     #[tokio::test]
     async fn test_misbehave_segfault() {
         // Process dies from a signal (simulated with kill -SEGV).
-        // We should get an ExitCode error with the signal-based exit code.
+        // We should get a ProcessResult with a non-zero exit code.
         let cmd = r#"kill -SEGV $$"#;
         let mut buffer = OutputBuffer::new(100);
-        let result = exec(cmd, "test", &mut buffer).await;
+        let result = exec(cmd, "test", &mut buffer).await.unwrap();
 
-        match result {
-            Err(ProcessError::ExitCode { code, .. }) => {
-                // On Unix, death by signal yields exit code 128+signal or negative
-                // SIGSEGV = 11, so expect 139 (128+11) or -11
-                assert!(code != 0, "expected non-zero exit code, got {}", code);
-            }
-            Err(other) => {
-                // Some systems report this differently — as long as it's an error
-                panic!("expected ExitCode, got: {:?}", other);
-            }
-            Ok(_) => panic!("expected error from segfaulting process"),
-        }
+        // On Unix, death by signal yields exit code 128+signal or negative
+        // SIGSEGV = 11, so expect non-zero
+        assert!(
+            !result.success(),
+            "expected non-zero exit code, got {}",
+            result.exit_code()
+        );
     }
 
     #[tokio::test]
@@ -750,9 +805,9 @@ mod tests {
         let pid = handle.pid().expect("should have a pid");
         nix::sys::signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL).unwrap();
 
-        // wait() should return an error (non-zero exit from signal death)
+        // wait() should return a ProcessResult with non-zero exit from signal death
         let result = handle.wait().await;
-        assert!(result.is_err());
+        assert!(!result.success());
         assert!(!handle.is_running());
     }
 
@@ -783,8 +838,10 @@ mod tests {
         let result = exec(cmd, "test", &mut buffer).await;
 
         match result {
-            Ok(output) => {
-                assert_eq!(output.stdout.trim().len(), 1_000_000);
+            Ok(proc_result) => {
+                let stdout = proc_result.output().stdout().await;
+                let total_len: usize = stdout.iter().map(|s| s.trim().len()).sum();
+                assert_eq!(total_len, 1_000_000);
             }
             Err(_) => {
                 // python3 might not be available; skip gracefully
@@ -799,16 +856,12 @@ mod tests {
         // We should preserve the valid parts at minimum.
         let mut buffer = OutputBuffer::new(100);
         let cmd = r#"printf '\xff\xfe'; echo hello"#;
-        let result = exec(cmd, "test", &mut buffer).await;
+        let result = exec(cmd, "test", &mut buffer).await.unwrap();
 
-        let output = match result {
-            Ok(output) => output,
-            Err(ProcessError::ExitCode { output, .. }) => output,
-            Err(other) => panic!("unexpected error: {:?}", other),
-        };
-
+        let stdout = result.output().stdout().await;
+        let stdout_text = stdout.join("\n");
         assert!(
-            output.stdout.contains("hello"),
+            stdout_text.contains("hello"),
             "valid output after binary data was lost"
         );
     }

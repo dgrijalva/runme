@@ -380,6 +380,7 @@ mod tests {
             level: Some("info".to_string()),
             message: Some(raw.to_string()),
             fields: HashMap::new(),
+            stream: None,
         }
     }
 

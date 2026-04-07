@@ -91,20 +91,6 @@ impl TaskError {
 impl From<crate::process::ProcessError> for TaskError {
     fn from(err: crate::process::ProcessError) -> Self {
         match err {
-            crate::process::ProcessError::ExitCode { code, output } => {
-                let message = if output.stderr.is_empty() {
-                    format!("process exited with code {}", code)
-                } else {
-                    output.stderr.trim_end().to_string()
-                };
-                TaskError {
-                    output: serde_json::json!({
-                        "message": message,
-                        "exit_code": code,
-                    }),
-                    hint: ExitHint::Code(code),
-                }
-            }
             crate::process::ProcessError::Spawn(_) => TaskError {
                 output: serde_json::json!({"message": err.to_string()}),
                 hint: ExitHint::Code(127),
@@ -117,6 +103,19 @@ impl From<crate::process::ProcessError> for TaskError {
                 output: serde_json::json!({"message": err.to_string()}),
                 hint: ExitHint::Default,
             },
+        }
+    }
+}
+
+impl From<crate::process::ProcessResult> for TaskError {
+    fn from(result: crate::process::ProcessResult) -> Self {
+        let code = result.exit_code();
+        TaskError {
+            output: serde_json::json!({
+                "message": format!("process exited with code {}", code),
+                "exit_code": code,
+            }),
+            hint: ExitHint::Code(code),
         }
     }
 }

@@ -7,8 +7,8 @@ pub use crate::log::parse::{
     CargoDiagnosticParser, FallbackParser, JsonlParser, LogfmtParser, PlainLineParser,
     RecordParser, RustPanicParser,
 };
-pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawRecord};
-pub use crate::process::{ExecOutput, ExecOutputExt, ProcessError, ProcessHandle};
+pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawRecord, Stream};
+pub use crate::process::{Output, ProcessError, ProcessHandle, ProcessResult};
 pub use crate::signal::SignalHandler;
 pub use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef, TaskFn};
 pub use runme_macros::init;

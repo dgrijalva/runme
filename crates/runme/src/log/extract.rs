@@ -644,6 +644,7 @@ mod tests {
             level: Some("info".to_string()),
             message: Some("test".to_string()),
             fields: HashMap::new(),
+            stream: None,
         };
 
         assert_eq!(entry.raw, "test line");

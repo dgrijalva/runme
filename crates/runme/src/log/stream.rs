@@ -204,6 +204,7 @@ mod tests {
             level: None,
             message: None,
             fields: HashMap::new(),
+            stream: None,
         }
     }
 
@@ -225,6 +226,7 @@ mod tests {
             level: level.map(|s| s.to_string()),
             message: message.map(|s| s.to_string()),
             fields: HashMap::new(),
+            stream: None,
         }
     }
 
@@ -240,6 +242,7 @@ mod tests {
             level: json.get("level").and_then(|v| v.as_str()).map(String::from),
             message: json.get("msg").and_then(|v| v.as_str()).map(String::from),
             fields: HashMap::new(),
+            stream: None,
         }
     }
 

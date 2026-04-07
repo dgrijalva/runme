@@ -307,6 +307,7 @@ mod tests {
             level: None,
             message: message.map(|s| s.to_string()),
             fields: HashMap::new(),
+            stream: None,
         }
     }
 
@@ -321,6 +322,7 @@ mod tests {
             level: None,
             message: None,
             fields: HashMap::new(),
+            stream: None,
         }
     }
 
