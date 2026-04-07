@@ -771,10 +771,11 @@ fn render_entry_detail(
         detail_lines.push(Line::from(raw_line.to_string()));
     }
 
-    // Compute overlay dimensions
+    // Compute overlay dimensions — use most of the screen height so
+    // wrapped content (like raw JSON) has room to display
     let total_lines = detail_lines.len();
-    let max_height = (area.height as usize).saturating_sub(4); // leave room for border + some margin
-    let display_height = total_lines.min(max_height).max(6);
+    let max_height = (area.height as usize).saturating_sub(4);
+    let display_height = max_height.max(6);
     let display_width = (area.width as usize).saturating_sub(8).max(20);
 
     let popup_height = (display_height + 2) as u16; // +2 for border
@@ -793,14 +794,15 @@ fn render_entry_detail(
     // Clear the area behind the popup
     frame.render_widget(Clear, popup_area);
 
-    // Apply scroll offset
-    let scroll_offset = state.detail_scroll.min(
-        total_lines.saturating_sub(display_height),
-    );
+    // Apply scroll offset — allow scrolling through all content lines
+    let scroll_offset = if total_lines > display_height {
+        state.detail_scroll.min(total_lines.saturating_sub(1))
+    } else {
+        0
+    };
     let visible_lines: Vec<Line<'static>> = detail_lines
         .into_iter()
         .skip(scroll_offset)
-        .take(display_height)
         .collect();
 
     let detail_block = Block::default()
