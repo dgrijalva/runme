@@ -230,6 +230,7 @@ These flow through the same pipeline as child process output.
 | `Ctrl-c` | Quit |
 | `Tab` | Toggle focus between sidebar and log viewer |
 | `?` | Toggle help overlay |
+| `\` | Toggle sidebar visibility |
 
 ### Log Viewer
 
@@ -249,6 +250,7 @@ These flow through the same pipeline as child process output.
 | `n` / `N` | Next / previous search match |
 | `a` | Show all sources (clear filter) |
 | `1`-`9` | Toggle visibility of source N |
+| `e` | Export visible log to file |
 
 ### Entry Detail
 
@@ -268,6 +270,7 @@ These flow through the same pipeline as child process output.
 | `Esc` | Cancel (revert) and return to normal mode |
 | `Ctrl-u` | Clear input |
 | `Left` / `Right` | Move cursor within input |
+| `Up` / `Down` | Cycle through filter history (filter input only) |
 
 ### Sidebar
 
@@ -275,8 +278,18 @@ These flow through the same pipeline as child process output.
 |-----|--------|
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
-| `Enter` / `Space` | Toggle source visibility |
+| `Enter` | Open process detail (process) / toggle visibility (task) |
+| `Space` | Toggle source visibility |
 | `s` | Stop selected process (SIGTERM) |
 | `S` | Send SIGHUP to selected process |
 | `a` | Show all sources |
 | `1`-`9` | Toggle visibility of source N |
+
+### Process Detail
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Scroll within detail |
+| `s` | Stop process (SIGTERM) |
+| `S` | Send SIGHUP |
+| `Esc` / `q` | Close detail view |

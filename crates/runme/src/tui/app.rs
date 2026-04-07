@@ -46,6 +46,8 @@ pub enum AppMode {
     Help,
     /// Entry detail overlay (expanded log entry view)
     EntryDetail,
+    /// Process detail overlay (expanded process info view)
+    ProcessDetail,
 }
 
 /// Core application state, shared across the event loop and rendering.
@@ -100,6 +102,21 @@ pub struct AppState {
     /// from the picker without needing access to the App wrapper.
     #[allow(dead_code)]
     pub runner: Option<TaskRunner>,
+    /// Index of the process being viewed in the ProcessDetail overlay.
+    /// This is the sidebar entry index (not the process vec index).
+    pub process_detail_index: Option<usize>,
+    /// Scroll offset within the process detail overlay.
+    pub process_detail_scroll: usize,
+    /// Cached lsof output for the process detail panel.
+    pub process_detail_sockets: Option<String>,
+    /// Whether the sidebar is visible (can be collapsed with backslash).
+    pub sidebar_visible: bool,
+    /// Notification messages (text, timestamp for auto-dismiss).
+    pub notifications: Vec<(String, std::time::Instant)>,
+    /// Filter expression history (session-scoped).
+    pub filter_history: Vec<String>,
+    /// Current position in filter history (for Up/Down cycling). None = not browsing history.
+    pub filter_history_index: Option<usize>,
 }
 
 impl Default for AppState {
@@ -134,6 +151,13 @@ impl AppState {
             group_names: HashMap::new(),
             pending_task: None,
             runner: None,
+            process_detail_index: None,
+            process_detail_scroll: 0,
+            process_detail_sockets: None,
+            sidebar_visible: true,
+            notifications: Vec::new(),
+            filter_history: Vec::new(),
+            filter_history_index: None,
         }
     }
 
@@ -358,7 +382,8 @@ pub fn render_frame(
 
         // Horizontal layout: sidebar (fixed width) + log viewer (fills)
         let has_task = state.task_name.is_some();
-        let horiz_chunks = if has_task {
+        let show_sidebar = has_task && state.sidebar_visible;
+        let horiz_chunks = if show_sidebar {
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -367,7 +392,7 @@ pub fn render_frame(
                 ])
                 .split(content_area)
         } else {
-            // No task running — full-width log viewer
+            // No task running or sidebar collapsed — full-width log viewer
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -381,7 +406,7 @@ pub fn render_frame(
         let log_area = horiz_chunks[1];
 
         // -- Sidebar --
-        if has_task {
+        if show_sidebar {
             sidebar::render_sidebar(
                 frame,
                 sidebar_area,
@@ -498,6 +523,7 @@ pub fn render_frame(
                 AppMode::FilterInput => "FILTER",
                 AppMode::SearchInput => "SEARCH",
                 AppMode::EntryDetail => "DETAIL",
+                AppMode::ProcessDetail => "PROCESS",
             };
 
             let focus_text = if state.sidebar.focused {
@@ -599,6 +625,16 @@ pub fn render_frame(
         if state.mode == AppMode::EntryDetail {
             render_entry_detail(frame, area, state);
         }
+
+        // -- Process detail overlay --
+        if state.mode == AppMode::ProcessDetail {
+            render_process_detail(frame, area, state);
+        }
+
+        // -- Notifications (top of log area, auto-dismiss) --
+        if !state.notifications.is_empty() {
+            render_notifications(frame, log_area, &state.notifications);
+        }
     })?;
 
     Ok(())
@@ -620,30 +656,31 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         Line::from(vec![Span::styled("Display", Style::default().fg(Color::Yellow))]),
         Line::from(vec![Span::raw("  v      "), Span::styled("Toggle preview/raw mode", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  w      "), Span::styled("Toggle wrap/truncate", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  \\      "), Span::styled("Toggle sidebar visibility", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
         Line::from(vec![Span::styled("Filter & Search", Style::default().fg(Color::Yellow))]),
         Line::from(vec![Span::raw("  f      "), Span::styled("Open filter bar (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  /      "), Span::styled("Open search (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  n/N    "), Span::styled("Next/previous search match", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  Up/Dn  "), Span::styled("Cycle filter history (in filter input)", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  1-9    "), Span::styled("Toggle source N visibility", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  a      "), Span::styled("Show all sources", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
         Line::from(vec![Span::styled("Sidebar (Tab to focus)", Style::default().fg(Color::Yellow))]),
         Line::from(vec![Span::raw("  Tab    "), Span::styled("Toggle sidebar focus", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  Enter  "), Span::styled("Process detail / toggle source visibility", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  s      "), Span::styled("Stop selected process (SIGTERM)", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  S      "), Span::styled("Send SIGHUP to selected process", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
-        Line::from(vec![Span::styled("Entry Detail", Style::default().fg(Color::Yellow))]),
-        Line::from(vec![Span::raw("  j/k    "), Span::styled("Scroll within detail view", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  y      "), Span::styled("Copy raw entry to clipboard", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  Esc/q  "), Span::styled("Close detail view", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::styled("Export", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  e      "), Span::styled("Export visible log to file", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
         Line::from(vec![Span::raw("  q      "), Span::styled("Quit", Style::default().fg(Color::DarkGray))]),
         Line::from(vec![Span::raw("  ?      "), Span::styled("Toggle this help", Style::default().fg(Color::DarkGray))]),
     ];
 
     let help_height = (help_text.len() + 2) as u16; // +2 for border
-    let help_width = 52u16;
+    let help_width = 56u16;
 
     // Center the popup
     let x = area.width.saturating_sub(help_width) / 2;
@@ -820,6 +857,206 @@ fn render_entry_detail(
     frame.render_widget(detail_paragraph, popup_area);
 }
 
+/// Render the process detail overlay showing info about a specific spawned process.
+fn render_process_detail(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &AppState,
+) {
+    use ratatui::widgets::{Borders, Clear, Wrap};
+
+    let sidebar_idx = match state.process_detail_index {
+        Some(idx) => idx,
+        None => return,
+    };
+
+    let entry = match state.sidebar_entries.get(sidebar_idx) {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Build the detail lines
+    let mut detail_lines: Vec<Line<'static>> = Vec::new();
+
+    detail_lines.push(Line::from(vec![
+        Span::styled("Command:  ", Style::default().fg(Color::Cyan)),
+        Span::raw(entry.name.clone()),
+    ]));
+
+    detail_lines.push(Line::from(vec![
+        Span::styled("Source:   ", Style::default().fg(Color::Cyan)),
+        Span::raw(entry.source.clone()),
+    ]));
+
+    detail_lines.push(Line::from(vec![
+        Span::styled("Status:   ", Style::default().fg(Color::Cyan)),
+        Span::styled(
+            entry.status_tag.clone(),
+            Style::default().fg(entry.status_color),
+        ),
+    ]));
+
+    // Try to get PID/PGID from the actual process info
+    if let Some(procs_arc) = &state.processes {
+        if let Ok(procs) = procs_arc.try_lock() {
+            // Map sidebar index to process vec index
+            // Sidebar index 0 = task, so process offset = sidebar_idx - 1
+            // Then map through running/completed ordering
+            let proc_idx = if state.task_name.is_some() {
+                sidebar_idx.checked_sub(1)
+            } else {
+                Some(sidebar_idx)
+            };
+
+            if let Some(idx) = proc_idx {
+                let mut running_indices: Vec<usize> = Vec::new();
+                let mut completed_indices: Vec<usize> = Vec::new();
+                for (i, p) in procs.iter().enumerate() {
+                    if p.status == super::runner::ProcessStatus::Running {
+                        running_indices.push(i);
+                    } else {
+                        completed_indices.push(i);
+                    }
+                }
+                let ordered: Vec<usize> =
+                    running_indices.into_iter().chain(completed_indices).collect();
+
+                if let Some(&proc_vec_idx) = ordered.get(idx) {
+                    let proc = &procs[proc_vec_idx];
+
+                    if let Some(pid) = proc.pid {
+                        detail_lines.push(Line::from(vec![
+                            Span::styled("PID:      ", Style::default().fg(Color::Cyan)),
+                            Span::raw(pid.to_string()),
+                        ]));
+                    }
+
+                    if let Some(pgid) = proc.pgid {
+                        detail_lines.push(Line::from(vec![
+                            Span::styled("PGID:     ", Style::default().fg(Color::Cyan)),
+                            Span::raw(pgid.to_string()),
+                        ]));
+                    }
+                }
+            }
+        }
+    }
+
+    // Open sockets section
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(Span::styled(
+        "--- open sockets ---",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    if let Some(ref sockets) = state.process_detail_sockets {
+        if sockets.is_empty() {
+            detail_lines.push(Line::from(Span::styled(
+                "  (none)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for line in sockets.lines() {
+                detail_lines.push(Line::from(line.to_string()));
+            }
+        }
+    } else {
+        detail_lines.push(Line::from(Span::styled(
+            "  Refreshing...",
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+
+    // Controls hint at bottom
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(vec![
+        Span::styled("s", Style::default().fg(Color::Cyan)),
+        Span::raw(" stop (SIGTERM)  "),
+        Span::styled("S", Style::default().fg(Color::Cyan)),
+        Span::raw(" SIGHUP  "),
+        Span::styled("j/k", Style::default().fg(Color::Cyan)),
+        Span::raw(" scroll  "),
+        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::raw(" close"),
+    ]));
+
+    // Compute overlay dimensions
+    let total_lines = detail_lines.len();
+    let max_height = (area.height as usize).saturating_sub(4);
+    let display_height = max_height.max(6);
+    let display_width = (area.width as usize).saturating_sub(8).max(20);
+
+    let popup_height = (display_height + 2) as u16; // +2 for border
+    let popup_width = display_width as u16;
+
+    // Center the popup
+    let x = area.width.saturating_sub(popup_width) / 2;
+    let y = area.height.saturating_sub(popup_height) / 2;
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + x,
+        area.y + y,
+        popup_width.min(area.width),
+        popup_height.min(area.height),
+    );
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    // Apply scroll offset
+    let scroll_offset = if total_lines > display_height {
+        state.process_detail_scroll.min(total_lines.saturating_sub(1))
+    } else {
+        0
+    };
+    let visible_lines: Vec<Line<'static>> = detail_lines.into_iter().skip(scroll_offset).collect();
+
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Process Detail ",
+            Style::default().fg(Color::Cyan),
+        ));
+
+    let detail_paragraph = Paragraph::new(visible_lines)
+        .block(detail_block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(detail_paragraph, popup_area);
+}
+
+/// Render notification banners at the top of the log area.
+fn render_notifications(
+    frame: &mut ratatui::Frame,
+    log_area: ratatui::layout::Rect,
+    notifications: &[(String, std::time::Instant)],
+) {
+    use ratatui::widgets::Clear;
+
+    if notifications.is_empty() || log_area.height < 2 {
+        return;
+    }
+
+    // Show the most recent notification (at most 1 line)
+    let (text, _) = &notifications[notifications.len() - 1];
+
+    let notif_area = ratatui::layout::Rect::new(
+        log_area.x,
+        log_area.y,
+        log_area.width,
+        1,
+    );
+
+    frame.render_widget(Clear, notif_area);
+    let line = Line::from(vec![
+        Span::styled(" ! ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+        Span::raw(" "),
+        Span::styled(text.clone(), Style::default().fg(Color::Yellow)),
+    ]);
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, notif_area);
+}
+
 /// Apply search highlighting to a rendered line.
 ///
 /// Walks each span in the line, finds substring matches of `pattern` (case-insensitive),
@@ -920,6 +1157,14 @@ mod tests {
         assert!(state.source_filter.is_empty());
         assert!(state.sidebar_entries.is_empty());
         assert!(state.processes.is_none());
+        // Phase 8 additions
+        assert!(state.sidebar_visible);
+        assert!(state.notifications.is_empty());
+        assert!(state.filter_history.is_empty());
+        assert!(state.filter_history_index.is_none());
+        assert!(state.process_detail_index.is_none());
+        assert_eq!(state.process_detail_scroll, 0);
+        assert!(state.process_detail_sockets.is_none());
     }
 
     #[test]
@@ -1020,6 +1265,15 @@ mod tests {
         let mut state = AppState::new();
         state.mode = AppMode::EntryDetail;
         assert_eq!(state.mode, AppMode::EntryDetail);
+        state.mode = AppMode::Normal;
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn app_mode_process_detail_variant() {
+        let mut state = AppState::new();
+        state.mode = AppMode::ProcessDetail;
+        assert_eq!(state.mode, AppMode::ProcessDetail);
         state.mode = AppMode::Normal;
         assert_eq!(state.mode, AppMode::Normal);
     }

@@ -1,7 +1,7 @@
 use std::io;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::signal::unix::{SignalKind, signal};
@@ -53,12 +53,26 @@ pub async fn run_event_loop(
         store.subscribe()
     };
 
+    // Timer for lsof polling (process detail panel) and notification cleanup
+    let mut lsof_interval = tokio::time::interval(Duration::from_secs(3));
+    lsof_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Skip the first immediate tick
+    lsof_interval.tick().await;
+
+    // Track previous process statuses for crash surfacing
+    let mut prev_process_statuses: Vec<(String, ProcessStatus)> = Vec::new();
+
     while state.running {
         tokio::select! {
             // Terminal input events
             maybe_event = event_stream.next() => {
                 match maybe_event {
                     Some(Ok(event)) => {
+                        // Any keypress dismisses notifications
+                        if matches!(event, Event::Key(_)) {
+                            state.notifications.clear();
+                        }
+
                         handle_event(event, state, terminal);
 
                         // Check if a task was selected from the picker
@@ -133,8 +147,22 @@ pub async fn run_event_loop(
             _ = render_interval.tick(), if state.dirty => {
                 // Refresh process statuses and rebuild sidebar entries
                 refresh_sidebar_state(state).await;
+
+                // Crash surfacing: detect newly failed processes
+                check_for_crashes(state, &mut prev_process_statuses);
+
+                // Auto-dismiss expired notifications (5 seconds)
+                let now = std::time::Instant::now();
+                state.notifications.retain(|(_, ts)| now.duration_since(*ts) < Duration::from_secs(5));
+
                 render_frame(terminal, state)?;
                 state.dirty = false;
+            }
+
+            // lsof polling timer (for process detail panel)
+            _ = lsof_interval.tick(), if state.mode == AppMode::ProcessDetail => {
+                poll_lsof(state).await;
+                state.dirty = true;
             }
 
             // SIGINT (Ctrl-C)
@@ -198,6 +226,7 @@ fn handle_event(
 ) {
     match event {
         Event::Key(key_event) => handle_key(key_event, state, terminal),
+        Event::Mouse(mouse_event) => handle_mouse(mouse_event, state, terminal),
         Event::Resize(_, _) => {
             // On resize, keep the same anchor entry — heights will reflow
             state.dirty = true;
@@ -264,6 +293,13 @@ fn handle_key(
         return;
     }
 
+    // Process detail mode: dedicated key handling
+    if state.mode == AppMode::ProcessDetail {
+        handle_process_detail_key(key, state);
+        state.dirty = true;
+        return;
+    }
+
     // Help mode: any key dismisses
     if state.mode == AppMode::Help {
         state.mode = AppMode::Normal;
@@ -325,8 +361,24 @@ fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
             state.sidebar.move_up();
         }
 
-        // Enter / Space: toggle source visibility
-        KeyCode::Enter | KeyCode::Char(' ') => {
+        // Enter: open process detail (for process entries) or toggle source visibility (for task entry)
+        KeyCode::Enter => {
+            if let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) {
+                if entry.is_task {
+                    let source = entry.source.clone();
+                    state.toggle_source_visibility(&source);
+                } else {
+                    // Open process detail overlay
+                    state.process_detail_index = Some(state.sidebar.selection);
+                    state.process_detail_scroll = 0;
+                    state.process_detail_sockets = None; // will be polled
+                    state.mode = AppMode::ProcessDetail;
+                }
+            }
+        }
+
+        // Space: toggle source visibility
+        KeyCode::Char(' ') => {
             if let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) {
                 let source = entry.source.clone();
                 state.toggle_source_visibility(&source);
@@ -480,6 +532,16 @@ fn handle_log_viewer_key(
             state.wrap = !state.wrap;
         }
 
+        // \: toggle sidebar visibility
+        KeyCode::Char('\\') => {
+            state.sidebar_visible = !state.sidebar_visible;
+        }
+
+        // e: export visible log to file
+        KeyCode::Char('e') => {
+            export_visible_log(state);
+        }
+
         // -- Source toggle shortcuts --
 
         // a: show all sources
@@ -608,13 +670,55 @@ fn handle_filter_input_key(key: KeyEvent, state: &mut AppState) {
     match key.code {
         // Enter: confirm filter and return to Normal mode
         KeyCode::Enter => {
+            // Save to filter history if non-empty
+            let text = state.filter_input.text.clone();
+            if !text.is_empty() {
+                // Don't duplicate the last entry
+                if state.filter_history.last().map(|s| s.as_str()) != Some(&text) {
+                    state.filter_history.push(text);
+                }
+            }
+            state.filter_history_index = None;
             state.mode = AppMode::Normal;
         }
 
         // Esc: cancel (revert) and return to Normal mode
         KeyCode::Esc => {
             state.filter_input.revert();
+            state.filter_history_index = None;
             state.mode = AppMode::Normal;
+        }
+
+        // Up arrow: cycle to previous filter history entry
+        KeyCode::Up => {
+            if !state.filter_history.is_empty() {
+                let idx = match state.filter_history_index {
+                    Some(i) => {
+                        if i > 0 { i - 1 } else { 0 }
+                    }
+                    None => state.filter_history.len() - 1,
+                };
+                state.filter_history_index = Some(idx);
+                state.filter_input.text = state.filter_history[idx].clone();
+                state.filter_input.cursor = state.filter_input.text.len();
+            }
+        }
+
+        // Down arrow: cycle to next filter history entry
+        KeyCode::Down => {
+            if let Some(idx) = state.filter_history_index {
+                if idx + 1 < state.filter_history.len() {
+                    let new_idx = idx + 1;
+                    state.filter_history_index = Some(new_idx);
+                    state.filter_input.text = state.filter_history[new_idx].clone();
+                    state.filter_input.cursor = state.filter_input.text.len();
+                } else {
+                    // Past the end of history — clear to empty
+                    state.filter_history_index = None;
+                    state.filter_input.text.clear();
+                    state.filter_input.cursor = 0;
+                }
+            }
         }
 
         // Ctrl-u: clear the input
@@ -918,6 +1022,320 @@ fn copy_entry_to_clipboard(state: &AppState) {
         let _ = std::io::stdout().write_all(osc52.as_bytes());
         let _ = std::io::stdout().flush();
     }
+}
+
+/// Handle keys when in process detail mode.
+fn handle_process_detail_key(key: KeyEvent, state: &mut AppState) {
+    match key.code {
+        // Esc or q: close process detail view
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.mode = AppMode::Normal;
+            state.process_detail_index = None;
+            state.process_detail_sockets = None;
+        }
+
+        // j / Down: scroll down within detail pane
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.process_detail_scroll = state.process_detail_scroll.saturating_add(1);
+        }
+
+        // k / Up: scroll up within detail pane
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.process_detail_scroll = state.process_detail_scroll.saturating_sub(1);
+        }
+
+        // s: stop selected process (SIGTERM)
+        KeyCode::Char('s') => {
+            send_signal_to_process_detail(state, nix::sys::signal::Signal::SIGTERM);
+        }
+
+        // S: send SIGHUP to selected process
+        KeyCode::Char('S') => {
+            send_signal_to_process_detail(state, nix::sys::signal::Signal::SIGHUP);
+        }
+
+        _ => {}
+    }
+}
+
+/// Send a signal to the process currently being viewed in the process detail panel.
+fn send_signal_to_process_detail(state: &mut AppState, sig: nix::sys::signal::Signal) {
+    // Temporarily set the sidebar selection to the process detail index
+    // and delegate to the existing send_signal_to_selected function.
+    if let Some(idx) = state.process_detail_index {
+        let saved_selection = state.sidebar.selection;
+        state.sidebar.selection = idx;
+        send_signal_to_selected(state, sig);
+        state.sidebar.selection = saved_selection;
+    }
+}
+
+/// Handle mouse events.
+fn handle_mouse(
+    mouse: MouseEvent,
+    state: &mut AppState,
+    terminal: &Terminal<CrosstermBackend<io::Stdout>>,
+) {
+    // Ignore mouse in overlay modes
+    if matches!(
+        state.mode,
+        AppMode::Help | AppMode::EntryDetail | AppMode::ProcessDetail | AppMode::TaskPicker
+    ) {
+        return;
+    }
+
+    let term_size = terminal.size().unwrap_or_default();
+    let sidebar_width = if state.task_name.is_some() && state.sidebar_visible {
+        super::sidebar::SIDEBAR_WIDTH
+    } else {
+        0
+    };
+
+    match mouse.kind {
+        // Scroll wheel in the log area
+        MouseEventKind::ScrollUp => {
+            if mouse.column >= sidebar_width {
+                // Scroll up by 3 entries in the log viewer
+                let viewport_height = term_size.height.saturating_sub(1);
+                let viewport_width = term_size.width.saturating_sub(sidebar_width);
+                let filtered_entries: Vec<LogEntry> = state.visible_log_lines().into_iter().cloned().collect();
+                for _ in 0..3 {
+                    state.scroll = scroll_up(
+                        &state.scroll,
+                        &filtered_entries,
+                        viewport_height,
+                        viewport_width,
+                        state.display_mode,
+                        state.wrap,
+                        &mut state.source_colors,
+                    );
+                }
+                state.dirty = true;
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if mouse.column >= sidebar_width {
+                // Scroll down by 3 entries in the log viewer
+                let viewport_height = term_size.height.saturating_sub(1);
+                let viewport_width = term_size.width.saturating_sub(sidebar_width);
+                let filtered_entries: Vec<LogEntry> = state.visible_log_lines().into_iter().cloned().collect();
+                for _ in 0..3 {
+                    state.scroll = scroll_down(
+                        &state.scroll,
+                        &filtered_entries,
+                        viewport_height,
+                        viewport_width,
+                        state.display_mode,
+                        state.wrap,
+                        &mut state.source_colors,
+                    );
+                }
+                state.dirty = true;
+            }
+        }
+        // Click in the sidebar area
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            if mouse.column < sidebar_width && state.mode == AppMode::Normal {
+                // Click in the sidebar: select the entry at the clicked row
+                let row = mouse.row as usize;
+                if row < state.sidebar_entries.len() {
+                    state.sidebar.selection = row;
+                    state.sidebar.focused = true;
+                    state.dirty = true;
+                }
+            } else if mouse.column >= sidebar_width && state.mode == AppMode::Normal {
+                // Click in the log viewer: try to move cursor to that entry
+                // The y position in the log area corresponds to a visible entry
+                let log_y = mouse.row as usize;
+                let viewport_height = term_size.height.saturating_sub(1);
+                let viewport_width = term_size.width.saturating_sub(sidebar_width);
+                let filtered_entries: Vec<LogEntry> = state.visible_log_lines().into_iter().cloned().collect();
+
+                if !filtered_entries.is_empty() {
+                    let vp_layout = viewport::layout(
+                        &state.scroll,
+                        &filtered_entries,
+                        viewport_height,
+                        viewport_width,
+                        state.display_mode,
+                        state.wrap,
+                        &mut state.source_colors,
+                    );
+
+                    // Find which entry was clicked
+                    for ve in &vp_layout.entries {
+                        let entry_start = ve.y as usize;
+                        let entry_end = entry_start + ve.lines.len();
+                        if log_y >= entry_start && log_y < entry_end {
+                            state.scroll = viewport::ScrollState::Pinned {
+                                cursor: ve.entry_index,
+                                top: match state.scroll {
+                                    viewport::ScrollState::Pinned { top, .. } => top,
+                                    viewport::ScrollState::Tail => 0,
+                                },
+                            };
+                            state.sidebar.focused = false;
+                            state.dirty = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Poll lsof for the process detail panel.
+async fn poll_lsof(state: &mut AppState) {
+    let pid = get_process_detail_pid(state);
+
+    if let Some(pid) = pid {
+        let output = tokio::process::Command::new("lsof")
+            .args(["-p", &pid.to_string(), "-i", "-P", "-n"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // Parse lsof output into a cleaner format
+                let mut socket_lines: Vec<String> = Vec::new();
+                for line in stdout.lines().skip(1) {
+                    // lsof columns: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+                    let parts: Vec<&str> = line.split_whitespace().collect();
+                    if parts.len() >= 10 {
+                        let fd = parts[3];
+                        let node_type = parts[7]; // TCP, UDP, etc.
+                        let name = parts[8..].join(" ");
+                        // Check for state info like (LISTEN), (ESTABLISHED)
+                        if name.contains("LISTEN") {
+                            socket_lines.push(format!("  LISTEN {} (fd {})", name.replace("(LISTEN)", "").trim(), fd));
+                        } else if name.contains("ESTABLISHED") {
+                            socket_lines.push(format!("  ESTABLISHED {} (fd {})", name.replace("(ESTABLISHED)", "").trim(), fd));
+                        } else {
+                            socket_lines.push(format!("  {} {} (fd {})", node_type, name, fd));
+                        }
+                    }
+                }
+                state.process_detail_sockets = Some(socket_lines.join("\n"));
+            }
+            Err(_) => {
+                state.process_detail_sockets = Some("(lsof not available)".to_string());
+            }
+        }
+    } else {
+        state.process_detail_sockets = Some("(no PID available)".to_string());
+    }
+}
+
+/// Get the PID for the currently viewed process detail.
+fn get_process_detail_pid(state: &AppState) -> Option<u32> {
+    let sidebar_idx = state.process_detail_index?;
+    let procs_arc = state.processes.as_ref()?;
+    let procs = procs_arc.try_lock().ok()?;
+
+    let proc_idx = if state.task_name.is_some() {
+        sidebar_idx.checked_sub(1)?
+    } else {
+        sidebar_idx
+    };
+
+    let mut running_indices: Vec<usize> = Vec::new();
+    let mut completed_indices: Vec<usize> = Vec::new();
+    for (i, p) in procs.iter().enumerate() {
+        if p.status == ProcessStatus::Running {
+            running_indices.push(i);
+        } else {
+            completed_indices.push(i);
+        }
+    }
+    let ordered: Vec<usize> = running_indices.into_iter().chain(completed_indices).collect();
+    let &proc_vec_idx = ordered.get(proc_idx)?;
+    procs[proc_vec_idx].pid
+}
+
+/// Check for newly failed processes and create notifications.
+fn check_for_crashes(
+    state: &mut AppState,
+    prev_statuses: &mut Vec<(String, ProcessStatus)>,
+) {
+    if let Some(procs_arc) = &state.processes {
+        if let Ok(procs) = procs_arc.try_lock() {
+            let current: Vec<(String, ProcessStatus)> = procs
+                .iter()
+                .map(|p| (p.command_label.clone(), p.status.clone()))
+                .collect();
+
+            // Check for new failures
+            for (i, (name, status)) in current.iter().enumerate() {
+                if let ProcessStatus::Failed(code) = status {
+                    // Check if this was previously running
+                    let was_running = if i < prev_statuses.len() {
+                        matches!(prev_statuses[i].1, ProcessStatus::Running)
+                    } else {
+                        false // new process we haven't seen before
+                    };
+
+                    if was_running {
+                        // Check if the source is filtered out or user is scrolled away
+                        let is_filtered = !state.source_filter.is_empty();
+                        let not_tailing = !matches!(state.scroll, viewport::ScrollState::Tail);
+                        if is_filtered || not_tailing {
+                            state.notifications.push((
+                                format!("{} exited with code {}", name, code),
+                                std::time::Instant::now(),
+                            ));
+                            state.dirty = true;
+                        }
+                    }
+                }
+            }
+
+            *prev_statuses = current;
+        }
+    }
+}
+
+/// Export visible log entries to a file.
+fn export_visible_log(state: &mut AppState) {
+    let visible = state.visible_log_lines();
+    if visible.is_empty() {
+        state.notifications.push((
+            "Nothing to export (no visible entries)".to_string(),
+            std::time::Instant::now(),
+        ));
+        state.dirty = true;
+        return;
+    }
+
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let filename = format!("runme-export-{}.log", timestamp);
+
+    let mut content = String::new();
+    let count = visible.len();
+    for entry in &visible {
+        content.push_str(&entry.raw);
+        content.push('\n');
+    }
+
+    match std::fs::write(&filename, &content) {
+        Ok(()) => {
+            state.notifications.push((
+                format!("Exported {} entries to {}", count, filename),
+                std::time::Instant::now(),
+            ));
+        }
+        Err(e) => {
+            state.notifications.push((
+                format!("Export failed: {}", e),
+                std::time::Instant::now(),
+            ));
+        }
+    }
+    state.dirty = true;
 }
 
 /// Navigate to a specific visible entry index, updating the scroll state.
@@ -1439,5 +1857,304 @@ mod tests {
             &mut state,
         );
         // No crash is the test here
+    }
+
+    // -- Process detail tests --
+
+    #[test]
+    fn sidebar_enter_on_process_opens_detail() {
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar.selection = 1; // process entry
+        state.sidebar_entries = vec![
+            SidebarEntry {
+                name: "task".to_string(),
+                source: "task".to_string(),
+                status_tag: "SETUP".to_string(),
+                status_color: Color::Yellow,
+                visible: true,
+                is_task: true,
+            },
+            SidebarEntry {
+                name: "echo hello".to_string(),
+                source: "task".to_string(),
+                status_tag: "RUN".to_string(),
+                status_color: Color::Green,
+                visible: true,
+                is_task: false,
+            },
+        ];
+
+        handle_sidebar_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::ProcessDetail);
+        assert_eq!(state.process_detail_index, Some(1));
+        assert_eq!(state.process_detail_scroll, 0);
+    }
+
+    #[test]
+    fn sidebar_enter_on_task_toggles_visibility() {
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar.selection = 0; // task entry
+        state.sidebar_entries = vec![
+            SidebarEntry {
+                name: "task".to_string(),
+                source: "task".to_string(),
+                status_tag: "SETUP".to_string(),
+                status_color: Color::Yellow,
+                visible: true,
+                is_task: true,
+            },
+            SidebarEntry {
+                name: "echo hello".to_string(),
+                source: "api".to_string(),
+                status_tag: "RUN".to_string(),
+                status_color: Color::Green,
+                visible: true,
+                is_task: false,
+            },
+        ];
+
+        handle_sidebar_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+        // Should stay in Normal mode (task toggle, not process detail)
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn process_detail_esc_closes() {
+        let mut state = AppState::new();
+        state.mode = AppMode::ProcessDetail;
+        state.process_detail_index = Some(1);
+
+        handle_process_detail_key(
+            make_key_event(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+        assert!(state.process_detail_index.is_none());
+    }
+
+    #[test]
+    fn process_detail_q_closes() {
+        let mut state = AppState::new();
+        state.mode = AppMode::ProcessDetail;
+        state.process_detail_index = Some(1);
+
+        handle_process_detail_key(
+            make_key_event(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+        assert!(state.process_detail_index.is_none());
+    }
+
+    #[test]
+    fn process_detail_jk_scrolls() {
+        let mut state = AppState::new();
+        state.mode = AppMode::ProcessDetail;
+        state.process_detail_scroll = 0;
+
+        handle_process_detail_key(
+            make_key_event(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.process_detail_scroll, 1);
+
+        handle_process_detail_key(
+            make_key_event(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.process_detail_scroll, 2);
+
+        handle_process_detail_key(
+            make_key_event(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.process_detail_scroll, 1);
+
+        state.process_detail_scroll = 0;
+        handle_process_detail_key(
+            make_key_event(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.process_detail_scroll, 0);
+    }
+
+    // -- Sidebar collapse tests --
+
+    #[test]
+    fn backslash_toggles_sidebar() {
+        let mut state = AppState::new();
+        assert!(state.sidebar_visible);
+
+        handle_log_viewer_key(
+            make_key_event(KeyCode::Char('\\'), KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert!(!state.sidebar_visible);
+
+        handle_log_viewer_key(
+            make_key_event(KeyCode::Char('\\'), KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert!(state.sidebar_visible);
+    }
+
+    // -- Filter history tests --
+
+    #[test]
+    fn filter_history_saved_on_confirm() {
+        let mut state = AppState::new();
+        state.mode = AppMode::FilterInput;
+
+        // Type something
+        for ch in "error".chars() {
+            state.filter_input.insert_char(ch);
+        }
+
+        // Confirm with Enter
+        handle_filter_input_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+
+        assert_eq!(state.filter_history.len(), 1);
+        assert_eq!(state.filter_history[0], "error");
+    }
+
+    #[test]
+    fn filter_history_up_down_cycles() {
+        let mut state = AppState::new();
+        state.filter_history = vec!["error".to_string(), "level:warn".to_string()];
+        state.mode = AppMode::FilterInput;
+
+        // Up should go to the last entry
+        handle_filter_input_key(
+            make_key_event(KeyCode::Up, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.filter_input.text, "level:warn");
+        assert_eq!(state.filter_history_index, Some(1));
+
+        // Up again should go to first entry
+        handle_filter_input_key(
+            make_key_event(KeyCode::Up, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.filter_input.text, "error");
+        assert_eq!(state.filter_history_index, Some(0));
+
+        // Down should go back to second entry
+        handle_filter_input_key(
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.filter_input.text, "level:warn");
+        assert_eq!(state.filter_history_index, Some(1));
+
+        // Down past end should clear
+        handle_filter_input_key(
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(state.filter_input.text.is_empty());
+        assert!(state.filter_history_index.is_none());
+    }
+
+    #[test]
+    fn filter_history_esc_resets_index() {
+        let mut state = AppState::new();
+        state.filter_history = vec!["error".to_string()];
+        state.mode = AppMode::FilterInput;
+        state.filter_input.save_current();
+
+        // Browse history
+        handle_filter_input_key(
+            make_key_event(KeyCode::Up, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.filter_history_index, Some(0));
+
+        // Esc should reset the history index
+        handle_filter_input_key(
+            make_key_event(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(state.filter_history_index.is_none());
+    }
+
+    // -- Crash surfacing tests --
+
+    #[test]
+    fn check_for_crashes_detects_new_failure() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use crate::log::buffer::OutputBuffer;
+
+        let mut state = AppState::new();
+        state.source_filter.insert("other".to_string()); // filters are active
+
+        let procs = Arc::new(Mutex::new(vec![
+            super::super::runner::ProcessInfo {
+                task_name: "test".to_string(),
+                command_label: "echo hello".to_string(),
+                buffer: Arc::new(Mutex::new(OutputBuffer::new(100))),
+                pgid: None,
+                pid: None,
+                status: ProcessStatus::Failed(1),
+            },
+        ]));
+        state.processes = Some(procs);
+
+        let mut prev_statuses = vec![("echo hello".to_string(), ProcessStatus::Running)];
+
+        check_for_crashes(&mut state, &mut prev_statuses);
+
+        assert_eq!(state.notifications.len(), 1);
+        assert!(state.notifications[0].0.contains("echo hello"));
+        assert!(state.notifications[0].0.contains("code 1"));
+    }
+
+    // -- Notification tests --
+
+    #[test]
+    fn notifications_default_empty() {
+        let state = AppState::new();
+        assert!(state.notifications.is_empty());
+    }
+
+    // -- New AppState defaults tests --
+
+    #[test]
+    fn new_state_has_sidebar_visible() {
+        let state = AppState::new();
+        assert!(state.sidebar_visible);
+    }
+
+    #[test]
+    fn new_state_has_empty_filter_history() {
+        let state = AppState::new();
+        assert!(state.filter_history.is_empty());
+        assert!(state.filter_history_index.is_none());
+    }
+
+    #[test]
+    fn new_state_has_no_process_detail() {
+        let state = AppState::new();
+        assert!(state.process_detail_index.is_none());
+        assert_eq!(state.process_detail_scroll, 0);
+        assert!(state.process_detail_sockets.is_none());
     }
 }
