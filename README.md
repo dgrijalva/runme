@@ -231,9 +231,19 @@ These flow through the same pipeline as child process output.
 | `w` | Toggle line wrap/truncate |
 | `f` | Open filter bar |
 | `/` | Open search |
+| `Enter` | Open entry detail view |
 | `n` / `N` | Next / previous search match |
 | `a` | Show all sources (clear filter) |
 | `1`-`9` | Toggle visibility of source N |
+
+### Entry Detail
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` | Scroll within detail |
+| `Esc` / `q` | Close detail view |
+| `n` / `N` | Close and jump to next/previous entry |
+| `y` | Copy raw entry to clipboard (OSC 52) |
 
 ### Filter / Search Input
 
@@ -252,5 +262,7 @@ These flow through the same pipeline as child process output.
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
 | `Enter` / `Space` | Toggle source visibility |
+| `s` | Stop selected process (SIGTERM) |
+| `S` | Send SIGHUP to selected process |
 | `a` | Show all sources |
 | `1`-`9` | Toggle visibility of source N |

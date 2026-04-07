@@ -12,7 +12,7 @@ use crate::log::LogEntry;
 
 use super::app::{AppMode, AppState, render_frame};
 use super::render::DisplayMode;
-use super::runner::TaskStatus;
+use super::runner::{ProcessStatus, TaskStatus};
 use super::sidebar;
 use super::viewport::{
     self, scroll_down, scroll_down_half_page, scroll_to_bottom, scroll_to_top,
@@ -237,6 +237,13 @@ fn handle_key(
         return;
     }
 
+    // Entry detail mode: dedicated key handling
+    if state.mode == AppMode::EntryDetail {
+        handle_detail_key(key, state, &filtered_entries, viewport_height, viewport_width);
+        state.dirty = true;
+        return;
+    }
+
     // Help mode: any key dismisses
     if state.mode == AppMode::Help {
         state.mode = AppMode::Normal;
@@ -304,6 +311,16 @@ fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
                 let source = entry.source.clone();
                 state.toggle_source_visibility(&source);
             }
+        }
+
+        // s: stop selected process (SIGTERM)
+        KeyCode::Char('s') => {
+            send_signal_to_selected(state, nix::sys::signal::Signal::SIGTERM);
+        }
+
+        // S: send SIGHUP to selected process
+        KeyCode::Char('S') => {
+            send_signal_to_selected(state, nix::sys::signal::Signal::SIGHUP);
         }
 
         // -- Source toggle shortcuts (work in sidebar too) --
@@ -417,6 +434,15 @@ fn handle_log_viewer_key(
         // G / End: jump to last entry, enter tail mode
         KeyCode::Char('G') | KeyCode::End => {
             state.scroll = scroll_to_bottom(&state.scroll, filtered_entries);
+        }
+
+        // Enter: open entry detail view
+        KeyCode::Enter => {
+            // Only open if there are visible entries
+            if !state.visible_line_indices().is_empty() {
+                state.detail_scroll = 0;
+                state.mode = AppMode::EntryDetail;
+            }
         }
 
         // -- Display mode toggles --
@@ -613,6 +639,193 @@ fn handle_search_input_key(
         }
 
         _ => {}
+    }
+}
+
+/// Send a signal to the process corresponding to the selected sidebar entry.
+///
+/// Sends the signal to the process group (pgid) if available, falling back to
+/// the individual pid. If SIGTERM is sent, updates the process status to Stopped.
+fn send_signal_to_selected(state: &mut AppState, sig: nix::sys::signal::Signal) {
+    use nix::sys::signal;
+    use nix::unistd::Pid;
+
+    let selection = state.sidebar.selection;
+    let entry = match state.sidebar_entries.get(selection) {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Skip task entries — only processes can be signaled
+    if entry.is_task {
+        return;
+    }
+
+    // Find the matching process in the shared process list.
+    // The sidebar entries are built from processes, and we match by command_label.
+    // Since we don't have direct access to the mutex here (we're in a sync context),
+    // we use try_lock. The processes Arc is available on state.
+    if let Some(procs_arc) = &state.processes {
+        if let Ok(mut procs) = procs_arc.try_lock() {
+            // Find process matching this sidebar entry.
+            // Sidebar entry index 0 is the task, so process index = selection - 1
+            // (assuming task entry is present and is always first).
+            let proc_idx = if state.task_name.is_some() {
+                selection.checked_sub(1)
+            } else {
+                Some(selection)
+            };
+
+            if let Some(idx) = proc_idx {
+                // The sidebar lists running processes first, then completed.
+                // We need to find the right process. The sidebar build_sidebar_entries
+                // orders: running (by spawn order) then completed (by spawn order).
+                // The processes Vec is in spawn order. We need to map sidebar index
+                // back to the processes vec.
+                let mut running_indices: Vec<usize> = Vec::new();
+                let mut completed_indices: Vec<usize> = Vec::new();
+                for (i, p) in procs.iter().enumerate() {
+                    if p.status == ProcessStatus::Running {
+                        running_indices.push(i);
+                    } else {
+                        completed_indices.push(i);
+                    }
+                }
+                let ordered: Vec<usize> = running_indices.into_iter().chain(completed_indices).collect();
+
+                if let Some(&proc_vec_idx) = ordered.get(idx) {
+                    let proc = &mut procs[proc_vec_idx];
+
+                    // Try pgid first (sends to process group), then pid
+                    let target_pid = if let Some(pgid) = proc.pgid {
+                        // Negative pid sends to the process group
+                        Some(Pid::from_raw(-pgid))
+                    } else if let Some(pid) = proc.pid {
+                        Some(Pid::from_raw(pid as i32))
+                    } else {
+                        None
+                    };
+
+                    if let Some(pid) = target_pid {
+                        let _ = signal::kill(pid, sig);
+                        // If we sent SIGTERM, mark as Stopped
+                        if sig == signal::Signal::SIGTERM {
+                            proc.status = ProcessStatus::Stopped;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handle keys when in entry detail mode.
+fn handle_detail_key(
+    key: KeyEvent,
+    state: &mut AppState,
+    filtered_entries: &[LogEntry],
+    viewport_height: u16,
+    viewport_width: u16,
+) {
+    match key.code {
+        // Esc or q: close detail view, return to Normal mode
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.mode = AppMode::Normal;
+        }
+
+        // j / Down: scroll down within detail pane
+        KeyCode::Char('j') | KeyCode::Down => {
+            state.detail_scroll = state.detail_scroll.saturating_add(1);
+        }
+
+        // k / Up: scroll up within detail pane
+        KeyCode::Char('k') | KeyCode::Up => {
+            state.detail_scroll = state.detail_scroll.saturating_sub(1);
+        }
+
+        // n: close detail and jump to next search match (or next entry)
+        KeyCode::Char('n') => {
+            state.mode = AppMode::Normal;
+            if state.search.active {
+                if let Some(target) = state.search.next_match() {
+                    navigate_to_entry(state, target, filtered_entries, viewport_height, viewport_width);
+                }
+            } else {
+                // Jump to next entry
+                state.scroll = scroll_down(
+                    &state.scroll,
+                    filtered_entries,
+                    viewport_height,
+                    viewport_width,
+                    state.display_mode,
+                    state.wrap,
+                    &mut state.source_colors,
+                );
+            }
+        }
+
+        // N: close detail and jump to previous search match (or previous entry)
+        KeyCode::Char('N') => {
+            state.mode = AppMode::Normal;
+            if state.search.active {
+                if let Some(target) = state.search.prev_match() {
+                    navigate_to_entry(state, target, filtered_entries, viewport_height, viewport_width);
+                }
+            } else {
+                // Jump to previous entry
+                state.scroll = scroll_up(
+                    &state.scroll,
+                    filtered_entries,
+                    viewport_height,
+                    viewport_width,
+                    state.display_mode,
+                    state.wrap,
+                    &mut state.source_colors,
+                );
+            }
+        }
+
+        // y: copy raw entry text to clipboard via OSC 52
+        KeyCode::Char('y') => {
+            copy_entry_to_clipboard(state);
+        }
+
+        _ => {}
+    }
+}
+
+/// Copy the currently focused entry's raw text to the clipboard using OSC 52 escape sequence.
+fn copy_entry_to_clipboard(state: &AppState) {
+    use base64::Engine;
+    use std::io::Write;
+
+    let visible_indices = state.visible_line_indices();
+    let cursor_idx = match state.scroll {
+        viewport::ScrollState::Tail => {
+            if visible_indices.is_empty() {
+                return;
+            }
+            *visible_indices.last().unwrap()
+        }
+        viewport::ScrollState::Pinned { cursor, .. } => {
+            if cursor >= visible_indices.len() {
+                if visible_indices.is_empty() {
+                    return;
+                }
+                *visible_indices.last().unwrap()
+            } else {
+                visible_indices[cursor]
+            }
+        }
+    };
+
+    if let Some(entry) = state.log_lines.get(cursor_idx) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&entry.raw);
+        // OSC 52 clipboard escape sequence: \x1b]52;c;<base64>\x07
+        let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+        // Write directly to stdout (bypassing ratatui)
+        let _ = std::io::stdout().write_all(osc52.as_bytes());
+        let _ = std::io::stdout().flush();
     }
 }
 
@@ -894,5 +1107,246 @@ mod tests {
             80,
         );
         assert!(state.source_filter.is_empty());
+    }
+
+    // -- Entry detail view tests --
+
+    fn make_log_entry(raw: &str, source: &str) -> LogEntry {
+        use crate::log::ParsedContent;
+        use std::collections::HashMap;
+
+        LogEntry {
+            received_at: chrono::Utc::now(),
+            raw: raw.to_string(),
+            parsed: ParsedContent::PlainText,
+            source: source.to_string(),
+            seq: 0,
+            timestamp: None,
+            level: Some("info".to_string()),
+            message: Some(raw.to_string()),
+            fields: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn enter_opens_detail_view() {
+        let mut state = AppState::new();
+        state.log_lines.push(make_log_entry("hello", "test"));
+        // Pin to entry 0 so there's a cursor
+        state.scroll = ScrollState::Pinned { cursor: 0, top: 0 };
+
+        let entries = state.log_lines.clone();
+        assert_eq!(state.mode, AppMode::Normal);
+        handle_log_viewer_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &entries,
+            24,
+            80,
+        );
+        assert_eq!(state.mode, AppMode::EntryDetail);
+        assert_eq!(state.detail_scroll, 0);
+    }
+
+    #[test]
+    fn enter_does_nothing_with_no_entries() {
+        let mut state = AppState::new();
+        assert_eq!(state.mode, AppMode::Normal);
+        handle_log_viewer_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        // Should stay in Normal mode since there are no visible entries
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn detail_esc_closes() {
+        let mut state = AppState::new();
+        state.log_lines.push(make_log_entry("hello", "test"));
+        state.mode = AppMode::EntryDetail;
+
+        handle_detail_key(
+            make_key_event(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn detail_q_closes() {
+        let mut state = AppState::new();
+        state.mode = AppMode::EntryDetail;
+
+        handle_detail_key(
+            make_key_event(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn detail_jk_scrolls() {
+        let mut state = AppState::new();
+        state.mode = AppMode::EntryDetail;
+        state.detail_scroll = 0;
+
+        // j scrolls down
+        handle_detail_key(
+            make_key_event(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert_eq!(state.detail_scroll, 1);
+
+        handle_detail_key(
+            make_key_event(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert_eq!(state.detail_scroll, 2);
+
+        // k scrolls up
+        handle_detail_key(
+            make_key_event(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert_eq!(state.detail_scroll, 1);
+
+        // k at 0 stays at 0
+        state.detail_scroll = 0;
+        handle_detail_key(
+            make_key_event(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+        );
+        assert_eq!(state.detail_scroll, 0);
+    }
+
+    #[test]
+    fn detail_n_closes_and_moves_next() {
+        let mut state = AppState::new();
+        for i in 0..5 {
+            state.log_lines.push(make_log_entry(&format!("entry {}", i), "test"));
+        }
+        state.scroll = ScrollState::Pinned { cursor: 2, top: 0 };
+        state.mode = AppMode::EntryDetail;
+
+        let entries = state.log_lines.clone();
+        handle_detail_key(
+            make_key_event(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut state,
+            &entries,
+            24,
+            80,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+        // Should have moved cursor down (from 2 to 3)
+        match state.scroll {
+            ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 3),
+            ScrollState::Tail => {} // also acceptable at end of list
+        }
+    }
+
+    #[test]
+    fn detail_n_uppercase_closes_and_moves_prev() {
+        let mut state = AppState::new();
+        for i in 0..5 {
+            state.log_lines.push(make_log_entry(&format!("entry {}", i), "test"));
+        }
+        state.scroll = ScrollState::Pinned { cursor: 2, top: 0 };
+        state.mode = AppMode::EntryDetail;
+
+        let entries = state.log_lines.clone();
+        handle_detail_key(
+            make_key_event(KeyCode::Char('N'), KeyModifiers::NONE),
+            &mut state,
+            &entries,
+            24,
+            80,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+        // Should have moved cursor up (from 2 to 1)
+        match state.scroll {
+            ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 1),
+            _ => panic!("expected Pinned"),
+        }
+    }
+
+    // -- Process control tests --
+
+    #[test]
+    fn sidebar_s_on_task_entry_is_noop() {
+        // Selecting the task entry (is_task = true) should not crash or send signals
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar.selection = 0;
+        state.sidebar_entries = vec![SidebarEntry {
+            name: "my-task".to_string(),
+            source: "my-task".to_string(),
+            status_tag: "SETUP".to_string(),
+            status_color: Color::Yellow,
+            visible: true,
+            is_task: true,
+        }];
+
+        // This should be a no-op (task entries can't be signaled)
+        handle_sidebar_key(
+            make_key_event(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut state,
+        );
+        // No crash is the test here
+    }
+
+    #[test]
+    fn sidebar_s_without_processes_is_noop() {
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar.selection = 1;
+        state.task_name = Some("test".to_string());
+        state.sidebar_entries = vec![
+            SidebarEntry {
+                name: "test".to_string(),
+                source: "test".to_string(),
+                status_tag: "READY".to_string(),
+                status_color: Color::Green,
+                visible: true,
+                is_task: true,
+            },
+            SidebarEntry {
+                name: "echo hello".to_string(),
+                source: "test".to_string(),
+                status_tag: "RUN".to_string(),
+                status_color: Color::Green,
+                visible: true,
+                is_task: false,
+            },
+        ];
+        // No processes Arc — should be a no-op
+        state.processes = None;
+
+        handle_sidebar_key(
+            make_key_event(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut state,
+        );
+        // No crash is the test here
     }
 }

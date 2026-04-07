@@ -19,6 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["registry"] }
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-stream = "0.1"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

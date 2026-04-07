@@ -41,6 +41,8 @@ pub enum AppMode {
     SearchInput,
     /// Help overlay
     Help,
+    /// Entry detail overlay (expanded log entry view)
+    EntryDetail,
 }
 
 /// Core application state, shared across the event loop and rendering.
@@ -81,6 +83,8 @@ pub struct AppState {
     pub filter_input: FilterInputState,
     /// Search state for / search with n/N navigation.
     pub search: SearchState,
+    /// Scroll offset within the entry detail overlay (for long entries).
+    pub detail_scroll: usize,
 }
 
 impl Default for AppState {
@@ -109,6 +113,7 @@ impl AppState {
             processes: None,
             filter_input: FilterInputState::new(),
             search: SearchState::new(),
+            detail_scroll: 0,
         }
     }
 
@@ -439,6 +444,7 @@ pub fn render_frame(
                 AppMode::Normal | AppMode::Help => "NORMAL",
                 AppMode::FilterInput => "FILTER",
                 AppMode::SearchInput => "SEARCH",
+                AppMode::EntryDetail => "DETAIL",
             };
 
             let focus_text = if state.sidebar.focused {
@@ -535,6 +541,11 @@ pub fn render_frame(
         if state.mode == AppMode::Help {
             render_help_overlay(frame, area);
         }
+
+        // -- Entry detail overlay --
+        if state.mode == AppMode::EntryDetail {
+            render_entry_detail(frame, area, state);
+        }
     })?;
 
     Ok(())
@@ -548,28 +559,34 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         Line::from(Span::styled("Keyboard Shortcuts", Style::default().fg(Color::Cyan).add_modifier(ratatui::style::Modifier::BOLD))),
         Line::from(""),
         Line::from(vec![Span::styled("Navigation", Style::default().fg(Color::Yellow))]),
-        Line::from(vec![Span::raw("  j/k  "), Span::styled("Move cursor down/up", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  [/]  "), Span::styled("Page up/down", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  g/G  "), Span::styled("Jump to top / bottom (tail)", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  j/k    "), Span::styled("Move cursor down/up", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  [/]    "), Span::styled("Page up/down", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  g/G    "), Span::styled("Jump to top / bottom (tail)", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  Enter  "), Span::styled("Open entry detail view", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
         Line::from(vec![Span::styled("Display", Style::default().fg(Color::Yellow))]),
-        Line::from(vec![Span::raw("  v    "), Span::styled("Toggle preview/raw mode", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  w    "), Span::styled("Toggle wrap/truncate", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  v      "), Span::styled("Toggle preview/raw mode", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  w      "), Span::styled("Toggle wrap/truncate", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
         Line::from(vec![Span::styled("Filter & Search", Style::default().fg(Color::Yellow))]),
-        Line::from(vec![Span::raw("  f    "), Span::styled("Open filter bar (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  /    "), Span::styled("Open search (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  n/N  "), Span::styled("Next/previous search match", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  1-9  "), Span::styled("Toggle source N visibility", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  a    "), Span::styled("Show all sources", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  f      "), Span::styled("Open filter bar (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  /      "), Span::styled("Open search (Enter confirm, Esc cancel)", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  n/N    "), Span::styled("Next/previous search match", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  1-9    "), Span::styled("Toggle source N visibility", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  a      "), Span::styled("Show all sources", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
-        Line::from(vec![Span::styled("Sidebar", Style::default().fg(Color::Yellow))]),
-        Line::from(vec![Span::raw("  Tab  "), Span::styled("Toggle sidebar focus", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  s    "), Span::styled("Stop selected process", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  r    "), Span::styled("Restart selected process", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::styled("Sidebar (Tab to focus)", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  Tab    "), Span::styled("Toggle sidebar focus", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  s      "), Span::styled("Stop selected process (SIGTERM)", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  S      "), Span::styled("Send SIGHUP to selected process", Style::default().fg(Color::DarkGray))]),
         Line::from(""),
-        Line::from(vec![Span::raw("  q    "), Span::styled("Quit", Style::default().fg(Color::DarkGray))]),
-        Line::from(vec![Span::raw("  ?    "), Span::styled("Toggle this help", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::styled("Entry Detail", Style::default().fg(Color::Yellow))]),
+        Line::from(vec![Span::raw("  j/k    "), Span::styled("Scroll within detail view", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  y      "), Span::styled("Copy raw entry to clipboard", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  Esc/q  "), Span::styled("Close detail view", Style::default().fg(Color::DarkGray))]),
+        Line::from(""),
+        Line::from(vec![Span::raw("  q      "), Span::styled("Quit", Style::default().fg(Color::DarkGray))]),
+        Line::from(vec![Span::raw("  ?      "), Span::styled("Toggle this help", Style::default().fg(Color::DarkGray))]),
     ];
 
     let help_height = (help_text.len() + 2) as u16; // +2 for border
@@ -598,6 +615,154 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         .wrap(Wrap { trim: false });
 
     frame.render_widget(help_paragraph, popup_area);
+}
+
+/// Render the entry detail overlay showing all fields of the focused log entry.
+fn render_entry_detail(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    state: &AppState,
+) {
+    use ratatui::widgets::{Borders, Clear, Wrap};
+
+    // Find the focused entry from the cursor position
+    let visible_indices = state.visible_line_indices();
+    let cursor_idx = match state.scroll {
+        ScrollState::Tail => {
+            if visible_indices.is_empty() {
+                return;
+            }
+            *visible_indices.last().unwrap()
+        }
+        ScrollState::Pinned { cursor, .. } => {
+            if cursor >= visible_indices.len() {
+                if visible_indices.is_empty() {
+                    return;
+                }
+                *visible_indices.last().unwrap()
+            } else {
+                visible_indices[cursor]
+            }
+        }
+    };
+
+    let entry = match state.log_lines.get(cursor_idx) {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Build the detail lines
+    let mut detail_lines: Vec<Line<'static>> = Vec::new();
+
+    // Well-known fields
+    detail_lines.push(Line::from(vec![
+        Span::styled("timestamp: ", Style::default().fg(Color::Cyan)),
+        Span::raw(entry.display_timestamp()),
+    ]));
+
+    detail_lines.push(Line::from(vec![
+        Span::styled("level:     ", Style::default().fg(Color::Cyan)),
+        Span::raw(entry.level.clone().unwrap_or_else(|| "---".to_string())),
+    ]));
+
+    detail_lines.push(Line::from(vec![
+        Span::styled("source:    ", Style::default().fg(Color::Cyan)),
+        Span::raw(entry.source.clone()),
+    ]));
+
+    detail_lines.push(Line::from(vec![
+        Span::styled("message:   ", Style::default().fg(Color::Cyan)),
+        Span::raw(
+            entry
+                .message
+                .clone()
+                .unwrap_or_else(|| "(none)".to_string()),
+        ),
+    ]));
+
+    // Additional fields
+    if !entry.fields.is_empty() {
+        detail_lines.push(Line::from(""));
+
+        // Sort fields by key for consistent display
+        let mut field_keys: Vec<&String> = entry.fields.keys().collect();
+        field_keys.sort();
+
+        // Find the longest key for alignment
+        let max_key_len = field_keys.iter().map(|k| k.len()).max().unwrap_or(0);
+
+        for key in field_keys {
+            let value = &entry.fields[key];
+            let value_str = match value {
+                serde_json::Value::String(s) => format!("\"{}\"", s),
+                other => other.to_string(),
+            };
+            let padding = " ".repeat(max_key_len.saturating_sub(key.len()));
+            detail_lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}:{} ", key, padding),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw(value_str),
+            ]));
+        }
+    }
+
+    // Raw text section
+    detail_lines.push(Line::from(""));
+    detail_lines.push(Line::from(Span::styled(
+        "--- raw ---",
+        Style::default().fg(Color::DarkGray),
+    )));
+    for raw_line in entry.raw.lines() {
+        detail_lines.push(Line::from(raw_line.to_string()));
+    }
+
+    // Compute overlay dimensions
+    let total_lines = detail_lines.len();
+    let max_height = (area.height as usize).saturating_sub(4); // leave room for border + some margin
+    let display_height = total_lines.min(max_height).max(6);
+    let display_width = (area.width as usize).saturating_sub(8).max(20);
+
+    let popup_height = (display_height + 2) as u16; // +2 for border
+    let popup_width = display_width as u16;
+
+    // Center the popup
+    let x = area.width.saturating_sub(popup_width) / 2;
+    let y = area.height.saturating_sub(popup_height) / 2;
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + x,
+        area.y + y,
+        popup_width.min(area.width),
+        popup_height.min(area.height),
+    );
+
+    // Clear the area behind the popup
+    frame.render_widget(Clear, popup_area);
+
+    // Apply scroll offset
+    let scroll_offset = state.detail_scroll.min(
+        total_lines.saturating_sub(display_height),
+    );
+    let visible_lines: Vec<Line<'static>> = detail_lines
+        .into_iter()
+        .skip(scroll_offset)
+        .take(display_height)
+        .collect();
+
+    let detail_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " Entry Detail (j/k scroll, y copy, Esc close) ",
+            Style::default().fg(Color::Cyan),
+        ));
+
+    let detail_paragraph = Paragraph::new(visible_lines)
+        .block(detail_block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(detail_paragraph, popup_area);
 }
 
 /// Apply search highlighting to a rendered line.
@@ -787,6 +952,21 @@ mod tests {
         state.toggle_source_visibility("api");
         assert!(state.source_filter.contains("task"));
         assert!(!state.source_filter.contains("api"));
+    }
+
+    #[test]
+    fn app_state_detail_scroll_default() {
+        let state = AppState::new();
+        assert_eq!(state.detail_scroll, 0);
+    }
+
+    #[test]
+    fn app_mode_entry_detail_variant() {
+        let mut state = AppState::new();
+        state.mode = AppMode::EntryDetail;
+        assert_eq!(state.mode, AppMode::EntryDetail);
+        state.mode = AppMode::Normal;
+        assert_eq!(state.mode, AppMode::Normal);
     }
 
     #[test]
