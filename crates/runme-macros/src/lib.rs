@@ -13,7 +13,7 @@ use syn::{Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, ReturnType, parse_mac
 ///
 /// Usage:
 /// ```ignore
-/// #[runme::task(desc = "Build the project", watch = "src/**/*.rs")]
+/// #[runme::task(desc = "Build the project")]
 /// async fn build(ctx: &TaskContext) {
 ///     ctx.exec("cargo build").await.unwrap();
 /// }
@@ -33,9 +33,8 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let is_async = input_fn.sig.asyncness.is_some();
 
-    // Parse attributes: desc = "...", watch = "...", depends_on = "a,b,c"
+    // Parse attributes: desc = "...", depends_on = "a,b,c"
     let mut description: Option<String> = None;
-    let mut watch: Option<String> = None;
     let mut depends_on: Vec<String> = Vec::new();
 
     // Parse the attribute as a comma-separated list of name = "value" pairs
@@ -61,7 +60,6 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 match key.as_str() {
                     "desc" | "description" => description = Some(val),
-                    "watch" => watch = Some(val),
                     "depends_on" => {
                         depends_on = val.split(',').map(|s| s.trim().to_string()).collect();
                     }
@@ -111,12 +109,6 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     // Generate the description token
     let desc_tokens = match &description {
         Some(d) => quote! { Some(#d) },
-        None => quote! { None },
-    };
-
-    // Generate the watch token
-    let watch_tokens = match &watch {
-        Some(w) => quote! { Some(#w) },
         None => quote! { None },
     };
 
@@ -186,7 +178,6 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #fn_name_str,
                 description: #desc_tokens,
                 group: __RUNME_GROUP,
-                watch: #watch_tokens,
                 depends_on: #deps_tokens,
                 func: #wrapper_name,
             }

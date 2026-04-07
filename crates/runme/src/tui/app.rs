@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
@@ -24,6 +25,7 @@ use crate::task::TaskDef;
 
 use super::event::run_event_loop;
 use super::filter::{FilterInputState, filter_status_spans, render_filter_input};
+use super::output::TuiOutput;
 use super::picker::{self, PickerState};
 use super::render::{DisplayMode, SourceColors};
 use super::runner::{ProcessInfo, TaskRunner, TaskStatus};
@@ -117,6 +119,12 @@ pub struct AppState {
     pub filter_history: Vec<String>,
     /// Current position in filter history (for Up/Down cycling). None = not browsing history.
     pub filter_history_index: Option<usize>,
+    /// Whether the TUI should stay open after the task completes.
+    /// None when no task is running. Shared with the TaskContext via the runner.
+    pub tui_wait: Option<Arc<AtomicBool>>,
+    /// Post-TUI output buffer. Shared with the TaskContext via the runner.
+    /// Flushed to real stdio after `restore_terminal()`.
+    pub tui_output: Option<Arc<Mutex<TuiOutput>>>,
 }
 
 impl Default for AppState {
@@ -158,6 +166,8 @@ impl AppState {
             notifications: Vec::new(),
             filter_history: Vec::new(),
             filter_history_index: None,
+            tui_wait: None,
+            tui_output: None,
         }
     }
 
@@ -251,6 +261,8 @@ impl AppState {
         let log_store = runner.log_store.clone();
         let task_status = runner.status.clone();
         let processes = runner.processes.clone();
+        let tui_wait = runner.tui_wait.clone();
+        let tui_output = runner.tui_output.clone();
 
         runner.launch(task);
 
@@ -258,6 +270,8 @@ impl AppState {
         self.task_status = Some(task_status);
         self.task_name = Some(task.name.to_string());
         self.processes = Some(processes);
+        self.tui_wait = Some(tui_wait);
+        self.tui_output = Some(tui_output);
         self.mode = AppMode::Normal;
         self.picker = None;
         self.pending_task = None;
@@ -330,6 +344,22 @@ impl App {
         let result = run_event_loop(&mut self.state, &mut terminal).await;
 
         restore_terminal()?;
+
+        // Flush staged TUI output to real stdout/stderr now that we've
+        // exited the alternate screen.
+        if let Some(ref tui_output) = self.state.tui_output {
+            let (stdout_text, stderr_text) = tui_output.lock().await.flush().await;
+            if !stdout_text.is_empty() {
+                use std::io::Write;
+                let _ = io::stdout().write_all(stdout_text.as_bytes());
+                let _ = io::stdout().flush();
+            }
+            if !stderr_text.is_empty() {
+                use std::io::Write;
+                let _ = io::stderr().write_all(stderr_text.as_bytes());
+                let _ = io::stderr().flush();
+            }
+        }
 
         // Restore the default panic hook now that the terminal is restored.
         let _ = std::panic::take_hook();

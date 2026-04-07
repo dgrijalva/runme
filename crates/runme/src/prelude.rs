@@ -11,6 +11,8 @@ pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawR
 pub use crate::process::{Output, ProcessError, ProcessHandle, ProcessResult};
 pub use crate::signal::SignalHandler;
 pub use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef, TaskFn};
+pub use crate::tui::output::{TuiOutput, TuiOutputHandle, TuiOutputStreamHandle};
+pub use crate::watch::{Watch, WatchInfo, WatchKind, glob_filter};
 pub use runme_macros::init;
 pub use runme_macros::task;
 

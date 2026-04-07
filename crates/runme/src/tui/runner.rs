@@ -5,6 +5,7 @@
 //! processes), and exposes status for the TUI to render.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use nix::sys::signal;
 use nix::unistd::Pid;
@@ -16,6 +17,8 @@ use crate::log::buffer::OutputBuffer;
 use crate::log::store::LogStore;
 use crate::task::{SpawnEvent, TaskContext, TaskDef};
 use crate::tracing_layer::LogEntryLayer;
+
+use super::output::TuiOutput;
 
 /// Status of the running task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +101,12 @@ pub struct TaskRunner {
     spawn_rx: Option<mpsc::UnboundedReceiver<SpawnEvent>>,
     /// Sender for spawn events (given to the TaskContext).
     spawn_tx: mpsc::UnboundedSender<SpawnEvent>,
+    /// Whether the TUI should stay open after the task completes.
+    /// Shared with the TaskContext so the task can control this at runtime.
+    pub tui_wait: Arc<AtomicBool>,
+    /// Post-TUI output buffer. Shared with the TaskContext so the task
+    /// can stage output that gets flushed after the TUI closes.
+    pub tui_output: Arc<Mutex<TuiOutput>>,
 }
 
 impl TaskRunner {
@@ -111,6 +120,8 @@ impl TaskRunner {
             tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             spawn_rx: Some(spawn_rx),
             spawn_tx,
+            tui_wait: Arc::new(AtomicBool::new(true)),
+            tui_output: Arc::new(Mutex::new(TuiOutput::new())),
         }
     }
 
@@ -124,6 +135,8 @@ impl TaskRunner {
             tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             spawn_rx: Some(spawn_rx),
             spawn_tx,
+            tui_wait: Arc::new(AtomicBool::new(true)),
+            tui_output: Arc::new(Mutex::new(TuiOutput::new())),
         }
     }
 
@@ -152,6 +165,8 @@ impl TaskRunner {
         // Create the TaskContext here so we can wire up its exec output buffer
         let mut ctx = TaskContext::new(task.name);
         ctx.set_spawn_notifier(spawn_tx);
+        ctx.set_tui_wait(self.tui_wait.clone());
+        ctx.set_tui_output(self.tui_output.clone());
 
         // Forward exec() output (TaskContext's own buffer) to the LogStore
         let exec_log_store = log_store.clone();
@@ -348,7 +363,7 @@ mod tests {
         name: "success",
         description: Some("A successful task"),
         group: "",
-        watch: None,
+
         depends_on: &[],
         func: success_task,
     };
@@ -357,7 +372,7 @@ mod tests {
         name: "failing",
         description: Some("A failing task"),
         group: "",
-        watch: None,
+
         depends_on: &[],
         func: failing_task,
     };
@@ -366,7 +381,7 @@ mod tests {
         name: "spawning",
         description: Some("A task that spawns a process"),
         group: "",
-        watch: None,
+
         depends_on: &[],
         func: spawning_task,
     };

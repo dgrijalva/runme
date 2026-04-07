@@ -21,6 +21,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-stream = "0.1"
 base64 = "0.22"
 fuzzy-matcher = "0.3"
+notify = "7"
+globset = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

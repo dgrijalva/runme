@@ -1,6 +1,8 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
@@ -9,7 +11,9 @@ use crate::cmd::Cmd;
 use crate::error::TaskError;
 use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
-use crate::process::{self, ProcessError, ProcessHandle, ProcessResult};
+use crate::process::{self, Output, ProcessError, ProcessHandle, ProcessResult};
+use crate::tui::output::{TuiOutput, TuiOutputHandle};
+use crate::watch::{self, Watch, WatchInfo, WatchKind};
 
 /// The type of async task functions.
 ///
@@ -27,7 +31,6 @@ pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
     pub group: &'static str,
-    pub watch: Option<&'static str>,
     pub depends_on: &'static [&'static str],
     pub func: TaskFn,
 }
@@ -45,7 +48,7 @@ inventory::collect!(TaskDef);
 /// Provides process execution, output capture, and lifecycle management.
 pub struct TaskContext {
     pub name: String,
-    output: Mutex<OutputBuffer>,
+    output: Arc<Mutex<OutputBuffer>>,
     /// Process group IDs of all processes spawned through this context.
     /// Used by `stop_all()` to signal every spawned process group.
     spawned_pgids: Mutex<Vec<i32>>,
@@ -53,6 +56,17 @@ pub struct TaskContext {
     /// process is spawned. The receiver gets the `ProcessHandle`'s output buffer
     /// and task name so it can register the process for display.
     spawn_tx: Option<mpsc::UnboundedSender<SpawnEvent>>,
+    /// Whether the TUI should stay open after the task completes.
+    /// Default: true (TUI stays open). Set to false via `ctx.tui_wait(false)`
+    /// to auto-exit on task completion.
+    tui_wait: Arc<AtomicBool>,
+    /// Post-TUI output buffer. Entries staged here are flushed to real
+    /// stdout/stderr after the TUI closes.
+    tui_output: Arc<Mutex<TuiOutput>>,
+    /// All watches registered through this context, for TUI visibility.
+    watches: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<WatchInfo>>>>>,
+    /// Working directory for file watches. Defaults to the current directory.
+    watch_dir: PathBuf,
 }
 
 /// Event emitted when a process is spawned through a TaskContext.
@@ -76,9 +90,13 @@ impl TaskContext {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            output: Mutex::new(OutputBuffer::new(10_000)),
+            output: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             spawned_pgids: Mutex::new(Vec::new()),
             spawn_tx: None,
+            tui_wait: Arc::new(AtomicBool::new(true)),
+            tui_output: Arc::new(Mutex::new(TuiOutput::new())),
+            watches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -86,9 +104,13 @@ impl TaskContext {
     pub fn with_capacity(name: impl Into<String>, capacity: usize) -> Self {
         Self {
             name: name.into(),
-            output: Mutex::new(OutputBuffer::new(capacity)),
+            output: Arc::new(Mutex::new(OutputBuffer::new(capacity))),
             spawned_pgids: Mutex::new(Vec::new()),
             spawn_tx: None,
+            tui_wait: Arc::new(AtomicBool::new(true)),
+            tui_output: Arc::new(Mutex::new(TuiOutput::new())),
+            watches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -104,7 +126,68 @@ impl TaskContext {
     ///
     /// The TUI runner uses this to forward exec output to the LogStore.
     pub fn output_buffer(&self) -> &Mutex<OutputBuffer> {
-        &self.output
+        &*self.output
+    }
+
+    /// Control whether the TUI stays open after the task completes.
+    ///
+    /// By default, the TUI stays open (`true`). Set to `false` to auto-exit
+    /// when the task returns. This is mutable — the task can change its mind:
+    ///
+    /// ```ignore
+    /// ctx.tui_wait(false);
+    /// let result = ctx.exec("cargo install --path .").await?;
+    /// if !result.success() {
+    ///     ctx.tui_wait(true);  // stay open on failure
+    /// }
+    /// ```
+    pub fn tui_wait(&self, wait: bool) {
+        self.tui_wait.store(wait, Ordering::Relaxed);
+    }
+
+    /// Get a handle to the TUI output buffer for staging post-TUI output.
+    ///
+    /// The returned handle supports chaining:
+    /// ```ignore
+    /// ctx.tui_output().stderr().append(result.output()).await;
+    /// ctx.tui_output().stdout().write("done!\n").await;
+    /// ```
+    pub fn tui_output(&self) -> TuiOutputHandle {
+        TuiOutputHandle::new(self.tui_output.clone())
+    }
+
+    /// Get an `Output` handle wrapping the task's own tracing output buffer.
+    ///
+    /// This is the output from `info!()`, `error!()`, etc. called within
+    /// the task function. Useful for staging task tracing output to post-TUI:
+    ///
+    /// ```ignore
+    /// ctx.tui_output().stderr().subscribe(&ctx.task_output()).await;
+    /// ```
+    pub fn task_output(&self) -> Output {
+        Output(self.output.clone())
+    }
+
+    /// Get the `tui_wait` flag as a shared Arc for external observation.
+    ///
+    /// The TUI event loop uses this to decide whether to auto-exit.
+    pub fn tui_wait_flag(&self) -> Arc<AtomicBool> {
+        self.tui_wait.clone()
+    }
+
+    /// Get the shared TUI output Arc for external use (e.g., flushing on shutdown).
+    pub fn tui_output_arc(&self) -> Arc<Mutex<TuiOutput>> {
+        self.tui_output.clone()
+    }
+
+    /// Set the tui_wait Arc (used by TaskRunner to inject a shared flag).
+    pub fn set_tui_wait(&mut self, flag: Arc<AtomicBool>) {
+        self.tui_wait = flag;
+    }
+
+    /// Set the tui_output Arc (used by TaskRunner to inject a shared buffer).
+    pub fn set_tui_output(&mut self, output: Arc<Mutex<TuiOutput>>) {
+        self.tui_output = output;
     }
 
     /// Run a command and wait for it to complete. Captures output.
@@ -177,6 +260,112 @@ impl TaskContext {
                 Some(nix::sys::signal::Signal::SIGKILL),
             );
         }
+    }
+
+    /// Watch files matching a glob pattern.
+    ///
+    /// Returns a `Watch<Vec<PathBuf>>` that yields batches of changed file paths
+    /// each time matching files are created, modified, or removed. Events are
+    /// debounced (coalesced over a short window) so rapid changes produce a
+    /// single batch.
+    ///
+    /// ```ignore
+    /// let mut w = ctx.watch("src/**/*.rs").label("rust sources");
+    /// loop {
+    ///     ctx.exec("cargo build").await.ok()?;
+    ///     w.next().await;
+    /// }
+    /// ```
+    pub fn watch(&self, pattern: &str) -> Watch<Vec<PathBuf>> {
+        let (rx, info) = watch::start_file_watcher(pattern, self.watch_dir.clone())
+            .expect("failed to start file watcher");
+
+        // Register for TUI visibility
+        if let Ok(mut watches) = self.watches.lock() {
+            watches.push(info.clone());
+        }
+
+        Watch::new(rx, info)
+    }
+
+    /// Watch files with a custom filter/map function.
+    ///
+    /// All filesystem events in the watch directory are collected and debounced,
+    /// then passed to `filter_fn`. If it returns `Some(value)`, that value is
+    /// delivered via `.next()`. If `None`, the event batch is discarded and the
+    /// watch keeps waiting.
+    ///
+    /// ```ignore
+    /// let mut w = ctx.watch_with(|changed| {
+    ///     let rs = glob_filter("src/**/*.rs", changed);
+    ///     let toml = glob_filter("**/Cargo.toml", changed);
+    ///     if rs.is_empty() && toml.is_empty() { None }
+    ///     else { Some((rs, toml)) }
+    /// });
+    /// ```
+    pub fn watch_with<F, T>(&self, filter_fn: F) -> Watch<T>
+    where
+        F: Fn(&[PathBuf]) -> Option<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (rx, info) = watch::start_filtered_watcher(self.watch_dir.clone(), filter_fn)
+            .expect("failed to start filtered watcher");
+
+        if let Ok(mut watches) = self.watches.lock() {
+            watches.push(info.clone());
+        }
+
+        Watch::new(rx, info)
+    }
+
+    /// Create a watch backed by a manual channel.
+    ///
+    /// Returns a sender and a `Watch<T>`. Send values through the sender
+    /// to trigger the watch. Useful for non-filesystem triggers like health
+    /// checks, polling, or external events.
+    ///
+    /// ```ignore
+    /// let (tx, mut w) = ctx.watch_channel::<HealthStatus>();
+    /// let w = w.label("health check");
+    /// tokio::spawn(async move {
+    ///     loop {
+    ///         let status = poll_health().await;
+    ///         tx.send(status).unwrap();
+    ///         tokio::time::sleep(Duration::from_secs(5)).await;
+    ///     }
+    /// });
+    /// loop {
+    ///     let status = w.next().await;
+    ///     // react...
+    /// }
+    /// ```
+    pub fn watch_channel<T: Send + 'static>(&self) -> (mpsc::UnboundedSender<T>, Watch<T>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let info = Arc::new(std::sync::Mutex::new(WatchInfo {
+            label: None,
+            kind: WatchKind::Channel,
+            trigger_count: 0,
+            last_triggered: None,
+        }));
+
+        if let Ok(mut watches) = self.watches.lock() {
+            watches.push(info.clone());
+        }
+
+        (tx, Watch::new(rx, info))
+    }
+
+    /// Set the working directory for file watches.
+    ///
+    /// By default, watches use the current working directory. Call this
+    /// to override (e.g., to watch relative to the RUNME.rs file location).
+    pub fn set_watch_dir(&mut self, dir: PathBuf) {
+        self.watch_dir = dir;
+    }
+
+    /// Get the list of active watches for TUI visibility.
+    pub fn watches(&self) -> Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<WatchInfo>>>>> {
+        self.watches.clone()
     }
 
     /// Access the output buffer (read the captured log entries).
@@ -302,7 +491,6 @@ mod tests {
         name: "alpha",
         description: Some("The alpha task"),
         group: "",
-        watch: None,
         depends_on: &[],
         func: dummy_task,
     };
@@ -311,7 +499,6 @@ mod tests {
         name: "beta",
         description: None,
         group: "",
-        watch: Some("src/**/*.rs"),
         depends_on: &["alpha"],
         func: another_task,
     };
@@ -330,7 +517,6 @@ mod tests {
         let found_b = reg.get("beta");
         assert!(found_b.is_some());
         assert_eq!(found_b.unwrap().name, "beta");
-        assert_eq!(found_b.unwrap().watch, Some("src/**/*.rs"));
     }
 
     #[test]
@@ -409,7 +595,6 @@ mod tests {
             name: "para_a",
             description: Some("Parallel A"),
             group: "",
-            watch: None,
             depends_on: &[],
             func: task_a,
         };
@@ -418,7 +603,6 @@ mod tests {
             name: "para_b",
             description: Some("Parallel B"),
             group: "",
-            watch: None,
             depends_on: &[],
             func: task_b,
         };
@@ -440,6 +624,50 @@ mod tests {
         let results = reg.run_parallel(&["nonexistent"]).await;
         assert_eq!(results.len(), 1);
         assert!(results[0].is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tui_wait_default_is_true() {
+        let ctx = TaskContext::new("test");
+        let flag = ctx.tui_wait_flag();
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_tui_wait_set_and_read() {
+        let ctx = TaskContext::new("test");
+        let flag = ctx.tui_wait_flag();
+
+        ctx.tui_wait(false);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+
+        ctx.tui_wait(true);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_tui_output_handle_is_shared() {
+        let ctx = TaskContext::new("test");
+        let handle1 = ctx.tui_output();
+        let handle2 = ctx.tui_output();
+
+        // Both handles point to the same underlying buffer
+        handle1.write_stdout("from handle1").await;
+        handle2.write_stderr("from handle2").await;
+
+        let (stdout, stderr) = handle1.flush().await;
+        assert_eq!(stdout, "from handle1\n");
+        assert_eq!(stderr, "from handle2\n");
+    }
+
+    #[tokio::test]
+    async fn test_task_output_returns_output() {
+        let ctx = TaskContext::new("test");
+        // task_output() should return an Output wrapping the task's buffer
+        let output = ctx.task_output();
+        // Initially empty
+        let entries = output.entries().await;
+        assert!(entries.is_empty());
     }
 
 }

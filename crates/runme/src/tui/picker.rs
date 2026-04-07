@@ -410,7 +410,7 @@ mod tests {
         name: "build",
         description: Some("Build the project"),
         group: "",
-        watch: None,
+
         depends_on: &[],
         func: dummy_task,
     };
@@ -419,7 +419,7 @@ mod tests {
         name: "test",
         description: Some("Run tests"),
         group: "services/auth",
-        watch: None,
+
         depends_on: &[],
         func: dummy_task,
     };
@@ -428,7 +428,7 @@ mod tests {
         name: "build",
         description: Some("Build the auth service"),
         group: "services/auth",
-        watch: None,
+
         depends_on: &[],
         func: dummy_task,
     };
@@ -437,7 +437,7 @@ mod tests {
         name: "dev",
         description: Some("Start dev server"),
         group: "web-app",
-        watch: None,
+
         depends_on: &[],
         func: dummy_task,
     };

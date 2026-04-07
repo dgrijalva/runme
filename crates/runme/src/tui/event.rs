@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -147,6 +148,21 @@ pub async fn run_event_loop(
             _ = render_interval.tick(), if state.dirty => {
                 // Refresh process statuses and rebuild sidebar entries
                 refresh_sidebar_state(state).await;
+
+                // Check tui_wait: auto-exit when task is complete and tui_wait is false
+                if let Some(ref tui_wait) = state.tui_wait {
+                    if !tui_wait.load(Ordering::Relaxed) {
+                        if let Some(ref task_status) = state.task_status {
+                            let status = task_status.lock().await;
+                            match &*status {
+                                TaskStatus::Done | TaskStatus::Failed(_) => {
+                                    state.running = false;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
 
                 // Crash surfacing: detect newly failed processes
                 check_for_crashes(state, &mut prev_process_statuses);
