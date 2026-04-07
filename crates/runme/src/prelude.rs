@@ -19,3 +19,6 @@ pub use tracing::{debug, error, info, trace, warn};
 
 // The tracing layer for wiring into a subscriber
 pub use crate::tracing_layer::LogEntryLayer;
+
+// Re-export libs
+pub use tokio;

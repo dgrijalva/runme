@@ -67,6 +67,8 @@ pub struct SpawnEvent {
     pub pgid: Option<i32>,
     /// The process ID, if available.
     pub pid: Option<u32>,
+    /// Human-readable label for the command (e.g., "echo hello", "npm run dev").
+    pub command_label: String,
 }
 
 impl TaskContext {
@@ -120,8 +122,12 @@ impl TaskContext {
     ///
     /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
     pub async fn spawn(&self, command: impl Into<Cmd>) -> Result<ProcessHandle, ProcessError> {
+        let cmd: Cmd = command.into();
+        let command_label = cmd.display_label();
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(10_000)));
-        let handle = process::spawn(command, &self.name, buffer).await?;
+        // Use the command label as the source name so each process gets a
+        // distinct source in the log viewer (rather than all sharing the task name).
+        let handle = process::spawn(cmd, &command_label, buffer).await?;
 
         // Track the process group so stop_all() can signal it
         if let Some(pgid) = handle.pgid() {
@@ -137,6 +143,7 @@ impl TaskContext {
                 task_name: handle.task_name().to_string(),
                 pgid: handle.pgid(),
                 pid: handle.pid(),
+                command_label,
             });
         }
 

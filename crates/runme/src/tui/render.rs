@@ -92,7 +92,7 @@ fn render_preview(
     let width = width as usize;
 
     // Timestamp column
-    let ts_text = format_timestamp(&entry.timestamp);
+    let ts_text = entry.display_timestamp();
     let ts_span = Span::styled(
         pad_or_truncate(&ts_text, TIMESTAMP_WIDTH),
         Style::default().fg(Color::DarkGray),
@@ -336,6 +336,7 @@ mod tests {
         timestamp: Option<&str>,
     ) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: crate::log::ParsedContent::PlainText,
             source: source.to_string(),

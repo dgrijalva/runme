@@ -75,16 +75,16 @@ fn build_log_entry(
     seq: &mut u64,
 ) -> LogEntry {
     let extracted = extractor.extract(&raw_record);
-    let entry = LogEntry {
-        raw: raw_record.raw,
-        parsed: raw_record.parsed,
-        source: source.to_string(),
-        seq: *seq,
-        timestamp: extracted.timestamp,
-        level: extracted.level,
-        message: extracted.message,
-        fields: extracted.fields,
-    };
+    let entry = LogEntry::new(
+        raw_record.raw,
+        raw_record.parsed,
+        source.to_string(),
+        *seq,
+        extracted.timestamp,
+        extracted.level,
+        extracted.message,
+        extracted.fields,
+    );
     *seq += 1;
     entry
 }
@@ -598,6 +598,7 @@ mod tests {
     async fn test_output_buffer_ring() {
         let mut buffer = OutputBuffer::new(3);
         let make_entry = |raw: &str, seq: u64| LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: "test".to_string(),
@@ -626,6 +627,7 @@ mod tests {
         let mut rx = buffer.subscribe();
 
         buffer.push(LogEntry {
+            received_at: chrono::Utc::now(),
             raw: "broadcast_test".to_string(),
             parsed: ParsedContent::PlainText,
             source: "test".to_string(),

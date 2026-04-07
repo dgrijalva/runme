@@ -298,6 +298,7 @@ mod tests {
     /// Helper to build a minimal LogEntry for testing.
     fn entry(raw: &str, message: Option<&str>) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: "test".to_string(),
@@ -311,6 +312,7 @@ mod tests {
 
     fn entry_with_source(raw: &str, source: &str, seq: u64) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: source.to_string(),

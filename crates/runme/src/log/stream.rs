@@ -195,6 +195,7 @@ mod tests {
     /// Helper to create a LogEntry for testing.
     fn make_entry(source: &str, seq: u64, raw: &str) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: source.to_string(),
@@ -215,6 +216,7 @@ mod tests {
         message: Option<&str>,
     ) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: source.to_string(),
@@ -229,6 +231,7 @@ mod tests {
     /// Helper to create a LogEntry with JSON parsed content.
     fn make_json_entry(source: &str, seq: u64, raw: &str, json: serde_json::Value) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::Json(json.clone()),
             source: source.to_string(),

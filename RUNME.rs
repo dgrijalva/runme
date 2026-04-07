@@ -9,18 +9,3 @@ async fn install(ctx: &TaskContext) -> TaskResult {
     ctx.exec("cargo install --path crates/runme-cli").await?;
     Ok(())
 }
-
-/// Test task
-#[runme::task]
-fn test(_ctx: &TaskContext) -> TaskResult {
-    eprintln!("test233");
-    Ok(())
-}
-
-/// Testing nested runme files
-#[runme::task]
-async fn example_nested(ctx: &TaskContext) -> TaskResult {
-    ctx.exec("echo foo bar baz").await?;
-    eprintln!("It's working!0");
-    Ok(())
-}

@@ -205,3 +205,38 @@ error!(service = "auth", "connection failed");
 ```
 
 These flow through the same pipeline as child process output.
+
+## TUI Keyboard Shortcuts
+
+### Global
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `Ctrl-c` | Quit |
+| `Tab` | Toggle focus between sidebar and log viewer |
+
+### Log Viewer
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Next entry |
+| `k` / `Up` | Previous entry |
+| `Ctrl-d` / `PageDown` | Scroll down half page |
+| `Ctrl-u` / `PageUp` | Scroll up half page |
+| `g` / `Home` | Jump to first entry |
+| `G` / `End` | Jump to last entry (tail mode) |
+| `v` / `m` | Toggle preview/raw display mode |
+| `w` | Toggle line wrap/truncate |
+| `a` | Show all sources (clear filter) |
+| `1`-`9` | Toggle visibility of source N |
+
+### Sidebar
+
+| Key | Action |
+|-----|--------|
+| `j` / `Down` | Move selection down |
+| `k` / `Up` | Move selection up |
+| `Enter` / `Space` | Toggle source visibility |
+| `a` | Show all sources |
+| `1`-`9` | Toggle visibility of source N |

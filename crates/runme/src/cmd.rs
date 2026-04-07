@@ -22,6 +22,7 @@ pub struct Cmd {
     inner: CmdKind,
     envs: Vec<(OsString, OsString)>,
     cwd: Option<PathBuf>,
+    label: Option<String>,
     pub(crate) parser: Option<Box<dyn RecordParser>>,
     pub(crate) extractor: Option<Box<dyn FieldExtractor>>,
 }
@@ -47,6 +48,7 @@ impl Cmd {
             },
             envs: Vec::new(),
             cwd: None,
+            label: None,
             parser: None,
             extractor: None,
         }
@@ -60,6 +62,7 @@ impl Cmd {
             inner: CmdKind::Shell(command.into()),
             envs: Vec::new(),
             cwd: None,
+            label: None,
             parser: None,
             extractor: None,
         }
@@ -113,6 +116,21 @@ impl Cmd {
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
         self.cwd = Some(path.into());
         self
+    }
+
+    /// Set a human-readable label for this command.
+    ///
+    /// The label is used as the source name in the log viewer and sidebar,
+    /// replacing the auto-generated command string. Useful when the raw command
+    /// is long or opaque (e.g., a shell one-liner).
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
+    }
+
+    /// Get the label, falling back to the auto-generated display string.
+    pub fn display_label(&self) -> String {
+        self.label.clone().unwrap_or_else(|| self.to_string())
     }
 
     /// Whether this is a shell command.
@@ -175,6 +193,7 @@ impl fmt::Debug for Cmd {
             .field("inner", &self.inner)
             .field("envs", &self.envs)
             .field("cwd", &self.cwd)
+            .field("label", &self.label)
             .field("parser", &self.parser.as_ref().map(|_| "..."))
             .field("extractor", &self.extractor.as_ref().map(|_| "..."))
             .finish()
@@ -226,6 +245,7 @@ impl From<std::process::Command> for Cmd {
             inner: CmdKind::Structured { program, args },
             envs,
             cwd,
+            label: None,
             parser: None,
             extractor: None,
         }

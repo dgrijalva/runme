@@ -161,16 +161,16 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
 
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
 
-        let entry = LogEntry {
+        let entry = LogEntry::new(
             raw,
-            parsed: ParsedContent::PlainText,
-            source: self.source.clone(),
+            ParsedContent::PlainText,
+            self.source.clone(),
             seq,
-            timestamp: None,
-            level: Some(level.to_string()),
-            message: collector.message,
-            fields: collector.fields,
-        };
+            None,
+            Some(level.to_string()),
+            collector.message,
+            collector.fields,
+        );
 
         // Push to buffer. We need to block on the async mutex since
         // tracing's Layer::on_event is synchronous. Use try_lock to avoid

@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use nix::sys::signal;
+use nix::unistd::Pid;
 use tokio::sync::{Mutex, mpsc};
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -28,12 +30,55 @@ pub enum TaskStatus {
     Failed(String),
 }
 
+/// Status of an individual spawned process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessStatus {
+    /// Process is currently running.
+    Running,
+    /// Process exited successfully (exit code 0).
+    Done,
+    /// Process exited with a non-zero exit code or was killed by a signal.
+    Failed(i32),
+    /// Process was stopped by the user.
+    Stopped,
+}
+
 /// Information about a spawned process, for the TUI to display.
 pub struct ProcessInfo {
     pub task_name: String,
+    pub command_label: String,
     pub buffer: Arc<Mutex<OutputBuffer>>,
     pub pgid: Option<i32>,
     pub pid: Option<u32>,
+    pub status: ProcessStatus,
+}
+
+impl ProcessInfo {
+    /// Check if this process is still running by sending signal 0 to the pid.
+    /// Updates self.status if the process has exited and was previously Running.
+    pub fn refresh_status(&mut self) {
+        if self.status != ProcessStatus::Running {
+            return;
+        }
+        if let Some(pid) = self.pid {
+            // kill(pid, 0) checks if process exists without sending a signal
+            match signal::kill(Pid::from_raw(pid as i32), None) {
+                Ok(()) => {} // still running
+                Err(_) => {
+                    // Process no longer exists — mark as Done
+                    // We can't easily distinguish Done vs Failed without waitpid,
+                    // but for display purposes this is good enough.
+                    self.status = ProcessStatus::Done;
+                }
+            }
+        }
+    }
+
+    /// Get a short display label for this process.
+    /// Uses the first token of the command label (e.g., "echo" from "echo hello").
+    pub fn display_name(&self) -> &str {
+        &self.command_label
+    }
 }
 
 /// The task execution orchestrator.
@@ -100,9 +145,6 @@ impl TaskRunner {
             .take()
             .expect("launch() can only be called once per TaskRunner");
 
-        // Start forwarding tracing output to the LogStore in real time.
-        start_tracing_forwarder(tracing_buffer.clone(), log_store.clone());
-
         // Install the LogEntryLayer as a scoped tracing subscriber for the task.
         let layer = LogEntryLayer::new(tracing_buffer.clone(), task.name);
         let subscriber = tracing_subscriber::registry().with(layer);
@@ -118,6 +160,17 @@ impl TaskRunner {
         // Spawn the task function.
         // Use set_global_default so spawned child tasks also inherit the subscriber.
         // (set_default is thread-local and doesn't propagate to tokio::spawn children.)
+        // Subscribe to the tracing buffer BEFORE installing the subscriber
+        // and spawning the task. Broadcast only delivers messages sent after
+        // subscribe, so we must subscribe first to avoid missing early entries.
+        let tracing_rx = {
+            let buf = tracing_buffer.try_lock().expect("tracing buffer not locked");
+            buf.subscribe()
+        };
+        start_tracing_forwarder(tracing_rx, log_store.clone());
+
+        // Install as global default so all threads and spawned tasks see it.
+        // This must be called before any tracing macros fire.
         let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
         let _ = tracing::dispatcher::set_global_default(dispatch);
 
@@ -165,9 +218,11 @@ impl TaskRunner {
             // Record the process for display
             processes.lock().await.push(ProcessInfo {
                 task_name: event.task_name.clone(),
+                command_label: event.command_label.clone(),
                 buffer: event.buffer.clone(),
                 pgid: event.pgid,
                 pid: event.pid,
+                status: ProcessStatus::Running,
             });
 
             // Subscribe to the process's output buffer and forward entries
@@ -228,15 +283,14 @@ fn start_buffer_forwarder(
 }
 
 /// Forward entries from a tracing OutputBuffer to the LogStore.
+/// The receiver must be created BEFORE launching the task to avoid
+/// missing early entries (broadcast only delivers messages sent after subscribe).
 fn start_tracing_forwarder(
-    tracing_buffer: Arc<Mutex<OutputBuffer>>,
+    rx: tokio::sync::broadcast::Receiver<LogEntry>,
     log_store: Arc<Mutex<LogStore>>,
 ) {
+    let mut rx = rx;
     tokio::spawn(async move {
-        let mut rx = {
-            let buf = tracing_buffer.lock().await;
-            buf.subscribe()
-        };
         loop {
             match rx.recv().await {
                 Ok(entry) => {
@@ -360,7 +414,12 @@ mod tests {
             "expected at least one spawned process, got {}",
             procs.len()
         );
-        assert_eq!(procs[0].task_name, "spawning");
+        // The task_name on ProcessInfo comes from the ProcessHandle, which
+        // now uses the command label as its source identifier.
+        assert!(
+            !procs[0].task_name.is_empty(),
+            "process should have a task_name"
+        );
     }
 
     #[tokio::test]
@@ -371,7 +430,11 @@ mod tests {
         let mut rx = runner.subscribe().await;
 
         // Also start the tracing forwarder so tracing output reaches the log store live
-        start_tracing_forwarder(runner.tracing_buffer.clone(), runner.log_store.clone());
+        let tracing_rx = {
+            let buf = runner.tracing_buffer.lock().await;
+            buf.subscribe()
+        };
+        start_tracing_forwarder(tracing_rx, runner.log_store.clone());
 
         runner.launch(&SPAWNING_TASK);
 

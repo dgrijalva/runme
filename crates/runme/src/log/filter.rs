@@ -509,6 +509,7 @@ mod tests {
     /// Helper to create a simple LogEntry for testing.
     fn make_entry(raw: &str) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: "test".to_string(),
@@ -538,6 +539,7 @@ mod tests {
         );
 
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: "2024-01-01 ERROR connection refused to auth service".to_string(),
             parsed: ParsedContent::PlainText,
             source: "web-server".to_string(),

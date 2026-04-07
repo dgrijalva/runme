@@ -6,6 +6,7 @@ pub mod search;
 pub mod store;
 pub mod stream;
 
+use chrono::Utc;
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -54,6 +55,9 @@ pub struct LogEntry {
     pub source: String,
     /// Sequence number (monotonic within a source).
     pub seq: u64,
+    /// When this entry was received/created (wall clock).
+    /// Always populated — use as fallback when `timestamp` is None.
+    pub received_at: chrono::DateTime<Utc>,
 
     // Well-known fields (populated by FieldExtractor, all optional)
     pub timestamp: Option<String>,
@@ -65,6 +69,40 @@ pub struct LogEntry {
 }
 
 impl LogEntry {
+    /// Create a new LogEntry with `received_at` set to now.
+    pub fn new(
+        raw: String,
+        parsed: ParsedContent,
+        source: String,
+        seq: u64,
+        timestamp: Option<String>,
+        level: Option<String>,
+        message: Option<String>,
+        fields: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            raw,
+            parsed,
+            source,
+            seq,
+            received_at: Utc::now(),
+            timestamp,
+            level,
+            message,
+            fields,
+        }
+    }
+
+    /// Get the best available timestamp string for display.
+    /// Prefers the extracted timestamp from log content; falls back to received_at.
+    pub fn display_timestamp(&self) -> String {
+        if let Some(ts) = &self.timestamp {
+            ts.clone()
+        } else {
+            self.received_at.format("%H:%M:%S%.3f").to_string()
+        }
+    }
+
     /// Get the raw string representation (for compatibility with former LogLine::as_str).
     pub fn as_str(&self) -> String {
         self.raw.clone()

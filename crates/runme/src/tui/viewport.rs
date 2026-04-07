@@ -371,6 +371,7 @@ mod tests {
 
     fn make_entry(raw: &str, source: &str) -> LogEntry {
         LogEntry {
+            received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: source.to_string(),

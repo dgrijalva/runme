@@ -635,6 +635,7 @@ mod tests {
         use super::super::LogEntry;
 
         let entry = LogEntry {
+            received_at: chrono::Utc::now(),
             raw: "test line".to_string(),
             parsed: ParsedContent::PlainText,
             source: "test_task".to_string(),
