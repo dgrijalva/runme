@@ -11,7 +11,6 @@ pub struct DiscoveryResult {
     pub nearest: Option<PathBuf>,
     /// All RUNME.rs files found in the subtree rooted at the nearest RUNME.rs
     /// (walking down), excluding the nearest itself.
-    #[allow(dead_code)]
     pub children: Vec<PathBuf>,
 }
 

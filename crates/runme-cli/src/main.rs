@@ -6,27 +6,37 @@ mod transform;
 
 use std::path::PathBuf;
 
-use compile::compile;
+use compile::compile_workspace;
 use discover::discover;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Determine the RUNME.rs file to run and the arguments to pass through.
+    // Determine discovery starting point and pass-through args.
     //
     // Two modes:
     //   1. Shebang invocation: `runme /path/to/RUNME.rs [args...]`
     //      The OS calls `runme` with the script path as the first argument.
+    //      Discovery starts from the file's parent directory.
     //   2. Discovery mode: `runme [args...]`
     //      Walk up from cwd to find the nearest RUNME.rs.
-    let (runme_file, pass_through_args) = if args.len() > 1 && args[1].ends_with(".rs") {
-        // Shebang mode
+    let (discovery_result, pass_through_args) = if args.len() > 1 && args[1].ends_with(".rs") {
+        // Shebang mode: discover from the file's directory to find full tree
         let file = PathBuf::from(&args[1]);
         if !file.exists() {
             eprintln!("runme: file not found: {}", args[1]);
             std::process::exit(1);
         }
-        (file, args[2..].to_vec())
+        let dir = file.parent().unwrap_or_else(|| {
+            eprintln!("runme: could not determine parent directory of {}", args[1]);
+            std::process::exit(1);
+        });
+        let result = discover(dir);
+        if result.nearest.is_none() {
+            eprintln!("runme: no RUNME.rs found (searched from {})", dir.display());
+            std::process::exit(1);
+        }
+        (result, args[2..].to_vec())
     } else {
         // Discovery mode
         let cwd = std::env::current_dir().unwrap_or_else(|e| {
@@ -35,17 +45,15 @@ fn main() {
         });
 
         let result = discover(&cwd);
-        match result.nearest {
-            Some(path) => (path, args[1..].to_vec()),
-            None => {
-                eprintln!("runme: no RUNME.rs found (searched from {})", cwd.display());
-                std::process::exit(1);
-            }
+        if result.nearest.is_none() {
+            eprintln!("runme: no RUNME.rs found (searched from {})", cwd.display());
+            std::process::exit(1);
         }
+        (result, args[1..].to_vec())
     };
 
-    // Compile (or use cached binary)
-    let compiled = match compile(&runme_file) {
+    // Compile the workspace
+    let compiled = match compile_workspace(&discovery_result) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("runme: compilation failed: {}", e);
@@ -54,7 +62,6 @@ fn main() {
     };
 
     // Exec the compiled binary, replacing this process.
-    // Build the full argv including the binary path as argv[0].
     let mut argv: Vec<&str> = Vec::with_capacity(pass_through_args.len() + 1);
     let binary_str = compiled
         .binary_path
@@ -65,7 +72,6 @@ fn main() {
         argv.push(arg.as_str());
     }
 
-    // Use exec crate for process replacement (replaces current process)
     let err = exec::execvp(&compiled.binary_path, &argv);
     eprintln!(
         "runme: failed to exec {}: {}",
