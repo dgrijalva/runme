@@ -113,8 +113,9 @@ pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
     pub group: &'static str,
-    pub func: TaskFn,
+    pub func: TaskFnKind,             // Static(TaskFn) or Dynamic(Arc<dyn Fn>)
     pub arg_metadata: ArgMetadataFn,  // NEW
+    pub ui_hint: Option<UiHint>,
 }
 ```
 

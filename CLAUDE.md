@@ -26,10 +26,12 @@ The generated runner crate calls `__runme_link()` on each lib crate to ensure `i
 
 ### Task System (runme lib)
 
-Tasks are registered at compile time via `inventory`. The `#[runme::task]` macro generates a `TaskDef` with name, description (from doc comments or `desc` attr), group, watch pattern, dependencies, and a wrapped function pointer.
+Tasks are registered via `inventory` at compile time, or dynamically at init time. The `#[runme::task]` macro generates a `TaskDef` with name, description (from doc comments or `desc` attr), group, and a wrapped function.
 
+- **`TaskDef`** — Task metadata. The `func` field is `TaskFnKind`: either `Static(TaskFn)` (function pointer from `#[runme::task]`, const-constructible for `inventory::submit!`) or `Dynamic(Arc<dyn Fn>)` (closure with captured state, from `InitContext::register_task()`).
 - **`TaskContext`** — Runtime context passed to task functions. Provides `exec()` (run-and-wait) and `spawn()` (background process with handle). All child processes are spawned in their own process group for clean signal delivery.
-- **`Registry`** — Collects `TaskDef`s from inventory, provides lookup and execution.
+- **`Registry`** — Collects `TaskDef`s from inventory + dynamic registration, provides lookup and execution.
+- **`InitContext`** — Passed to `#[runme::init]` hooks. Can set group display name and register dynamic tasks via `register_task()`. Dynamic tasks have their strings leaked to `&'static str` (process-lifetime, bounded count).
 - **`Cmd`** — Value type describing a command. Two modes: structured (`Cmd::new("cargo").args(["build"])`) or shell (`Cmd::shell("echo hi")`). `&str` auto-converts to shell mode.
 
 ### Log Engine

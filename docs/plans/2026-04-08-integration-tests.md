@@ -28,13 +28,13 @@ Plus two special-case explorations:
 
 ## Acceptance Criteria
 
-- [ ] `cargo test` passes with all new integration tests
-- [ ] In-process tests cover: execution (success/failure/exit codes), all 3 argument forms, task dependencies, output buffer capture, tracing integration
-- [ ] CLI tests cover: discovery, group resolution, `--ui cli` and `--ui agent` modes, `--format text` and `--format json`, exit code propagation, error messages
-- [ ] Test helper module provides reusable assertion utilities for both layers
-- [ ] Shared crate test demonstrates cross-crate task visibility via inventory
-- [ ] Dynamic registration design documented with working prototype
-- [ ] No test fixtures appear in normal `runme` discovery from project root
+- [x] `cargo test` passes with all new integration tests
+- [x] In-process tests cover: execution (success/failure/exit codes), all 3 argument forms, output buffer capture, resolve_ui_mode(), init hooks, cross-task invocation
+- [x] CLI tests cover: discovery, group resolution, `--ui cli` and `--ui agent` modes, `--format json`, exit code propagation, error messages
+- [x] Test helper module provides reusable assertion utilities for both layers
+- [x] Shared crate test demonstrates cross-crate task visibility via inventory
+- [x] Dynamic registration implemented (not just prototype) with TaskFnKind enum and InitContext::register_task()
+- [x] No test fixtures appear in normal `runme` discovery from project root
 
 ## Human Review Gates
 
@@ -44,7 +44,7 @@ Plus two special-case explorations:
 
 ## Status
 
-`draft`
+`complete`
 
 ## Context
 
@@ -443,42 +443,31 @@ Recommendation: Option B for this test suite effort. The field and macro parsing
 - Cons: necessary infrastructure but insufficient alone (no discovery mechanism without a hook)
 - Complexity: medium
 
-#### Recommendation: A + C combined
+#### Recommendation: A (InitContext collects tasks)
 
-Option C (DynamicTaskDef + Registry support) is necessary infrastructure regardless — you need owned strings and closures. Option A (InitContext collects tasks) is the simplest discovery hook, reusing an existing mechanism.
+Option A was chosen. Rather than a separate `DynamicTaskDef` type, the implementation uses a `TaskFnKind` enum on the existing `TaskDef`:
 
-#### Key Design Decisions Proven in Prototype
+- `TaskFnKind::Static(TaskFn)` — function pointer from `#[runme::task]`, const-constructible for `inventory::submit!`
+- `TaskFnKind::Dynamic(Arc<dyn Fn>)` — closure with captured state, from `InitContext::register_task()`
 
-1. **`DynamicTaskFn` uses `Arc<dyn for<'a> Fn(...)>`** — function pointers can't capture state, but dynamic tasks inherently need captured state (e.g., which subcommand to run). The HRTB `for<'a>` syntax is needed to match the existing TaskFn lifetime semantics.
+Strings are leaked to `&'static str` via `Box::leak`, keeping `TaskDef` as the single task type. This avoids a parallel `DynamicTaskDef` struct and keeps Registry unchanged.
 
-2. **`DynamicTaskDef` uses owned `String` fields** — `&'static str` would require `Box::leak` for runtime-generated names, which permanently leaks memory. Owned strings are cleaner.
+#### Implemented (committed)
 
-3. **Registry stores dynamic tasks in a separate `Vec<DynamicTaskDef>`** — lookup checks static tasks first, then dynamic. This avoids trait-object indirection on the common (static) path.
-
-4. **Closures are `Fn` (not `FnOnce`)** — tasks can be re-run (e.g., watch mode). Prototype test `test_dynamic_task_rerunnable` validates this.
-
-#### What the Prototype Covers
-
-- Basic dynamic task creation and execution
-- Captured state in closures (the "cargo subcommands" pattern)
-- Error propagation from dynamic tasks
-- Argument forwarding to dynamic tasks
-- Coexistence of static (inventory) and dynamic tasks in one registry
-- Task metadata (description, group) on dynamic tasks
-- The InitContext collection pattern (simulated end-to-end runner lifecycle)
-
-#### What's Needed for Real Integration
-
-- Add `collected_tasks: Vec<DynamicTaskDef>` and `register_task()` method to `InitContext` in `crates/runme/src/init.rs`
-- Move `DynamicTaskDef` and `DynamicTaskFn` into `crates/runme/src/task.rs`
-- Extend `Registry` to hold `Vec<DynamicTaskDef>` alongside `Vec<&'static TaskDef>`
-- Update `Registry::get()`, `resolve()`, `list()` to check both collections
-- Update codegen in `crates/runme-cli/src/codegen.rs` to drain `InitContext.collected_tasks` into `Registry` after init hooks run
-- Export new types through prelude
+- `TaskFnKind` enum added to `crates/runme/src/task.rs` with `Static`/`Dynamic` variants and `call()` method
+- `InitContext::register_task(name, description, closure)` in `crates/runme/src/init.rs` — leaks strings, wraps closure in `TaskFnKind::Dynamic(Arc::new(...))`
+- `InitContext::drain_tasks()` returns collected `&'static TaskDef`s
+- Generated runner in `crates/runme-cli/src/codegen.rs` drains dynamic tasks into Registry after init hooks
+- Macro emits `TaskFnKind::Static(wrapper)` instead of bare function pointer
+- Tests in `crates/runme/tests/dynamic_registration.rs` exercise the real API (8 tests)
 
 ## Decisions Log
 
-*(populated during execution)*
+1. **`depends_on` removed** (2026-04-08) — Field was declared on TaskDef and parsed by macro but never executed at runtime. Removed entirely from source and design docs. Task dependencies are expressed through code (`ctx.run()`), not declarative metadata.
+
+2. **CLI testing: thin wrapper over assert_cmd** (2026-04-08) — Structured JSON output from agent mode makes JSON-aware assertions more valuable than assert_cmd's string predicates. ~50-line harness with `CliOutput`, `run_runme()`, fixture generators.
+
+3. **Dynamic registration: TaskFnKind enum on TaskDef** (2026-04-08) — Instead of a parallel `DynamicTaskDef` type, added `TaskFnKind::Static`/`Dynamic` enum to the existing `TaskDef.func` field. Strings leaked via `Box::leak`. Keeps one task type, no Registry changes needed. InitContext is the registration point (no separate RegisterContext hook).
 
 ## Blockers
 

@@ -157,12 +157,22 @@ pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
     pub group: &'static str,           // matches a GroupDef.key
-    pub watch: Option<&'static str>,
-    pub func: TaskFn,
+    pub func: TaskFnKind,
+    pub arg_metadata: ArgMetadataFn,
+    pub ui_hint: Option<UiHint>,
+}
+
+pub enum TaskFnKind {
+    Static(TaskFn),       // function pointer — from #[runme::task], const-constructible
+    Dynamic(DynamicTaskFn), // Arc<dyn Fn> — from InitContext::register_task(), captures state
 }
 ```
 
-The `#[task]` macro reads `__RUNME_GROUP` (injected by the code generator) and sets `group` at compile time. `InitContext.set_group_name()` modifies the `GroupDef.display_name` for that file's group. This separation means tasks don't need to know about display name overrides — the registry resolves group key to display name at lookup time.
+The `#[task]` macro reads `__RUNME_GROUP` (injected by the code generator) and sets `group` at compile time. It emits `TaskFnKind::Static(wrapper_fn)` for the function.
+
+Dynamic tasks are registered at init time via `InitContext::register_task()`, which leaks name/description/group strings to `&'static str` and wraps the closure in `TaskFnKind::Dynamic(Arc::new(closure))`. The runner drains dynamic tasks from each InitContext into the Registry after init hooks complete.
+
+`InitContext.set_group_name()` modifies the `GroupDef.display_name` for that file's group. This separation means tasks don't need to know about display name overrides — the registry resolves group key to display name at lookup time.
 
 ### Generated Runner Crate
 
