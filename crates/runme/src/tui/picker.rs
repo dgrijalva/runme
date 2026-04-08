@@ -45,23 +45,17 @@ pub struct PickerState {
 
 impl PickerState {
     /// Create a new PickerState from task definitions and group name mappings.
-    pub fn new(
-        tasks: &[&'static TaskDef],
-        group_names: &HashMap<String, String>,
-    ) -> Self {
+    pub fn new(tasks: &[&'static TaskDef], group_names: &HashMap<String, String>) -> Self {
         let mut picker_tasks: Vec<PickerTask> = tasks
             .iter()
             .map(|&task| {
-                let group_display = group_names
-                    .get(task.group)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        if task.group.is_empty() {
-                            ".".to_string()
-                        } else {
-                            task.group.to_string()
-                        }
-                    });
+                let group_display = group_names.get(task.group).cloned().unwrap_or_else(|| {
+                    if task.group.is_empty() {
+                        ".".to_string()
+                    } else {
+                        task.group.to_string()
+                    }
+                });
 
                 let qualified_name = if task.group.is_empty() {
                     task.name.to_string()
@@ -131,11 +125,14 @@ impl PickerState {
                 // Match against qualified name and description.
                 // Name matches get a large bonus so task names win over
                 // incidental matches in descriptions.
-                let name_score = self.matcher.fuzzy_match(&pt.qualified_name, &self.input)
+                let name_score = self
+                    .matcher
+                    .fuzzy_match(&pt.qualified_name, &self.input)
                     .map(|s| s + 1000);
-                let desc_score = pt.task.description.and_then(|d| {
-                    self.matcher.fuzzy_match(d, &self.input)
-                });
+                let desc_score = pt
+                    .task
+                    .description
+                    .and_then(|d| self.matcher.fuzzy_match(d, &self.input));
                 // Take the best score
                 let best = match (name_score, desc_score) {
                     (Some(a), Some(b)) => Some(a.max(b)),
@@ -283,11 +280,7 @@ pub enum PickerItem {
 }
 
 /// Render the task picker full-screen.
-pub fn render_picker(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    picker: &mut PickerState,
-) {
+pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut PickerState) {
     // Ensure selection is within bounds and visible
     picker.ensure_visible(area.height as usize);
 
@@ -303,18 +296,12 @@ pub fn render_picker(
     let input_line = if picker.input.is_empty() {
         Line::from(vec![
             Span::styled(" > ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                "type to filter...",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("type to filter...", Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
             Span::styled(" > ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                picker.input.clone(),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(picker.input.clone(), Style::default().fg(Color::White)),
         ])
     };
     lines.push(input_line);
@@ -330,7 +317,12 @@ pub fn render_picker(
         let visible_start = picker.scroll_offset;
         let visible_count = (area.height as usize).saturating_sub(1); // -1 for input bar
 
-        for (idx, item) in items.iter().enumerate().skip(visible_start).take(visible_count) {
+        for (idx, item) in items
+            .iter()
+            .enumerate()
+            .skip(visible_start)
+            .take(visible_count)
+        {
             let line = match item {
                 PickerItem::GroupHeader(name) => {
                     let display = if name.is_empty() { "." } else { name.as_str() };
@@ -385,7 +377,11 @@ pub fn render_picker(
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Pick a task ")
-        .title_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .border_style(Style::default().fg(Color::DarkGray));
 
     let paragraph = Paragraph::new(lines).block(block);
@@ -443,7 +439,8 @@ mod tests {
     };
 
     fn make_picker() -> PickerState {
-        let tasks: Vec<&'static TaskDef> = vec![&TEST_TASK_A, &TEST_TASK_B, &TEST_TASK_C, &TEST_TASK_D];
+        let tasks: Vec<&'static TaskDef> =
+            vec![&TEST_TASK_A, &TEST_TASK_B, &TEST_TASK_C, &TEST_TASK_D];
         let mut group_names = HashMap::new();
         group_names.insert("".to_string(), ".".to_string());
         group_names.insert("services/auth".to_string(), "services/auth".to_string());
@@ -522,7 +519,11 @@ mod tests {
             })
             .collect();
 
-        assert!(tasks.contains(&"dev"), "expected 'dev' in results: {:?}", tasks);
+        assert!(
+            tasks.contains(&"dev"),
+            "expected 'dev' in results: {:?}",
+            tasks
+        );
     }
 
     #[test]
@@ -543,8 +544,11 @@ mod tests {
             .collect();
 
         // Should include auth group tasks
-        assert!(tasks.contains(&"test") || tasks.contains(&"build"),
-            "expected auth group tasks in results: {:?}", tasks);
+        assert!(
+            tasks.contains(&"test") || tasks.contains(&"build"),
+            "expected auth group tasks in results: {:?}",
+            tasks
+        );
     }
 
     #[test]

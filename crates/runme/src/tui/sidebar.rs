@@ -3,11 +3,11 @@
 //! Renders a sidebar showing the task and its spawned processes with status
 //! indicators. Three sections: Task (top), Running processes, Completed processes.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use super::render::SourceColors;
 use super::runner::{ProcessInfo, ProcessStatus, TaskStatus};
@@ -274,7 +274,7 @@ fn task_status_display(status: &TaskStatus) -> (String, Color) {
         TaskStatus::Setup => ("SETUP".to_string(), Color::Yellow),
         TaskStatus::Ready => ("READY".to_string(), Color::Green),
         TaskStatus::Done => ("DONE".to_string(), Color::DarkGray),
-        TaskStatus::Failed(_) => ("FAIL".to_string(), Color::Red)
+        TaskStatus::Failed(_) => ("FAIL".to_string(), Color::Red),
     }
 }
 
@@ -336,13 +336,8 @@ mod tests {
     #[test]
     fn build_entries_empty() {
         let mut sc = SourceColors::new();
-        let entries = build_sidebar_entries(
-            None,
-            &TaskStatus::Setup,
-            &[],
-            &HashSet::new(),
-            &mut sc,
-        );
+        let entries =
+            build_sidebar_entries(None, &TaskStatus::Setup, &[], &HashSet::new(), &mut sc);
         assert!(entries.is_empty());
     }
 
@@ -364,9 +359,18 @@ mod tests {
 
     #[test]
     fn task_status_display_all_variants() {
-        assert_eq!(task_status_display(&TaskStatus::Setup), ("SETUP".to_string(), Color::Yellow));
-        assert_eq!(task_status_display(&TaskStatus::Ready), ("READY".to_string(), Color::Green));
-        assert_eq!(task_status_display(&TaskStatus::Done), ("DONE".to_string(), Color::DarkGray));
+        assert_eq!(
+            task_status_display(&TaskStatus::Setup),
+            ("SETUP".to_string(), Color::Yellow)
+        );
+        assert_eq!(
+            task_status_display(&TaskStatus::Ready),
+            ("READY".to_string(), Color::Green)
+        );
+        assert_eq!(
+            task_status_display(&TaskStatus::Done),
+            ("DONE".to_string(), Color::DarkGray)
+        );
         let (tag, color) = task_status_display(&TaskStatus::Failed("err".to_string()));
         assert_eq!(tag, "FAIL");
         assert_eq!(color, Color::Red);
@@ -374,12 +378,21 @@ mod tests {
 
     #[test]
     fn process_status_display_all_variants() {
-        assert_eq!(process_status_display(&ProcessStatus::Running), ("RUN".to_string(), Color::Green));
-        assert_eq!(process_status_display(&ProcessStatus::Done), ("DONE".to_string(), Color::DarkGray));
+        assert_eq!(
+            process_status_display(&ProcessStatus::Running),
+            ("RUN".to_string(), Color::Green)
+        );
+        assert_eq!(
+            process_status_display(&ProcessStatus::Done),
+            ("DONE".to_string(), Color::DarkGray)
+        );
         let (tag, color) = process_status_display(&ProcessStatus::Failed(1));
         assert_eq!(tag, "FAIL:1");
         assert_eq!(color, Color::Red);
-        assert_eq!(process_status_display(&ProcessStatus::Stopped), ("STOP".to_string(), Color::Yellow));
+        assert_eq!(
+            process_status_display(&ProcessStatus::Stopped),
+            ("STOP".to_string(), Color::Yellow)
+        );
     }
 
     #[test]
@@ -413,13 +426,8 @@ mod tests {
         let mut visible = HashSet::new();
         visible.insert("visible-source".to_string());
 
-        let entries = build_sidebar_entries(
-            Some("my-task"),
-            &TaskStatus::Ready,
-            &[],
-            &visible,
-            &mut sc,
-        );
+        let entries =
+            build_sidebar_entries(Some("my-task"), &TaskStatus::Ready, &[], &visible, &mut sc);
         // Task name "my-task" is not in the visible set, so not visible
         assert!(!entries[0].visible);
     }

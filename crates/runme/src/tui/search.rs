@@ -6,11 +6,11 @@
 use std::ops::Range;
 
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 /// State for the search feature.
@@ -237,10 +237,7 @@ pub fn render_search_input(frame: &mut Frame, area: Rect, search_state: &SearchS
     let mut spans: Vec<Span> = Vec::new();
 
     // Prefix
-    spans.push(Span::styled(
-        " /",
-        Style::default().fg(Color::Yellow),
-    ));
+    spans.push(Span::styled(" /", Style::default().fg(Color::Yellow)));
 
     if search_state.text.is_empty() {
         // Placeholder
@@ -279,8 +276,8 @@ pub fn render_search_input(frame: &mut Frame, area: Rect, search_state: &SearchS
     }
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line)
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let paragraph =
+        Paragraph::new(line).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     frame.render_widget(paragraph, area);
 }
 
@@ -316,9 +313,7 @@ pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
 
 /// Style for highlighting search matches (non-current).
 pub fn match_highlight_style() -> Style {
-    Style::default()
-        .bg(Color::Yellow)
-        .fg(Color::Black)
+    Style::default().bg(Color::Yellow).fg(Color::Black)
 }
 
 /// Style for highlighting the current search match (where n/N is focused).
@@ -509,11 +504,7 @@ mod tests {
         }
         state.confirm();
 
-        let texts = vec![
-            (0, "ERROR: fail"),
-            (1, "error: problem"),
-            (2, "no match"),
-        ];
+        let texts = vec![(0, "ERROR: fail"), (1, "error: problem"), (2, "no match")];
         state.scan_matches(texts.into_iter());
         assert_eq!(state.match_indices, vec![0, 1]);
     }

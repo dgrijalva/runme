@@ -1,6 +1,8 @@
 pub mod app;
 pub mod event;
 pub mod filter;
+pub mod frame;
+pub mod keys;
 pub mod output;
 pub mod picker;
 pub mod render;

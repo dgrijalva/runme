@@ -13,7 +13,7 @@ pub fn transform_source(source: &str, group: &str) -> String {
     // Strip //! frontmatter lines — they've already been parsed into Cargo.toml
     // by the frontmatter module. Leaving them in causes compiler errors since
     // they appear after the injected const.
-    let without_frontmatter = strip_frontmatter(&stripped);
+    let without_frontmatter = strip_frontmatter(stripped);
 
     // Escape any special characters in the group string for a Rust string literal.
     // In practice group strings are path-derived (e.g. "services/auth") but be safe.
@@ -113,7 +113,8 @@ mod tests {
     #[test]
     fn test_shebang_and_frontmatter_comments_both_present() {
         // Both shebang and //! frontmatter are stripped from transformed output.
-        let source = "#!/usr/bin/env runme\n//! [dependencies]\n//! tokio = \"1\"\n\nfn work() {}\n";
+        let source =
+            "#!/usr/bin/env runme\n//! [dependencies]\n//! tokio = \"1\"\n\nfn work() {}\n";
         let result = transform_source(source, "infra");
         assert!(result.starts_with("const __RUNME_GROUP: &str = \"infra\";\n"));
         assert!(!result.contains("#!/usr/bin/env runme"));

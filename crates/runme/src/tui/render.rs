@@ -113,14 +113,11 @@ fn render_preview(
     );
 
     // Message: use extracted message, fall back to raw
-    let message = entry
-        .message
-        .as_deref()
-        .unwrap_or(&entry.raw)
-        .to_string();
+    let message = entry.message.as_deref().unwrap_or(&entry.raw).to_string();
 
     // Calculate prefix width (columns before message)
-    let prefix_width = TIMESTAMP_WIDTH + COLUMN_GAP + LEVEL_WIDTH + COLUMN_GAP + SOURCE_WIDTH + COLUMN_GAP;
+    let prefix_width =
+        TIMESTAMP_WIDTH + COLUMN_GAP + LEVEL_WIDTH + COLUMN_GAP + SOURCE_WIDTH + COLUMN_GAP;
     let gap = " ".repeat(COLUMN_GAP);
 
     if !wrap {
@@ -421,7 +418,11 @@ mod tests {
         assert_eq!(height, 1);
         // The combined width should not exceed terminal width
         let total_width: usize = lines[0].spans.iter().map(|s| s.content.len()).sum();
-        assert!(total_width <= 80, "line width {} exceeds terminal width 80", total_width);
+        assert!(
+            total_width <= 80,
+            "line width {} exceeds terminal width 80",
+            total_width
+        );
     }
 
     #[test]
@@ -493,19 +494,32 @@ mod tests {
         assert!(height > 1, "long message should wrap to multiple lines");
         assert_eq!(lines.len(), height);
         // First line has prefix spans; continuation lines are indented
-        assert!(lines[0].spans.len() > 2, "first line should have prefix spans");
+        assert!(
+            lines[0].spans.len() > 2,
+            "first line should have prefix spans"
+        );
     }
 
     // -- Raw mode, truncated --
 
     #[test]
     fn raw_truncated_basic() {
-        let entry = make_entry("Hello world raw output", "api", Some("info"), Some("msg"), None);
+        let entry = make_entry(
+            "Hello world raw output",
+            "api",
+            Some("info"),
+            Some("msg"),
+            None,
+        );
         let mut sc = SourceColors::new();
         let (lines, height) = render_entry(&entry, 80, DisplayMode::Raw, false, &mut sc);
         assert_eq!(height, 1);
         assert_eq!(lines.len(), 1);
-        let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert_eq!(text, "Hello world raw output");
     }
 
@@ -516,7 +530,11 @@ mod tests {
         let mut sc = SourceColors::new();
         let (lines, height) = render_entry(&entry, 50, DisplayMode::Raw, false, &mut sc);
         assert_eq!(height, 1);
-        let text: String = lines[0].spans.iter().map(|s| s.content.to_string()).collect();
+        let text: String = lines[0]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
         assert_eq!(text.len(), 50);
     }
 
@@ -567,10 +585,22 @@ mod tests {
 
     #[test]
     fn test_format_level() {
-        assert_eq!(format_level(&Some("error".to_string())), ("ERROR".to_string(), Color::Red));
-        assert_eq!(format_level(&Some("warn".to_string())), ("WARN".to_string(), Color::Yellow));
-        assert_eq!(format_level(&Some("info".to_string())), ("INFO".to_string(), Color::Green));
-        assert_eq!(format_level(&Some("debug".to_string())), ("DEBUG".to_string(), Color::DarkGray));
+        assert_eq!(
+            format_level(&Some("error".to_string())),
+            ("ERROR".to_string(), Color::Red)
+        );
+        assert_eq!(
+            format_level(&Some("warn".to_string())),
+            ("WARN".to_string(), Color::Yellow)
+        );
+        assert_eq!(
+            format_level(&Some("info".to_string())),
+            ("INFO".to_string(), Color::Green)
+        );
+        assert_eq!(
+            format_level(&Some("debug".to_string())),
+            ("DEBUG".to_string(), Color::DarkGray)
+        );
         assert_eq!(format_level(&None), ("---".to_string(), Color::DarkGray));
     }
 }

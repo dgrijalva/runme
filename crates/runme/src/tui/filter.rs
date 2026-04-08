@@ -4,11 +4,11 @@
 //! Renders in the status bar area when active, with inline parse error display.
 
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
     widgets::Paragraph,
-    Frame,
 };
 
 use crate::log::filter::{self, FilterExpr};
@@ -178,10 +178,7 @@ pub fn render_filter_input(frame: &mut Frame, area: Rect, filter_state: &FilterI
     let mut spans: Vec<Span> = Vec::new();
 
     // Prefix
-    spans.push(Span::styled(
-        " filter: ",
-        Style::default().fg(Color::Cyan),
-    ));
+    spans.push(Span::styled(" filter: ", Style::default().fg(Color::Cyan)));
 
     if filter_state.text.is_empty() {
         // Placeholder
@@ -228,8 +225,8 @@ pub fn render_filter_input(frame: &mut Frame, area: Rect, filter_state: &FilterI
     }
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line)
-        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let paragraph =
+        Paragraph::new(line).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     frame.render_widget(paragraph, area);
 }
 

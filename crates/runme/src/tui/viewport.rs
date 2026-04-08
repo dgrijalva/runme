@@ -67,7 +67,15 @@ pub fn layout(
         ScrollState::Tail => {
             let cursor = entries.len() - 1;
             // Compute top so the last entry is at the bottom
-            let top = compute_top_for_bottom(cursor, entries, viewport_height, width, mode, wrap, source_colors);
+            let top = compute_top_for_bottom(
+                cursor,
+                entries,
+                viewport_height,
+                width,
+                mode,
+                wrap,
+                source_colors,
+            );
             (cursor, top)
         }
         ScrollState::Pinned { cursor, top } => {
@@ -145,7 +153,16 @@ pub fn scroll_down(
                 return ScrollState::Tail;
             }
             let new_cursor = cursor + 1;
-            let new_top = adjust_top_for_cursor(new_cursor, top, entries, viewport_height, width, mode, wrap, source_colors);
+            let new_top = adjust_top_for_cursor(
+                new_cursor,
+                top,
+                entries,
+                viewport_height,
+                width,
+                mode,
+                wrap,
+                source_colors,
+            );
             ScrollState::Pinned {
                 cursor: new_cursor,
                 top: new_top,
@@ -174,8 +191,25 @@ pub fn scroll_up(
                 return ScrollState::Pinned { cursor: 0, top: 0 };
             }
             let cursor = entries.len() - 2;
-            let top = compute_top_for_bottom(entries.len() - 1, entries, viewport_height, width, mode, wrap, source_colors);
-            let top = adjust_top_for_cursor(cursor, top, entries, viewport_height, width, mode, wrap, source_colors);
+            let top = compute_top_for_bottom(
+                entries.len() - 1,
+                entries,
+                viewport_height,
+                width,
+                mode,
+                wrap,
+                source_colors,
+            );
+            let top = adjust_top_for_cursor(
+                cursor,
+                top,
+                entries,
+                viewport_height,
+                width,
+                mode,
+                wrap,
+                source_colors,
+            );
             ScrollState::Pinned { cursor, top }
         }
         ScrollState::Pinned { cursor, top } => {
@@ -183,7 +217,16 @@ pub fn scroll_up(
                 return ScrollState::Pinned { cursor: 0, top: 0 };
             }
             let new_cursor = cursor - 1;
-            let new_top = adjust_top_for_cursor(new_cursor, top, entries, viewport_height, width, mode, wrap, source_colors);
+            let new_top = adjust_top_for_cursor(
+                new_cursor,
+                top,
+                entries,
+                viewport_height,
+                width,
+                mode,
+                wrap,
+                source_colors,
+            );
             ScrollState::Pinned {
                 cursor: new_cursor,
                 top: new_top,
@@ -222,7 +265,16 @@ pub fn scroll_down_half_page(
         ScrollState::Pinned { top, .. } => top,
         _ => 0,
     };
-    let new_top = adjust_top_for_cursor(new_cursor, top, entries, viewport_height, width, mode, wrap, source_colors);
+    let new_top = adjust_top_for_cursor(
+        new_cursor,
+        top,
+        entries,
+        viewport_height,
+        width,
+        mode,
+        wrap,
+        source_colors,
+    );
 
     ScrollState::Pinned {
         cursor: new_cursor,
@@ -254,9 +306,26 @@ pub fn scroll_up_half_page(
 
     let top = match *scroll {
         ScrollState::Pinned { top, .. } => top,
-        ScrollState::Tail => compute_top_for_bottom(entries.len() - 1, entries, viewport_height, width, mode, wrap, source_colors),
+        ScrollState::Tail => compute_top_for_bottom(
+            entries.len() - 1,
+            entries,
+            viewport_height,
+            width,
+            mode,
+            wrap,
+            source_colors,
+        ),
     };
-    let new_top = adjust_top_for_cursor(new_cursor, top, entries, viewport_height, width, mode, wrap, source_colors);
+    let new_top = adjust_top_for_cursor(
+        new_cursor,
+        top,
+        entries,
+        viewport_height,
+        width,
+        mode,
+        wrap,
+        source_colors,
+    );
 
     ScrollState::Pinned {
         cursor: new_cursor,
@@ -290,6 +359,7 @@ pub fn new_entries_since_pin(scroll: &ScrollState, total: usize) -> usize {
 
 /// Ensure the cursor is visible within the viewport with proper margins.
 /// Returns the adjusted `top` value.
+#[allow(clippy::too_many_arguments)]
 fn adjust_top_for_cursor(
     cursor: usize,
     current_top: usize,
@@ -331,11 +401,16 @@ fn adjust_top_for_cursor(
         let mut top = current_top;
 
         // Compute Y of cursor relative to current top
-        for i in top..=cursor.min(entries.len() - 1) {
+        for (i, entry) in entries
+            .iter()
+            .enumerate()
+            .take(cursor.min(entries.len() - 1) + 1)
+            .skip(top)
+        {
             if i == cursor {
                 break;
             }
-            let (_, h) = render_entry(&entries[i], width, mode, wrap, source_colors);
+            let (_, h) = render_entry(entry, width, mode, wrap, source_colors);
             y += h;
         }
 
@@ -345,7 +420,13 @@ fn adjust_top_for_cursor(
         }
 
         // Cursor below the bottom margin
-        let (_, cursor_h) = render_entry(&entries[cursor.min(entries.len() - 1)], width, mode, wrap, source_colors);
+        let (_, cursor_h) = render_entry(
+            &entries[cursor.min(entries.len() - 1)],
+            width,
+            mode,
+            wrap,
+            source_colors,
+        );
         if y + cursor_h + margin > vh {
             // Need to scroll down: recompute top
             // Walk backward from cursor to find new top
@@ -393,7 +474,15 @@ mod tests {
     #[test]
     fn layout_empty() {
         let mut sc = SourceColors::new();
-        let result = layout(&ScrollState::Tail, &[], 24, 80, DisplayMode::Preview, false, &mut sc);
+        let result = layout(
+            &ScrollState::Tail,
+            &[],
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         assert!(result.entries.is_empty());
     }
 
@@ -401,7 +490,15 @@ mod tests {
     fn layout_tail_single() {
         let entries = make_entries(1);
         let mut sc = SourceColors::new();
-        let result = layout(&ScrollState::Tail, &entries, 24, 80, DisplayMode::Preview, false, &mut sc);
+        let result = layout(
+            &ScrollState::Tail,
+            &entries,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].is_cursor);
     }
@@ -410,7 +507,15 @@ mod tests {
     fn layout_tail_fills_viewport() {
         let entries = make_entries(30);
         let mut sc = SourceColors::new();
-        let result = layout(&ScrollState::Tail, &entries, 10, 80, DisplayMode::Preview, false, &mut sc);
+        let result = layout(
+            &ScrollState::Tail,
+            &entries,
+            10,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         // Should show ~10 entries (last ones)
         assert!(result.entries.len() <= 10);
         // Last entry should be the cursor
@@ -424,7 +529,15 @@ mod tests {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
         let state = ScrollState::Pinned { cursor: 5, top: 0 };
-        let next = scroll_down(&state, &entries, 24, 80, DisplayMode::Preview, false, &mut sc);
+        let next = scroll_down(
+            &state,
+            &entries,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         match next {
             ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 6),
             _ => panic!("expected Pinned"),
@@ -436,7 +549,15 @@ mod tests {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
         let state = ScrollState::Pinned { cursor: 9, top: 0 };
-        let next = scroll_down(&state, &entries, 24, 80, DisplayMode::Preview, false, &mut sc);
+        let next = scroll_down(
+            &state,
+            &entries,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         assert_eq!(next, ScrollState::Tail);
     }
 
@@ -445,7 +566,15 @@ mod tests {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
         let state = ScrollState::Pinned { cursor: 10, top: 5 };
-        let next = scroll_up(&state, &entries, 24, 80, DisplayMode::Preview, false, &mut sc);
+        let next = scroll_up(
+            &state,
+            &entries,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         match next {
             ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 9),
             _ => panic!("expected Pinned"),
@@ -456,7 +585,15 @@ mod tests {
     fn scroll_up_from_tail() {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
-        let next = scroll_up(&ScrollState::Tail, &entries, 24, 80, DisplayMode::Preview, false, &mut sc);
+        let next = scroll_up(
+            &ScrollState::Tail,
+            &entries,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         match next {
             ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 18),
             _ => panic!("expected Pinned"),
@@ -468,14 +605,28 @@ mod tests {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
         let state = ScrollState::Pinned { cursor: 0, top: 0 };
-        let next = scroll_up(&state, &entries, 24, 80, DisplayMode::Preview, false, &mut sc);
+        let next = scroll_up(
+            &state,
+            &entries,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         assert_eq!(next, ScrollState::Pinned { cursor: 0, top: 0 });
     }
 
     #[test]
     fn scroll_to_top_works() {
         let entries = make_entries(20);
-        let next = scroll_to_top(&ScrollState::Pinned { cursor: 15, top: 10 }, &entries);
+        let next = scroll_to_top(
+            &ScrollState::Pinned {
+                cursor: 15,
+                top: 10,
+            },
+            &entries,
+        );
         assert_eq!(next, ScrollState::Pinned { cursor: 0, top: 0 });
     }
 
@@ -491,7 +642,15 @@ mod tests {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
         let state = ScrollState::Pinned { cursor: 3, top: 0 };
-        let result = layout(&state, &entries, 24, 80, DisplayMode::Preview, false, &mut sc);
+        let result = layout(
+            &state,
+            &entries,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         // Entry 3 should be the cursor
         let cursor_entry = result.entries.iter().find(|e| e.entry_index == 3).unwrap();
         assert!(cursor_entry.is_cursor);
@@ -508,7 +667,16 @@ mod tests {
         let entries = make_entries(30);
         let mut sc = SourceColors::new();
         // Cursor at 15, viewport height 10, top at 0 — cursor is way below viewport
-        let top = adjust_top_for_cursor(15, 0, &entries, 10, 80, DisplayMode::Preview, false, &mut sc);
+        let top = adjust_top_for_cursor(
+            15,
+            0,
+            &entries,
+            10,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+        );
         // top should adjust so cursor is visible with margin
         assert!(top > 0);
         assert!(15 >= top + SCROLL_MARGIN as usize);
@@ -522,7 +690,10 @@ mod tests {
 
     #[test]
     fn new_entries_since_pin_pinned() {
-        let state = ScrollState::Pinned { cursor: 50, top: 40 };
+        let state = ScrollState::Pinned {
+            cursor: 50,
+            top: 40,
+        };
         assert_eq!(new_entries_since_pin(&state, 100), 49);
     }
 }

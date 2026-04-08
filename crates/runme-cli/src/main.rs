@@ -1,3 +1,4 @@
+mod codegen;
 mod compile;
 mod crate_name;
 mod discover;

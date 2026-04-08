@@ -180,7 +180,9 @@ impl TaskRunner {
         // and spawning the task. Broadcast only delivers messages sent after
         // subscribe, so we must subscribe first to avoid missing early entries.
         let tracing_rx = {
-            let buf = tracing_buffer.try_lock().expect("tracing buffer not locked");
+            let buf = tracing_buffer
+                .try_lock()
+                .expect("tracing buffer not locked");
             buf.subscribe()
         };
         start_tracing_forwarder(tracing_rx, log_store.clone());
@@ -470,10 +472,7 @@ mod tests {
         }
 
         // Should have received at least the tracing output and the spawned process output
-        assert!(
-            !entries.is_empty(),
-            "expected log entries but got none"
-        );
+        assert!(!entries.is_empty(), "expected log entries but got none");
     }
 
     #[tokio::test]

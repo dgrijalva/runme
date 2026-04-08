@@ -63,12 +63,14 @@ impl TuiOutput {
 
     /// Copy current entries from an Output snapshot, preserving stdout/stderr mapping.
     pub async fn append(&mut self, output: &Output) {
-        self.append_with_target(output, TargetStream::Preserve).await;
+        self.append_with_target(output, TargetStream::Preserve)
+            .await;
     }
 
     /// Subscribe to live output, preserving stdout/stderr mapping.
     pub async fn subscribe(&mut self, output: &Output) {
-        self.subscribe_with_target(output, TargetStream::Preserve).await;
+        self.subscribe_with_target(output, TargetStream::Preserve)
+            .await;
     }
 
     /// Get a stream-targeted handle for stdout.
@@ -101,10 +103,7 @@ impl TuiOutput {
     async fn append_with_target(&mut self, output: &Output, target: TargetStream) {
         let entries = output.entries().await;
         for entry in entries {
-            self.entries.push(StagedEntry {
-                entry,
-                target,
-            });
+            self.entries.push(StagedEntry { entry, target });
         }
     }
 
@@ -218,12 +217,16 @@ pub struct TuiOutputStream<'a> {
 impl<'a> TuiOutputStream<'a> {
     /// Copy current entries from an Output snapshot, forcing them to this stream.
     pub async fn append(&mut self, output: &Output) {
-        self.tui_output.append_with_target(output, self.target).await;
+        self.tui_output
+            .append_with_target(output, self.target)
+            .await;
     }
 
     /// Subscribe to live output, forcing entries to this stream.
     pub async fn subscribe(&mut self, output: &Output) {
-        self.tui_output.subscribe_with_target(output, self.target).await;
+        self.tui_output
+            .subscribe_with_target(output, self.target)
+            .await;
     }
 
     /// Write literal text to this stream.
@@ -305,12 +308,20 @@ pub struct TuiOutputStreamHandle {
 impl TuiOutputStreamHandle {
     /// Copy current entries from an Output snapshot, forcing to this stream.
     pub async fn append(&self, output: &Output) {
-        self.inner.lock().await.append_with_target(output, self.target).await;
+        self.inner
+            .lock()
+            .await
+            .append_with_target(output, self.target)
+            .await;
     }
 
     /// Subscribe to live output, forcing entries to this stream.
     pub async fn subscribe(&self, output: &Output) {
-        self.inner.lock().await.subscribe_with_target(output, self.target).await;
+        self.inner
+            .lock()
+            .await
+            .subscribe_with_target(output, self.target)
+            .await;
     }
 
     /// Write literal text to this stream.
@@ -353,7 +364,8 @@ mod tests {
         let output = make_test_output(vec![
             ("stdout line", Some(Stream::Stdout)),
             ("stderr line", Some(Stream::Stderr)),
-        ]).await;
+        ])
+        .await;
 
         let mut tui_output = TuiOutput::new();
         tui_output.append(&output).await;
@@ -368,7 +380,8 @@ mod tests {
         let output = make_test_output(vec![
             ("line 1", Some(Stream::Stdout)),
             ("line 2", Some(Stream::Stderr)),
-        ]).await;
+        ])
+        .await;
 
         let mut tui_output = TuiOutput::new();
         tui_output.stderr().append(&output).await;
@@ -384,7 +397,8 @@ mod tests {
         let output = make_test_output(vec![
             ("line 1", Some(Stream::Stdout)),
             ("line 2", Some(Stream::Stderr)),
-        ]).await;
+        ])
+        .await;
 
         let mut tui_output = TuiOutput::new();
         tui_output.stdout().append(&output).await;
@@ -490,9 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_append() {
-        let output = make_test_output(vec![
-            ("line a", Some(Stream::Stdout)),
-        ]).await;
+        let output = make_test_output(vec![("line a", Some(Stream::Stdout))]).await;
 
         let tui_output = Arc::new(Mutex::new(TuiOutput::new()));
         let handle = TuiOutputHandle::new(tui_output);
@@ -505,9 +517,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_stderr_append() {
-        let output = make_test_output(vec![
-            ("line b", Some(Stream::Stdout)),
-        ]).await;
+        let output = make_test_output(vec![("line b", Some(Stream::Stdout))]).await;
 
         let tui_output = Arc::new(Mutex::new(TuiOutput::new()));
         let handle = TuiOutputHandle::new(tui_output);
@@ -520,9 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_entries_without_stream_default_to_stderr() {
-        let output = make_test_output(vec![
-            ("tracing entry", None),
-        ]).await;
+        let output = make_test_output(vec![("tracing entry", None)]).await;
 
         let mut tui_output = TuiOutput::new();
         tui_output.append(&output).await;

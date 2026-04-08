@@ -81,6 +81,7 @@ pub struct LogEntry {
 
 impl LogEntry {
     /// Create a new LogEntry with `received_at` set to now.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raw: String,
         parsed: ParsedContent,

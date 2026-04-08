@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,10 @@ impl WatchInfo {
         self.last_triggered = Some(Instant::now());
     }
 }
+
+/// Result type for watcher setup functions.
+type WatchSetupResult<T> =
+    Result<(mpsc::UnboundedReceiver<T>, Arc<Mutex<WatchInfo>>, PathBuf), WatchError>;
 
 /// A watch handle that receives events of type `T`.
 ///
@@ -170,10 +174,10 @@ fn split_glob_prefix(pattern: &str) -> (&str, &str) {
 ///
 /// Returns the actual directory to watch and the glob pattern to match against.
 /// The directory prefix from the pattern is resolved relative to `base_dir`.
-fn resolve_watch_target(pattern: &str, base_dir: &PathBuf) -> (PathBuf, String) {
+fn resolve_watch_target(pattern: &str, base_dir: &Path) -> (PathBuf, String) {
     let (prefix, glob_part) = split_glob_prefix(pattern);
     let actual_dir = if prefix.is_empty() {
-        base_dir.clone()
+        base_dir.to_path_buf()
     } else {
         let resolved = base_dir.join(prefix);
         // Canonicalize to resolve .. components, fall back to the joined path
@@ -186,7 +190,7 @@ fn resolve_watch_target(pattern: &str, base_dir: &PathBuf) -> (PathBuf, String) 
 ///
 /// Returns the watcher (must be kept alive) and a receiver for events.
 fn create_notify_watcher(
-    watch_dir: &PathBuf,
+    watch_dir: &Path,
 ) -> Result<(RecommendedWatcher, mpsc::UnboundedReceiver<Event>), WatchError> {
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
@@ -219,7 +223,7 @@ fn create_notify_watcher(
 pub(crate) fn start_file_watcher(
     pattern: &str,
     watch_dir: PathBuf,
-) -> Result<(mpsc::UnboundedReceiver<Vec<PathBuf>>, Arc<Mutex<WatchInfo>>, PathBuf), WatchError> {
+) -> WatchSetupResult<Vec<PathBuf>> {
     let (actual_dir, glob_part) = resolve_watch_target(pattern, &watch_dir);
     let glob = Glob::new(&glob_part).map_err(|e| WatchError::InvalidGlob(e.to_string()))?;
     let matcher = glob.compile_matcher();
@@ -232,7 +236,9 @@ pub(crate) fn start_file_watcher(
 
     // Spawn a background task to debounce and filter events
     let dir_clone = actual_dir.clone();
-    tokio::spawn(debounce_glob_loop(event_rx, tx, matcher, dir_clone, watcher));
+    tokio::spawn(debounce_glob_loop(
+        event_rx, tx, matcher, dir_clone, watcher,
+    ));
 
     Ok((rx, info, actual_dir))
 }
@@ -246,7 +252,7 @@ pub(crate) fn start_filtered_watcher<F, T>(
     pattern: &str,
     watch_dir: PathBuf,
     filter_fn: F,
-) -> Result<(mpsc::UnboundedReceiver<T>, Arc<Mutex<WatchInfo>>, PathBuf), WatchError>
+) -> WatchSetupResult<T>
 where
     F: Fn(&[PathBuf]) -> Option<T> + Send + 'static,
     T: Send + 'static,
@@ -259,7 +265,9 @@ where
 
     // Spawn a background task to debounce and run the filter
     let dir_clone = actual_dir.clone();
-    tokio::spawn(debounce_filter_loop(event_rx, tx, filter_fn, dir_clone, watcher));
+    tokio::spawn(debounce_filter_loop(
+        event_rx, tx, filter_fn, dir_clone, watcher,
+    ));
 
     Ok((rx, info, actual_dir))
 }
@@ -310,11 +318,10 @@ async fn debounce_glob_loop(
                             })
                             .collect();
 
-                        if !matched.is_empty() {
-                            if tx.send(matched).is_err() {
+                        if !matched.is_empty()
+                            && tx.send(matched).is_err() {
                                 return; // receiver dropped
                             }
-                        }
                     }
                     deadline = None;
                 }
@@ -373,11 +380,10 @@ async fn debounce_filter_loop<F, T>(
                             .drain(..)
                             .map(|p| p.strip_prefix(&watch_dir).map(|r| r.to_path_buf()).unwrap_or(p))
                             .collect();
-                        if let Some(value) = filter_fn(&paths) {
-                            if tx.send(value).is_err() {
+                        if let Some(value) = filter_fn(&paths)
+                            && tx.send(value).is_err() {
                                 return;
                             }
-                        }
                     }
                     deadline = None;
                 }
@@ -452,10 +458,7 @@ mod tests {
 
     #[test]
     fn test_glob_filter_no_matches() {
-        let paths = vec![
-            PathBuf::from("src/main.rs"),
-            PathBuf::from("Cargo.toml"),
-        ];
+        let paths = vec![PathBuf::from("src/main.rs"), PathBuf::from("Cargo.toml")];
 
         let result = glob_filter("**/*.py", &paths);
         assert!(result.is_empty());
@@ -572,10 +575,8 @@ mod tests {
     async fn test_file_watch_ignores_non_matching() {
         use std::fs;
 
-        let tmp = std::env::temp_dir().join(format!(
-            "runme_watch_nomatch_test_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("runme_watch_nomatch_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
@@ -602,10 +603,8 @@ mod tests {
     async fn test_filtered_watcher() {
         use std::fs;
 
-        let tmp = std::env::temp_dir().join(format!(
-            "runme_watch_filter_test_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("runme_watch_filter_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
@@ -631,10 +630,7 @@ mod tests {
         fs::write(tmp.join("main.rs"), "fn main() {}").unwrap();
 
         let result = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-        assert!(
-            result.is_ok(),
-            "timed out waiting for filtered watch event"
-        );
+        assert!(result.is_ok(), "timed out waiting for filtered watch event");
         let count = result.unwrap().unwrap();
         assert!(count >= 1);
 

@@ -131,7 +131,7 @@ impl TaskContext {
     ///
     /// The TUI runner uses this to forward exec output to the LogStore.
     pub fn output_buffer(&self) -> &Mutex<OutputBuffer> {
-        &*self.output
+        &self.output
     }
 
     /// Control whether the TUI stays open after the task completes.

@@ -116,11 +116,7 @@ impl ProcessResult {
     /// Returns `Ok(self)` on success (exit code 0), `Err(self)` otherwise.
     /// On the error path, `ProcessResult` converts into `TaskError` via `From`.
     pub fn ok(self) -> Result<ProcessResult, ProcessResult> {
-        if self.success() {
-            Ok(self)
-        } else {
-            Err(self)
-        }
+        if self.success() { Ok(self) } else { Err(self) }
     }
 }
 
@@ -152,6 +148,7 @@ fn build_log_entry(
 }
 
 /// Drain records from a buffer using the parser, pushing entries into the output buffer.
+#[allow(clippy::too_many_arguments)]
 fn drain_records(
     buf: &mut BytesMut,
     eof: bool,
@@ -179,6 +176,7 @@ fn drain_records(
 }
 
 /// Drain records from a buffer (async version for spawn background tasks).
+#[allow(clippy::too_many_arguments)]
 async fn drain_records_async(
     buf: &mut BytesMut,
     eof: bool,

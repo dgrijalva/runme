@@ -5,14 +5,14 @@
 //! as `LogEntry` records pushed to an `OutputBuffer`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
-use tracing::field::{Field, Visit};
 use tracing::Subscriber;
-use tracing_subscriber::layer::Context;
+use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
 use crate::log::buffer::OutputBuffer;
 use crate::log::{LogEntry, ParsedContent};
@@ -81,10 +81,8 @@ impl Visit for FieldCollector {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::json!(value),
-            );
+            self.fields
+                .insert(field.name().to_string(), serde_json::json!(value));
         }
     }
 
@@ -92,10 +90,8 @@ impl Visit for FieldCollector {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::json!(value),
-            );
+            self.fields
+                .insert(field.name().to_string(), serde_json::json!(value));
         }
     }
 
@@ -103,10 +99,8 @@ impl Visit for FieldCollector {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::json!(value),
-            );
+            self.fields
+                .insert(field.name().to_string(), serde_json::json!(value));
         }
     }
 
@@ -114,10 +108,8 @@ impl Visit for FieldCollector {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::json!(value),
-            );
+            self.fields
+                .insert(field.name().to_string(), serde_json::json!(value));
         }
     }
 }

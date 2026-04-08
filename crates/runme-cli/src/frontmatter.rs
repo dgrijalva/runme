@@ -153,9 +153,7 @@ fn rewrite_path_in_value(value: &str, original_dir: &std::path::Path) -> String 
     // Resolve relative to the original RUNME.rs directory
     let resolved = original_dir.join(rel_path);
     // Canonicalize if the path exists, otherwise just use the joined path
-    let abs_path = resolved
-        .canonicalize()
-        .unwrap_or(resolved);
+    let abs_path = resolved.canonicalize().unwrap_or(resolved);
 
     // Rebuild the value string with the absolute path
     let before = &value[..quote_start_in_value + 1]; // up to and including opening quote
@@ -173,18 +171,12 @@ fn find_path_key(value: &str) -> Option<usize> {
         let abs_pos = search_from + pos;
 
         // Check that it's a key boundary (not part of a larger word)
-        let before_ok = abs_pos == 0
-            || matches!(
-                value.as_bytes()[abs_pos - 1],
-                b' ' | b'\t' | b'{' | b','
-            );
+        let before_ok =
+            abs_pos == 0 || matches!(value.as_bytes()[abs_pos - 1], b' ' | b'\t' | b'{' | b',');
 
         let after_pos = abs_pos + 4;
-        let after_ok = after_pos >= value.len()
-            || matches!(
-                value.as_bytes()[after_pos],
-                b' ' | b'\t' | b'='
-            );
+        let after_ok =
+            after_pos >= value.len() || matches!(value.as_bytes()[after_pos], b' ' | b'\t' | b'=');
 
         if before_ok && after_ok {
             return Some(abs_pos);
@@ -344,7 +336,9 @@ use runme::prelude::*;
         assert_eq!(result[0].0, "my-tools");
         // The path should be resolved to an absolute path (joined against original_dir)
         assert!(
-            result[0].1.contains("/home/user/project/services/auth/../shared/tools"),
+            result[0]
+                .1
+                .contains("/home/user/project/services/auth/../shared/tools"),
             "Expected resolved path in: {}",
             result[0].1
         );
@@ -381,10 +375,7 @@ use runme::prelude::*;
             result[1].1
         );
         // serde: unchanged (no path key)
-        assert_eq!(
-            result[2].1,
-            "{ version = \"1\", features = [\"derive\"] }"
-        );
+        assert_eq!(result[2].1, "{ version = \"1\", features = [\"derive\"] }");
     }
 
     #[test]
@@ -458,10 +449,7 @@ use runme::prelude::*;
     fn test_rewrite_multiple_path_deps() {
         // Multiple deps that both have path keys should both be rewritten
         let deps = vec![
-            (
-                "lib-a".to_string(),
-                "{ path = \"../lib-a\" }".to_string(),
-            ),
+            ("lib-a".to_string(), "{ path = \"../lib-a\" }".to_string()),
             (
                 "lib-b".to_string(),
                 "{ path = \"../lib-b\", features = [\"extra\"] }".to_string(),
@@ -491,7 +479,10 @@ use runme::prelude::*;
     fn test_rewrite_passthrough_no_path_key() {
         // A dep with no path key at all is returned unchanged
         let deps = vec![
-            ("serde".to_string(), "{ version = \"1\", features = [\"derive\"] }".to_string()),
+            (
+                "serde".to_string(),
+                "{ version = \"1\", features = [\"derive\"] }".to_string(),
+            ),
             ("tokio".to_string(), "\"1\"".to_string()),
         ];
         let original_dir = std::path::Path::new("/home/user/project");
