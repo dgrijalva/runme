@@ -60,7 +60,7 @@ implementation — Phases 1-3 complete, Phase 4 (examples) pending
 
 ### Current State
 
-- `TaskDef` has: name, description, group, depends_on, func (TaskFn)
+- `TaskDef` has: name, description, group, func (TaskFn)
 - `TaskFn` is `fn(&TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>>`
 - `#[task]` macro handles 4 variants (async/sync x with/without return), all taking only `&TaskContext`
 - `Registry::from_inventory()` collects tasks, `run()` creates a fresh TaskContext per invocation
@@ -113,7 +113,6 @@ pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
     pub group: &'static str,
-    pub depends_on: &'static [&'static str],
     pub func: TaskFn,
     pub arg_metadata: ArgMetadataFn,  // NEW
 }

@@ -158,7 +158,6 @@ pub struct TaskDef {
     pub description: Option<&'static str>,
     pub group: &'static str,           // matches a GroupDef.key
     pub watch: Option<&'static str>,
-    pub depends_on: &'static [&'static str],
     pub func: TaskFn,
 }
 ```

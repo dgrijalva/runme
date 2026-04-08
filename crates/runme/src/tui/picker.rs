@@ -411,8 +411,6 @@ mod tests {
         name: "build",
         description: Some("Build the project"),
         group: "",
-
-        depends_on: &[],
         func: dummy_task,
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -422,8 +420,6 @@ mod tests {
         name: "test",
         description: Some("Run tests"),
         group: "services/auth",
-
-        depends_on: &[],
         func: dummy_task,
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -433,8 +429,6 @@ mod tests {
         name: "build",
         description: Some("Build the auth service"),
         group: "services/auth",
-
-        depends_on: &[],
         func: dummy_task,
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -444,8 +438,6 @@ mod tests {
         name: "dev",
         description: Some("Start dev server"),
         group: "web-app",
-
-        depends_on: &[],
         func: dummy_task,
         arg_metadata: no_arg_metadata,
         ui_hint: None,

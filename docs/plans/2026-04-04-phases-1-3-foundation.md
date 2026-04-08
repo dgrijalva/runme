@@ -135,7 +135,6 @@ pub struct TaskDef {
     pub name: String,
     pub description: Option<String>,
     pub watch: Option<String>,         // glob pattern for file watching
-    pub depends_on: Vec<String>,       // task dependency names
     pub func: fn(&TaskContext),        // the task function
 }
 
@@ -201,7 +200,6 @@ fn __runme_register_build(registry: &mut Registry) {
         name: "build".to_string(),
         description: Some("Build the project".to_string()),
         watch: Some("src/**/*.rs".to_string()),
-        depends_on: vec![],
         func: build,
     });
 }

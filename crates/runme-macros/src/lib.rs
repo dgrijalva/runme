@@ -210,9 +210,8 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let is_async = input_fn.sig.asyncness.is_some();
 
-    // Parse attributes: desc = "...", depends_on = "a,b,c"
+    // Parse attributes: desc = "..."
     let mut description: Option<String> = None;
-    let mut depends_on: Vec<String> = Vec::new();
 
     // Parse the attribute as a comma-separated list of name = "value" pairs
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
@@ -237,9 +236,6 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 };
                 match key.as_str() {
                     "desc" | "description" => description = Some(val),
-                    "depends_on" => {
-                        depends_on = val.split(',').map(|s| s.trim().to_string()).collect();
-                    }
                     other => {
                         return syn::Error::new_spanned(
                             path,
@@ -287,14 +283,6 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     let desc_tokens = match &description {
         Some(d) => quote! { Some(#d) },
         None => quote! { None },
-    };
-
-    // Generate the depends_on token as a static slice
-    let deps_tokens = if depends_on.is_empty() {
-        quote! { &[] }
-    } else {
-        let dep_strs: Vec<&str> = depends_on.iter().map(|s| s.as_str()).collect();
-        quote! { &[#(#dep_strs),*] }
     };
 
     // Detect argument form
@@ -450,7 +438,6 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #fn_name_str,
                 description: #desc_tokens,
                 group: __RUNME_GROUP,
-                depends_on: #deps_tokens,
                 func: #wrapper_name,
                 arg_metadata: #arg_metadata_name,
                 ui_hint: None,

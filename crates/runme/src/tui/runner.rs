@@ -482,8 +482,6 @@ mod tests {
         name: "success",
         description: Some("A successful task"),
         group: "",
-
-        depends_on: &[],
         func: success_task,
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -493,8 +491,6 @@ mod tests {
         name: "failing",
         description: Some("A failing task"),
         group: "",
-
-        depends_on: &[],
         func: failing_task,
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -504,8 +500,6 @@ mod tests {
         name: "spawning",
         description: Some("A task that spawns a process"),
         group: "",
-
-        depends_on: &[],
         func: spawning_task,
         arg_metadata: no_arg_metadata,
         ui_hint: None,
