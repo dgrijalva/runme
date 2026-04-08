@@ -3,10 +3,10 @@ use std::path::Path;
 
 /// Rust keywords that cannot be used as crate names.
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
-    "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
-    "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
-    "type", "unsafe", "use", "where", "while", "yield",
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while", "yield",
 ];
 
 /// Convert a relative path (to a RUNME.rs file) into a valid Rust crate name.
@@ -130,10 +130,7 @@ mod tests {
     #[test]
     fn test_trailing_separators_trimmed() {
         // A path like "foo./RUNME.rs" produces "foo_" which should be trimmed to "foo"
-        assert_eq!(
-            crate_name_from_path(Path::new("foo./RUNME.rs")),
-            "foo"
-        );
+        assert_eq!(crate_name_from_path(Path::new("foo./RUNME.rs")), "foo");
     }
 
     #[test]
@@ -146,10 +143,7 @@ mod tests {
 
     #[test]
     fn test_keyword_mod() {
-        assert_eq!(
-            crate_name_from_path(Path::new("mod/RUNME.rs")),
-            "runme_mod"
-        );
+        assert_eq!(crate_name_from_path(Path::new("mod/RUNME.rs")), "runme_mod");
     }
 
     #[test]
@@ -178,10 +172,7 @@ mod tests {
 
     #[test]
     fn test_single_dir() {
-        assert_eq!(
-            crate_name_from_path(Path::new("web/RUNME.rs")),
-            "web"
-        );
+        assert_eq!(crate_name_from_path(Path::new("web/RUNME.rs")), "web");
     }
 
     #[test]
@@ -209,10 +200,7 @@ mod tests {
     #[should_panic(expected = "Crate name collision")]
     fn test_assign_crate_names_collision() {
         // Both produce "a_b"
-        let paths: Vec<&Path> = vec![
-            Path::new("a/b/RUNME.rs"),
-            Path::new("a-b/RUNME.rs"),
-        ];
+        let paths: Vec<&Path> = vec![Path::new("a/b/RUNME.rs"), Path::new("a-b/RUNME.rs")];
         assign_crate_names(&paths);
     }
 
@@ -232,10 +220,7 @@ mod tests {
     #[test]
     fn test_three_level_deep() {
         // Explicit 3-level depth
-        assert_eq!(
-            crate_name_from_path(Path::new("a/b/c/RUNME.rs")),
-            "a_b_c"
-        );
+        assert_eq!(crate_name_from_path(Path::new("a/b/c/RUNME.rs")), "a_b_c");
     }
 
     #[test]

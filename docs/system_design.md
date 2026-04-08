@@ -398,17 +398,19 @@ All child processes are spawned through `TaskContext`, which gives the runtime f
 
 ### Watch API
 
-Watches are runtime primitives, not macro attributes. A watch is created through `TaskContext`, starts listening immediately, and returns a `Watch<T>` handle. The task consumes events from it via `.next().await`. All watches registered through `ctx` are visible to the TUI (status, label, trigger count).
+Watches are runtime primitives, not macro attributes. A watch is created through `TaskContext`, starts listening immediately, and returns a `Watch<T>` handle. The task consumes events from it via `.next().await`. All watches registered through `ctx` are visible to the TUI (status, label, trigger count). Each call to `.next()` emits a tracing log entry ("Watching for changes") with the watch label and pattern as structured fields, so the log viewer shows when the task is waiting and what it's watching.
 
 #### Constructors
 
 | Constructor | `T` | Notes |
 |---|---|---|
 | `ctx.watch("glob")` | `Vec<PathBuf>` | Debounced, glob-filtered |
-| `ctx.watch_with(f)` | whatever `f` returns | `F: Fn(&[PathBuf]) -> Option<T>` |
+| `ctx.watch_with("glob", f)` | whatever `f` returns | `F: Fn(&[PathBuf]) -> Option<T>` |
 | `ctx.watch_channel::<T>()` | `T` | Bring your own signal |
 
 All support `.label("name")` for TUI display.
+
+Glob patterns are split into a concrete directory prefix and a glob suffix. The prefix is resolved relative to the RUNME.rs file's location to determine the actual directory notify watches. For example, `../../crates/**/*.rs` from a RUNME.rs in `docs/examples/` resolves to watching the project root's `crates/` directory, matching `**/*.rs` within it.
 
 **File watch** — the common case. Debounce is built into the watch type, not the caller's problem:
 
@@ -420,11 +422,11 @@ loop {
 }
 ```
 
-**Custom filter** — the closure receives all changed paths and returns `Option<T>`. `None` means "not interesting, keep waiting." The return value becomes what `.next()` yields:
+**Custom filter** — the pattern determines the watch directory (same prefix resolution as `watch()`). The closure receives changed paths (relative to that directory) and returns `Option<T>`. `None` means "not interesting, keep waiting." The return value becomes what `.next()` yields:
 
 ```rust
-let w = ctx.watch_with(|changed: &[PathBuf]| {
-    let rs = glob_filter("src/**/*.rs", changed);
+let w = ctx.watch_with("src/**/*", |changed: &[PathBuf]| {
+    let rs = glob_filter("**/*.rs", changed);
     let toml = glob_filter("**/Cargo.toml", changed);
     if rs.is_empty() && toml.is_empty() { None }
     else { Some((rs, toml)) }

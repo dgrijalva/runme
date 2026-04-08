@@ -127,7 +127,24 @@ fn render_preview(
         // Truncated: single line, clip message to remaining width
         let msg_width = width.saturating_sub(prefix_width);
         let msg_text = truncate_str(&message, msg_width);
+        let msg_len = msg_text.len();
         let msg_span = Span::raw(msg_text);
+
+        // Append structured fields in dim color using remaining space
+        let fields_width = msg_width.saturating_sub(msg_len + 1);
+        let fields_span = if !entry.fields.is_empty() && fields_width > 3 {
+            let fields_str = format_fields_inline(&entry.fields, fields_width);
+            if fields_str.is_empty() {
+                Span::raw("")
+            } else {
+                Span::styled(
+                    format!(" {}", fields_str),
+                    Style::default().fg(Color::DarkGray),
+                )
+            }
+        } else {
+            Span::raw("")
+        };
 
         let line = Line::from(vec![
             ts_span,
@@ -137,6 +154,7 @@ fn render_preview(
             source_span,
             Span::raw(gap),
             msg_span,
+            fields_span,
         ]);
         (vec![line], 1)
     } else {
@@ -243,6 +261,49 @@ fn pad_or_truncate(s: &str, width: usize) -> String {
 }
 
 /// Truncate a string to fit within the given width.
+/// Format structured fields as `key=value key=value`, fitting within `max_width`.
+///
+/// Fills as many fields as fit, truncating the last one if needed.
+fn format_fields_inline(fields: &HashMap<String, serde_json::Value>, max_width: usize) -> String {
+    if fields.is_empty() || max_width < 3 {
+        return String::new();
+    }
+
+    let mut parts: Vec<String> = fields
+        .iter()
+        .map(|(k, v)| {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            format!("{}={}", k, val)
+        })
+        .collect();
+    parts.sort(); // deterministic order
+
+    let mut result = String::new();
+    for part in &parts {
+        if result.is_empty() {
+            if part.len() <= max_width {
+                result.push_str(part);
+            } else {
+                result.push_str(&part[..max_width]);
+                break;
+            }
+        } else {
+            let needed = result.len() + 1 + part.len(); // space + part
+            if needed <= max_width {
+                result.push(' ');
+                result.push_str(part);
+            } else {
+                // No room for more fields
+                break;
+            }
+        }
+    }
+    result
+}
+
 fn truncate_str(s: &str, width: usize) -> String {
     if s.len() <= width {
         s.to_string()
@@ -405,8 +466,8 @@ mod tests {
         let entry = make_entry("the raw text", "api", Some("info"), None, None);
         let mut sc = SourceColors::new();
         let (lines, _) = render_entry(&entry, 100, DisplayMode::Preview, false, &mut sc);
-        // Message span (last) should contain raw text since message is None
-        let msg_span = &lines[0].spans[lines[0].spans.len() - 1];
+        // Message span (index 6: after ts, gap, level, gap, source, gap) should contain raw text
+        let msg_span = &lines[0].spans[6];
         assert!(msg_span.content.contains("the raw text"));
     }
 

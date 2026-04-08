@@ -167,6 +167,7 @@ impl TaskRunner {
         ctx.set_spawn_notifier(spawn_tx);
         ctx.set_tui_wait(self.tui_wait.clone());
         ctx.set_tui_output(self.tui_output.clone());
+        ctx.set_tracing_output(tracing_buffer.clone());
 
         // Forward exec() output (TaskContext's own buffer) to the LogStore
         let exec_log_store = log_store.clone();

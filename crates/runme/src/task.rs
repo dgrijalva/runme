@@ -49,6 +49,9 @@ inventory::collect!(TaskDef);
 pub struct TaskContext {
     pub name: String,
     output: Arc<Mutex<OutputBuffer>>,
+    /// The tracing output buffer (info!/error!/etc from the task function).
+    /// Injected by TaskRunner; None when running outside the TUI (e.g., tests).
+    tracing_output: Option<Arc<Mutex<OutputBuffer>>>,
     /// Process group IDs of all processes spawned through this context.
     /// Used by `stop_all()` to signal every spawned process group.
     spawned_pgids: Mutex<Vec<i32>>,
@@ -91,6 +94,7 @@ impl TaskContext {
         Self {
             name: name.into(),
             output: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
+            tracing_output: None,
             spawned_pgids: Mutex::new(Vec::new()),
             spawn_tx: None,
             tui_wait: Arc::new(AtomicBool::new(true)),
@@ -105,6 +109,7 @@ impl TaskContext {
         Self {
             name: name.into(),
             output: Arc::new(Mutex::new(OutputBuffer::new(capacity))),
+            tracing_output: None,
             spawned_pgids: Mutex::new(Vec::new()),
             spawn_tx: None,
             tui_wait: Arc::new(AtomicBool::new(true)),
@@ -156,7 +161,7 @@ impl TaskContext {
         TuiOutputHandle::new(self.tui_output.clone())
     }
 
-    /// Get an `Output` handle wrapping the task's own tracing output buffer.
+    /// Get an `Output` handle wrapping the task's tracing output buffer.
     ///
     /// This is the output from `info!()`, `error!()`, etc. called within
     /// the task function. Useful for staging task tracing output to post-TUI:
@@ -164,8 +169,15 @@ impl TaskContext {
     /// ```ignore
     /// ctx.tui_output().stderr().subscribe(&ctx.task_output()).await;
     /// ```
+    ///
+    /// Falls back to the exec output buffer if no tracing buffer was injected
+    /// (e.g., in tests or non-TUI mode).
     pub fn task_output(&self) -> Output {
-        Output(self.output.clone())
+        Output(
+            self.tracing_output
+                .clone()
+                .unwrap_or_else(|| self.output.clone()),
+        )
     }
 
     /// Get the `tui_wait` flag as a shared Arc for external observation.
@@ -188,6 +200,12 @@ impl TaskContext {
     /// Set the tui_output Arc (used by TaskRunner to inject a shared buffer).
     pub fn set_tui_output(&mut self, output: Arc<Mutex<TuiOutput>>) {
         self.tui_output = output;
+    }
+
+    /// Set the tracing output buffer (used by TaskRunner to inject the
+    /// buffer that LogEntryLayer writes to).
+    pub fn set_tracing_output(&mut self, buffer: Arc<Mutex<OutputBuffer>>) {
+        self.tracing_output = Some(buffer);
     }
 
     /// Run a command and wait for it to complete. Captures output.
@@ -277,7 +295,7 @@ impl TaskContext {
     /// }
     /// ```
     pub fn watch(&self, pattern: &str) -> Watch<Vec<PathBuf>> {
-        let (rx, info) = watch::start_file_watcher(pattern, self.watch_dir.clone())
+        let (rx, info, _actual_dir) = watch::start_file_watcher(pattern, self.watch_dir.clone())
             .expect("failed to start file watcher");
 
         // Register for TUI visibility
@@ -290,26 +308,28 @@ impl TaskContext {
 
     /// Watch files with a custom filter/map function.
     ///
-    /// All filesystem events in the watch directory are collected and debounced,
-    /// then passed to `filter_fn`. If it returns `Some(value)`, that value is
-    /// delivered via `.next()`. If `None`, the event batch is discarded and the
-    /// watch keeps waiting.
+    /// The `pattern` determines which directory to watch (the non-glob prefix
+    /// is resolved relative to the RUNME.rs file's location). All matching
+    /// filesystem events are collected, debounced, and passed to `filter_fn`.
+    /// If it returns `Some(value)`, that value is delivered via `.next()`.
+    /// If `None`, the event batch is discarded and the watch keeps waiting.
     ///
     /// ```ignore
-    /// let mut w = ctx.watch_with(|changed| {
-    ///     let rs = glob_filter("src/**/*.rs", changed);
+    /// let mut w = ctx.watch_with("src/**/*.rs", |changed| {
+    ///     let rs = glob_filter("**/*.rs", changed);
     ///     let toml = glob_filter("**/Cargo.toml", changed);
     ///     if rs.is_empty() && toml.is_empty() { None }
     ///     else { Some((rs, toml)) }
     /// });
     /// ```
-    pub fn watch_with<F, T>(&self, filter_fn: F) -> Watch<T>
+    pub fn watch_with<F, T>(&self, pattern: &str, filter_fn: F) -> Watch<T>
     where
         F: Fn(&[PathBuf]) -> Option<T> + Send + 'static,
         T: Send + 'static,
     {
-        let (rx, info) = watch::start_filtered_watcher(self.watch_dir.clone(), filter_fn)
-            .expect("failed to start filtered watcher");
+        let (rx, info, _actual_dir) =
+            watch::start_filtered_watcher(pattern, self.watch_dir.clone(), filter_fn)
+                .expect("failed to start filtered watcher");
 
         if let Ok(mut watches) = self.watches.lock() {
             watches.push(info.clone());
@@ -669,5 +689,4 @@ mod tests {
         let entries = output.entries().await;
         assert!(entries.is_empty());
     }
-
 }

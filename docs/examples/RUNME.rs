@@ -22,6 +22,7 @@ async fn multi(ctx: &TaskContext) -> TaskResult {
     ctx.spawn(Cmd::from("bash -c 'while true; do echo \"[fast] $(date +%T)\"; sleep 0.5; done'").label("fast")).await?;
     ctx.spawn(Cmd::from("bash -c 'while true; do echo \"[slow] $(date +%T)\"; sleep 2; done'").label("slow")).await?;
     ctx.spawn(Cmd::from("bash -c 'for i in $(seq 1 5); do echo \"[finite] step $i\"; sleep 1; done; echo done'").label("finite")).await?;
+
     Ok(())
 }
 
@@ -46,6 +47,87 @@ async fn burst(ctx: &TaskContext) -> TaskResult {
     ctx.exec("bash -c 'for i in $(seq 1 500); do echo \"line $i: $(head -c 80 /dev/urandom | base64)\"; done'").await?;
     info!("burst complete");
     Ok(())
+}
+
+/// Transient task: closes TUI on success, outputs task logs to stderr
+#[runme::task]
+async fn transient(ctx: &TaskContext) -> TaskResult {
+    ctx.tui_wait(false);
+    ctx.tui_output().stderr().subscribe(&ctx.task_output()).await;
+
+    info!("starting work");
+    ctx.exec("sleep 1").await?.ok()?;
+    info!("done!");
+    Ok(())
+}
+
+/// Build and rebuild on source changes
+#[runme::task]
+async fn watch_build(ctx: &TaskContext) -> TaskResult {
+    let mut w = ctx.watch("*.rs").label("rust sources");
+    loop {
+        info!("Building...");
+        let result = ctx.exec("cargo build").await?;
+        if result.success() {
+            info!("Build succeeded");
+        } else {
+            error!("Build failed (exit {})", result.exit_code());
+        }
+        w.next().await;
+    }
+}
+
+/// Watch with custom filter: separate handling for source vs config changes
+#[runme::task]
+async fn watch_filtered(ctx: &TaskContext) -> TaskResult {
+    let mut w = ctx.watch_with("../../crates/**/*", |changed| {
+        let rs = glob_filter("**/*.rs", changed);
+        let toml = glob_filter("**/Cargo.toml", changed);
+        if rs.is_empty() && toml.is_empty() { None } else { Some((rs, toml)) }
+    }).label("rust + manifests");
+
+    loop {
+        let (rs_files, toml_files) = w.next().await;
+        if !toml_files.is_empty() {
+            info!("Cargo.toml changed, updating deps");
+            ctx.exec("cargo update").await?;
+        }
+        info!("{} file(s) changed, running tests", rs_files.len() + toml_files.len());
+        ctx.exec("cargo test").await?.ok()?;
+    }
+}
+
+/// Watch and restart: kill the server, rebuild, relaunch on file change
+#[runme::task]
+async fn watch_restart(ctx: &TaskContext) -> TaskResult {
+    let mut w = ctx.watch("src/**/*.rs").label("server sources");
+    loop {
+        info!("Starting server");
+        let mut h = ctx.spawn("cargo run --example server").await?;
+        w.next().await;
+        info!("Source changed, restarting");
+        h.stop(std::time::Duration::from_secs(5)).await?;
+    }
+}
+
+/// Custom watch channel: poll an external condition
+#[runme::task]
+async fn watch_channel_demo(ctx: &TaskContext) -> TaskResult {
+    let (tx, w) = ctx.watch_channel::<String>();
+    let mut w = w.label("health check");
+
+    // Background poller
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let _ = tx.send("checked".to_string());
+        }
+    });
+
+    loop {
+        let status = w.next().await;
+        info!("Health check: {}", status);
+    }
 }
 
 /// Use Cmd builder with env and cwd

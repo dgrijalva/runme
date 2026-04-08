@@ -65,6 +65,16 @@ impl<T> Watch<T> {
     /// Blocks until an event is available. Panics if the watch channel
     /// is closed (which only happens if the sender is dropped).
     pub async fn next(&mut self) -> T {
+        // Log that we're waiting — shows up when the task is actually blocked on the watch
+        if let Ok(info) = self.info.lock() {
+            let label = info.label.as_deref().unwrap_or("files");
+            let detail = match &info.kind {
+                WatchKind::FileGlob(pattern) => format!("pattern={}", pattern),
+                WatchKind::Custom => "custom filter".to_string(),
+                WatchKind::Channel => "channel".to_string(),
+            };
+            tracing::info!(watch = label, detail = %detail, "Watching for changes");
+        }
         let item = self.rx.recv().await.expect("watch channel closed");
         if let Ok(mut info) = self.info.lock() {
             info.record_trigger();
@@ -123,6 +133,55 @@ pub fn glob_filter(pattern: &str, paths: &[PathBuf]) -> Vec<PathBuf> {
 /// Default debounce duration for file watches.
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(100);
 
+/// Split a glob pattern into a concrete directory prefix and a glob suffix.
+///
+/// Everything before the first path component containing a glob character
+/// (`*`, `?`, `[`) is treated as a directory path. The remainder is the glob.
+///
+/// Examples:
+///   `crates/**/*.rs`        → ("crates", "**/*.rs")
+///   `../../crates/*/src`    → ("../../crates", "*/src")
+///   `**/*.rs`               → ("", "**/*.rs")
+///   `src/main.rs`           → ("src", "main.rs")  (no glob chars until filename)
+fn split_glob_prefix(pattern: &str) -> (&str, &str) {
+    let mut last_sep = 0;
+    for (i, c) in pattern.char_indices() {
+        if c == '*' || c == '?' || c == '[' {
+            // Split at the last separator before this glob char
+            if last_sep == 0 {
+                return ("", pattern);
+            }
+            return (&pattern[..last_sep], &pattern[last_sep + 1..]);
+        }
+        if c == '/' {
+            last_sep = i;
+        }
+    }
+    // No glob characters found — treat the whole thing as a directory + empty glob
+    // This is an edge case; in practice patterns always have glob chars
+    if let Some(pos) = pattern.rfind('/') {
+        (&pattern[..pos], &pattern[pos + 1..])
+    } else {
+        ("", pattern)
+    }
+}
+
+/// Resolve a glob pattern against a base directory.
+///
+/// Returns the actual directory to watch and the glob pattern to match against.
+/// The directory prefix from the pattern is resolved relative to `base_dir`.
+fn resolve_watch_target(pattern: &str, base_dir: &PathBuf) -> (PathBuf, String) {
+    let (prefix, glob_part) = split_glob_prefix(pattern);
+    let actual_dir = if prefix.is_empty() {
+        base_dir.clone()
+    } else {
+        let resolved = base_dir.join(prefix);
+        // Canonicalize to resolve .. components, fall back to the joined path
+        resolved.canonicalize().unwrap_or(resolved)
+    };
+    (actual_dir, glob_part.to_string())
+}
+
 /// Create a notify watcher that bridges events to a tokio mpsc channel.
 ///
 /// Returns the watcher (must be kept alive) and a receiver for events.
@@ -160,20 +219,22 @@ fn create_notify_watcher(
 pub(crate) fn start_file_watcher(
     pattern: &str,
     watch_dir: PathBuf,
-) -> Result<(mpsc::UnboundedReceiver<Vec<PathBuf>>, Arc<Mutex<WatchInfo>>), WatchError> {
-    let glob = Glob::new(pattern).map_err(|e| WatchError::InvalidGlob(e.to_string()))?;
+) -> Result<(mpsc::UnboundedReceiver<Vec<PathBuf>>, Arc<Mutex<WatchInfo>>, PathBuf), WatchError> {
+    let (actual_dir, glob_part) = resolve_watch_target(pattern, &watch_dir);
+    let glob = Glob::new(&glob_part).map_err(|e| WatchError::InvalidGlob(e.to_string()))?;
     let matcher = glob.compile_matcher();
     let info = Arc::new(Mutex::new(WatchInfo::new(WatchKind::FileGlob(
         pattern.to_string(),
     ))));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let (watcher, event_rx) = create_notify_watcher(&watch_dir)?;
+    let (watcher, event_rx) = create_notify_watcher(&actual_dir)?;
 
     // Spawn a background task to debounce and filter events
-    tokio::spawn(debounce_glob_loop(event_rx, tx, matcher, watcher));
+    let dir_clone = actual_dir.clone();
+    tokio::spawn(debounce_glob_loop(event_rx, tx, matcher, dir_clone, watcher));
 
-    Ok((rx, info))
+    Ok((rx, info, actual_dir))
 }
 
 /// Start a file watcher with a custom filter function.
@@ -182,22 +243,25 @@ pub(crate) fn start_file_watcher(
 /// instead of a glob. The filter returns `Option<T>` — `None` means "not interesting,
 /// keep collecting."
 pub(crate) fn start_filtered_watcher<F, T>(
+    pattern: &str,
     watch_dir: PathBuf,
     filter_fn: F,
-) -> Result<(mpsc::UnboundedReceiver<T>, Arc<Mutex<WatchInfo>>), WatchError>
+) -> Result<(mpsc::UnboundedReceiver<T>, Arc<Mutex<WatchInfo>>, PathBuf), WatchError>
 where
     F: Fn(&[PathBuf]) -> Option<T> + Send + 'static,
     T: Send + 'static,
 {
+    let (actual_dir, _glob_part) = resolve_watch_target(pattern, &watch_dir);
     let info = Arc::new(Mutex::new(WatchInfo::new(WatchKind::Custom)));
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let (watcher, event_rx) = create_notify_watcher(&watch_dir)?;
+    let (watcher, event_rx) = create_notify_watcher(&actual_dir)?;
 
     // Spawn a background task to debounce and run the filter
-    tokio::spawn(debounce_filter_loop(event_rx, tx, filter_fn, watcher));
+    let dir_clone = actual_dir.clone();
+    tokio::spawn(debounce_filter_loop(event_rx, tx, filter_fn, dir_clone, watcher));
 
-    Ok((rx, info))
+    Ok((rx, info, actual_dir))
 }
 
 /// Background loop: collect notify events, debounce, filter through glob, send batches.
@@ -207,6 +271,7 @@ async fn debounce_glob_loop(
     mut event_rx: mpsc::UnboundedReceiver<Event>,
     tx: mpsc::UnboundedSender<Vec<PathBuf>>,
     matcher: globset::GlobMatcher,
+    watch_dir: PathBuf,
     _watcher: RecommendedWatcher,
 ) {
     let mut pending: Vec<PathBuf> = Vec::new();
@@ -236,9 +301,13 @@ async fn debounce_glob_loop(
                         pending.sort();
                         pending.dedup();
 
+                        // Strip watch_dir prefix so relative globs match
                         let matched: Vec<PathBuf> = pending
                             .drain(..)
-                            .filter(|p| matcher.is_match(p))
+                            .filter(|p| {
+                                let rel = p.strip_prefix(&watch_dir).unwrap_or(p);
+                                matcher.is_match(rel)
+                            })
                             .collect();
 
                         if !matched.is_empty() {
@@ -270,6 +339,7 @@ async fn debounce_filter_loop<F, T>(
     mut event_rx: mpsc::UnboundedReceiver<Event>,
     tx: mpsc::UnboundedSender<T>,
     filter_fn: F,
+    watch_dir: PathBuf,
     _watcher: RecommendedWatcher,
 ) where
     F: Fn(&[PathBuf]) -> Option<T> + Send + 'static,
@@ -298,7 +368,11 @@ async fn debounce_filter_loop<F, T>(
                         pending.sort();
                         pending.dedup();
 
-                        let paths: Vec<PathBuf> = pending.drain(..).collect();
+                        // Strip watch_dir prefix so filter sees relative paths
+                        let paths: Vec<PathBuf> = pending
+                            .drain(..)
+                            .map(|p| p.strip_prefix(&watch_dir).map(|r| r.to_path_buf()).unwrap_or(p))
+                            .collect();
                         if let Some(value) = filter_fn(&paths) {
                             if tx.send(value).is_err() {
                                 return;
@@ -475,7 +549,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        let (mut rx, _info) = start_file_watcher("**/*.txt", tmp.clone()).unwrap();
+        let (mut rx, _info, _dir) = start_file_watcher("**/*.txt", tmp.clone()).unwrap();
 
         // Give the watcher time to set up
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -505,7 +579,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        let (mut rx, _info) = start_file_watcher("**/*.rs", tmp.clone()).unwrap();
+        let (mut rx, _info, _dir) = start_file_watcher("**/*.rs", tmp.clone()).unwrap();
 
         // Give the watcher time to set up
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -536,7 +610,7 @@ mod tests {
         fs::create_dir_all(&tmp).unwrap();
 
         // Custom filter: only return .rs files, mapped to their count
-        let (mut rx, _info) = start_filtered_watcher(tmp.clone(), |paths| {
+        let (mut rx, _info, _dir) = start_filtered_watcher("**/*", tmp.clone(), |paths| {
             let rs_files: Vec<PathBuf> = paths
                 .iter()
                 .filter(|p| p.extension().is_some_and(|e| e == "rs"))
