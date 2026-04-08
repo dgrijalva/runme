@@ -4,4 +4,5 @@ members = [
     "crates/runme-macros",
     "crates/runme",
     "crates/runme-cli",
+    "crates/runme-test-tasks",
 ]

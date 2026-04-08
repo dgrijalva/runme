@@ -227,7 +227,7 @@ async fn run_agent(
 /// Resolve the effective UI mode from explicit flag, task hint, and terminal state.
 ///
 /// Priority: explicit `--ui` flag > task's `ui_hint` > terminal detection.
-fn resolve_ui_mode(
+pub fn resolve_ui_mode(
     explicit: Option<UiMode>,
     task_hint: Option<crate::task::UiHint>,
     has_terminal: bool,
