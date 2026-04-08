@@ -10,7 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::render::SourceColors;
-use super::runner::{ProcessInfo, ProcessStatus, TaskStatus};
+use super::runner::{ProcessInfo, ProcessStatus, TaskSession, TaskStatus};
 
 /// Fixed sidebar width in columns.
 pub const SIDEBAR_WIDTH: u16 = 28;
@@ -77,6 +77,8 @@ pub struct SidebarEntry {
     pub visible: bool,
     /// Whether this is the task entry (vs a process entry).
     pub is_task: bool,
+    /// Nesting depth for indentation (0 = top-level task, 1 = process under task).
+    pub depth: usize,
 }
 
 /// Build the list of sidebar entries from current task/process state.
@@ -104,8 +106,12 @@ pub fn build_sidebar_entries(
             status_color: color,
             visible: visible_sources.is_empty() || visible_sources.contains(name),
             is_task: true,
+            depth: 0,
         });
     }
+
+    // Determine process depth: 1 if under a task, 0 if standalone
+    let proc_depth = if task_name.is_some() { 1 } else { 0 };
 
     // Partition processes into running and completed
     let mut running: Vec<&ProcessInfo> = Vec::new();
@@ -128,6 +134,7 @@ pub fn build_sidebar_entries(
             status_color: Color::Green,
             visible: visible_sources.is_empty() || visible_sources.contains(&proc.task_name),
             is_task: false,
+            depth: proc_depth,
         });
     }
 
@@ -142,7 +149,83 @@ pub fn build_sidebar_entries(
             status_color: color,
             visible: visible_sources.is_empty() || visible_sources.contains(&proc.task_name),
             is_task: false,
+            depth: proc_depth,
         });
+    }
+
+    entries
+}
+
+/// Build sidebar entries from multiple task sessions.
+///
+/// Groups entries by session: each session contributes a task entry at depth 0,
+/// followed by its processes at depth 1. Running processes appear before
+/// completed ones within each session.
+pub async fn build_sidebar_entries_multi(
+    sessions: &[TaskSession],
+    visible_sources: &std::collections::HashSet<String>,
+    source_colors: &mut SourceColors,
+) -> Vec<SidebarEntry> {
+    let mut entries = Vec::new();
+
+    for session in sessions {
+        let task_status = session.status.lock().await.clone();
+        let procs = session.processes.lock().await;
+
+        let (tag, color) = task_status_display(&task_status);
+        let _ = source_colors.color_for(&session.task_name);
+        entries.push(SidebarEntry {
+            name: session.task_name.clone(),
+            source: session.task_name.clone(),
+            status_tag: tag,
+            status_color: color,
+            visible: visible_sources.is_empty()
+                || visible_sources.contains(&session.task_name),
+            is_task: true,
+            depth: 0,
+        });
+
+        // Partition processes into running and completed
+        let mut running: Vec<&ProcessInfo> = Vec::new();
+        let mut completed: Vec<&ProcessInfo> = Vec::new();
+
+        for proc in procs.iter() {
+            match proc.status {
+                ProcessStatus::Running => running.push(proc),
+                _ => completed.push(proc),
+            }
+        }
+
+        // Running processes under this task
+        for proc in &running {
+            let _ = source_colors.color_for(&proc.task_name);
+            entries.push(SidebarEntry {
+                name: proc.display_name().to_string(),
+                source: proc.task_name.clone(),
+                status_tag: "RUN".to_string(),
+                status_color: Color::Green,
+                visible: visible_sources.is_empty()
+                    || visible_sources.contains(&proc.task_name),
+                is_task: false,
+                depth: 1,
+            });
+        }
+
+        // Completed processes under this task
+        for proc in &completed {
+            let (tag, color) = process_status_display(&proc.status);
+            let _ = source_colors.color_for(&proc.task_name);
+            entries.push(SidebarEntry {
+                name: proc.display_name().to_string(),
+                source: proc.task_name.clone(),
+                status_tag: tag,
+                status_color: color,
+                visible: visible_sources.is_empty()
+                    || visible_sources.contains(&proc.task_name),
+                is_task: false,
+                depth: 1,
+            });
+        }
     }
 
     entries
@@ -184,10 +267,16 @@ pub fn render_sidebar(
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     // Fixed columns: prefix (2) + marker+space (2) + padding (1) + longest tag [SETUP] (7) = 12
-    let max_name_width = inner.width.saturating_sub(12) as usize;
+    let base_overhead = 12_u16;
 
     for (i, entry) in entries.iter().enumerate() {
         let is_selected = state.focused && i == state.selection;
+
+        // Indentation based on depth (2 chars per level)
+        let indent_width = entry.depth * 2;
+        let indent = " ".repeat(indent_width);
+        let max_name_width =
+            inner.width.saturating_sub(base_overhead + indent_width as u16) as usize;
 
         // Build the line: "  name  [TAG]" or "> name  [TAG]" if selected
         let prefix = if is_selected { "> " } else { "  " };
@@ -196,6 +285,10 @@ pub fn render_sidebar(
         let name_color = source_colors.color_for(&entry.source);
         let name_style = if !entry.visible {
             Style::default().fg(Color::DarkGray) // dimmed when filtered out
+        } else if entry.is_task {
+            Style::default()
+                .fg(name_color)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(name_color)
         };
@@ -209,8 +302,8 @@ pub fn render_sidebar(
 
         // Right-align the status tag
         let tag = format!("[{}]", entry.status_tag);
-        // Total line: prefix(2) + marker+space(2) + name + padding + tag
-        let used = prefix.len() + 2 + display_name.len() + tag.len();
+        // Total line: prefix(2) + indent + marker+space(2) + name + padding + tag
+        let used = prefix.len() + indent_width + 2 + display_name.len() + tag.len();
         let padding = if used < inner.width as usize {
             " ".repeat(inner.width as usize - used)
         } else {
@@ -231,20 +324,22 @@ pub fn render_sidebar(
             Style::default().fg(name_color)
         };
 
-        let spans = vec![
-            Span::styled(
-                prefix.to_string(),
-                if is_selected {
-                    Style::default().fg(Color::Cyan)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                },
-            ),
-            Span::styled(format!("{} ", visibility_marker), marker_style),
-            Span::styled(display_name, name_style),
-            Span::raw(padding),
-            Span::styled(tag, tag_style),
-        ];
+        let mut spans = Vec::new();
+        spans.push(Span::styled(
+            prefix.to_string(),
+            if is_selected {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            },
+        ));
+        if indent_width > 0 {
+            spans.push(Span::raw(indent));
+        }
+        spans.push(Span::styled(format!("{} ", visibility_marker), marker_style));
+        spans.push(Span::styled(display_name, name_style));
+        spans.push(Span::raw(padding));
+        spans.push(Span::styled(tag, tag_style));
 
         // If this is a section separator, add a blank line before completed processes
         if i > 0 && !entry.is_task {
@@ -405,6 +500,7 @@ mod tests {
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
@@ -413,6 +509,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
         assert_eq!(source_for_index(&entries, 0), Some("my-task"));

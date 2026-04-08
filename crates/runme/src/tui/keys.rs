@@ -200,6 +200,11 @@ pub(super) fn handle_log_viewer_key(
             state.sidebar_visible = !state.sidebar_visible;
         }
 
+        // y: copy raw entry text to clipboard via OSC 52
+        KeyCode::Char('y') => {
+            copy_entry_to_clipboard(state);
+        }
+
         // e: export visible log to file
         KeyCode::Char('e') => {
             export_visible_log(state);
@@ -905,6 +910,7 @@ mod tests {
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "api".to_string(),
@@ -913,6 +919,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
             SidebarEntry {
                 name: "worker".to_string(),
@@ -921,6 +928,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
 
@@ -960,6 +968,7 @@ mod tests {
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "api".to_string(),
@@ -968,6 +977,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
 
@@ -1184,6 +1194,7 @@ mod tests {
             status_color: Color::Yellow,
             visible: true,
             is_task: true,
+            depth: 0,
         }];
 
         // This should be a no-op (task entries can't be signaled)
@@ -1208,6 +1219,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
@@ -1216,6 +1228,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
         // No processes Arc — should be a no-op
@@ -1243,6 +1256,7 @@ mod tests {
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
@@ -1251,6 +1265,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
 
@@ -1276,6 +1291,7 @@ mod tests {
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
@@ -1284,6 +1300,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
 

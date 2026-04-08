@@ -76,7 +76,7 @@ pub async fn run_event_loop(
 
                         // Check if a task was selected from the picker
                         if let Some(task) = state.pending_task.take() {
-                            state.launch_picked_task(task);
+                            state.launch_picked_task(task, Vec::new());
                             // Re-subscribe to the new LogStore
                             let store = state.log_store.lock().await;
                             let existing = store.compose_owned();
@@ -193,8 +193,37 @@ pub async fn run_event_loop(
 }
 
 /// Refresh process statuses and rebuild sidebar entries from the runner's state.
+///
+/// If the runner has multiple sessions, iterates all sessions to refresh
+/// process statuses and builds a grouped sidebar. Falls back to the legacy
+/// single-task path when no runner is present.
 async fn refresh_sidebar_state(state: &mut AppState) {
-    // Get current task status
+    // Multi-session path: if we have a runner with sessions, use those
+    if let Some(ref runner) = state.runner
+        && !runner.sessions.is_empty()
+    {
+        // Refresh process statuses across all sessions
+        for session in &runner.sessions {
+            let mut procs = session.processes.lock().await;
+            for proc in procs.iter_mut() {
+                proc.refresh_status();
+            }
+        }
+
+        // Build sidebar entries from all sessions
+        state.sidebar_entries = sidebar::build_sidebar_entries_multi(
+            &runner.sessions,
+            &state.source_filter,
+            &mut state.source_colors,
+        )
+        .await;
+
+        // Clamp sidebar selection
+        state.sidebar.clamp_selection(state.sidebar_entries.len());
+        return;
+    }
+
+    // Legacy single-task path (backward compatibility)
     let task_status = if let Some(ts) = &state.task_status {
         ts.lock().await.clone()
     } else {
@@ -265,17 +294,9 @@ fn handle_key(
     };
     let viewport_width = term_size.width.saturating_sub(sidebar_width);
 
-    // Build filtered entries for scroll operations
-    let filtered_entries: Vec<LogEntry> = if state.source_filter.is_empty() {
-        state.log_lines.clone()
-    } else {
-        state
-            .log_lines
-            .iter()
-            .filter(|e| state.source_filter.contains(&e.source))
-            .cloned()
-            .collect()
-    };
+    // Build filtered entries for scroll operations (applies both source and expression filters)
+    let filtered_entries: Vec<LogEntry> =
+        state.visible_log_lines().into_iter().cloned().collect();
 
     // Task picker mode: dedicated key handling
     if state.mode == AppMode::TaskPicker {
@@ -548,8 +569,33 @@ async fn poll_lsof(state: &mut AppState) {
 }
 
 /// Get the PID for the currently viewed process detail.
+///
+/// In multi-session mode, finds the process across all sessions by matching
+/// the sidebar entry. Falls back to the legacy single-process-list path.
 fn get_process_detail_pid(state: &AppState) -> Option<u32> {
     let sidebar_idx = state.process_detail_index?;
+    let entry = state.sidebar_entries.get(sidebar_idx)?;
+
+    // The sidebar entry must be a process (not a task)
+    if entry.is_task {
+        return None;
+    }
+
+    // Multi-session path: search all sessions for a matching process
+    if let Some(ref runner) = state.runner {
+        for session in &runner.sessions {
+            let procs = session.processes.try_lock().ok()?;
+            // Find process by command label match
+            for proc in procs.iter() {
+                if proc.display_name() == entry.name {
+                    return proc.pid;
+                }
+            }
+        }
+        return None;
+    }
+
+    // Legacy single-process-list path
     let procs_arc = state.processes.as_ref()?;
     let procs = procs_arc.try_lock().ok()?;
 
@@ -577,14 +623,32 @@ fn get_process_detail_pid(state: &AppState) -> Option<u32> {
 }
 
 /// Check for newly failed processes and create notifications.
+///
+/// In multi-session mode, collects process statuses across all sessions.
 fn check_for_crashes(state: &mut AppState, prev_statuses: &mut Vec<(String, ProcessStatus)>) {
-    if let Some(procs_arc) = &state.processes
+    // Collect current process statuses from all sessions (or the single process list)
+    let current: Vec<(String, ProcessStatus)> = if let Some(ref runner) = state.runner {
+        let mut all = Vec::new();
+        for session in &runner.sessions {
+            if let Ok(procs) = session.processes.try_lock() {
+                for p in procs.iter() {
+                    all.push((p.command_label.clone(), p.status.clone()));
+                }
+            }
+        }
+        all
+    } else if let Some(procs_arc) = &state.processes
         && let Ok(procs) = procs_arc.try_lock()
     {
-        let current: Vec<(String, ProcessStatus)> = procs
+        procs
             .iter()
             .map(|p| (p.command_label.clone(), p.status.clone()))
-            .collect();
+            .collect()
+    } else {
+        return;
+    };
+
+    {
 
         // Check for new failures
         for (i, (name, status)) in current.iter().enumerate() {

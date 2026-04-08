@@ -396,9 +396,14 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
 
-    fn dummy_task(
-        _ctx: &TaskContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+    fn no_arg_metadata() -> Option<clap::Command> {
+        None
+    }
+
+    fn dummy_task<'a>(
+        _ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>> {
         Box::pin(async { Ok(()) })
     }
 
@@ -409,6 +414,8 @@ mod tests {
 
         depends_on: &[],
         func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
     };
 
     static TEST_TASK_B: TaskDef = TaskDef {
@@ -418,6 +425,8 @@ mod tests {
 
         depends_on: &[],
         func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
     };
 
     static TEST_TASK_C: TaskDef = TaskDef {
@@ -427,6 +436,8 @@ mod tests {
 
         depends_on: &[],
         func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
     };
 
     static TEST_TASK_D: TaskDef = TaskDef {
@@ -436,6 +447,8 @@ mod tests {
 
         depends_on: &[],
         func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
     };
 
     fn make_picker() -> PickerState {

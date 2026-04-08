@@ -10,7 +10,10 @@ pub use crate::log::parse::{
 pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawRecord, Stream};
 pub use crate::process::{Output, ProcessError, ProcessHandle, ProcessResult};
 pub use crate::signal::SignalHandler;
-pub use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef, TaskFn};
+pub use crate::task::{
+    ArgMetadataFn, Registry, SpawnEvent, StepGuard, TaskContext, TaskDef, TaskFn, TaskGuard,
+    TaskInfo, TaskQuery, UiHint,
+};
 pub use crate::tui::output::{TuiOutput, TuiOutputHandle, TuiOutputStreamHandle};
 pub use crate::watch::{Watch, WatchInfo, WatchKind, glob_filter};
 pub use runme_macros::init;

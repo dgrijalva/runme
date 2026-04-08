@@ -930,10 +930,10 @@ fn build() {}
             runner_main,
         );
 
-        // Verify --list flag handling is present
+        // Verify dispatch is handed off to cli::run()
         assert!(
-            runner_main.contains("--list"),
-            "runner main should handle --list flag, got:\n{}",
+            runner_main.contains("runme::cli::run("),
+            "runner main should hand off to runme::cli::run(), got:\n{}",
             runner_main,
         );
     }

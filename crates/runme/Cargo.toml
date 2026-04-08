@@ -23,6 +23,7 @@ base64 = "0.22"
 fuzzy-matcher = "0.3"
 notify = "7"
 globset = "0.4"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

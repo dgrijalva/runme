@@ -1012,6 +1012,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "clap",
  "crossterm",
  "fuzzy-matcher",
  "globset",

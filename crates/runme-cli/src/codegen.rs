@@ -29,7 +29,7 @@ pub(crate) fn generate_runner_main(entries: &[CrateEntry]) -> String {
     }
     source.push('\n');
 
-    // Build tokio runtime and dispatch
+    // Build tokio runtime, run init hooks, and hand off to cli::run()
     source.push_str(
         r#"    runme::tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -58,81 +58,14 @@ pub(crate) fn generate_runner_main(entries: &[CrateEntry]) -> String {
                 group_names.insert(init.group, ctx.group_name().to_string());
             }
 
-            // Build registry from inventory
-            let registry = runme::task::Registry::from_inventory();
-            let args: Vec<String> = std::env::args().collect();
+            // Build registry and convert group_names to owned types for cli::run()
+            let registry = std::sync::Arc::new(runme::task::Registry::from_inventory());
+            let group_names_owned: std::collections::HashMap<String, String> = group_names
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
 
-            if args.iter().any(|a| a == "--list") {
-                for task in registry.list() {
-                    let group_display = group_names.get(task.group).map(|s| s.as_str()).unwrap_or(task.group);
-                    if group_display.is_empty() {
-                        println!("{}: {}", task.name, task.description.unwrap_or(""));
-                    } else {
-                        println!("[{}] {}: {}", group_display, task.name, task.description.unwrap_or(""));
-                    }
-                }
-                return;
-            }
-
-            if let Some(task_name) = args.get(1) {
-                // Resolve task: short name when unambiguous, "group:task" to disambiguate.
-                // Group names come from group_names map (init hooks can override).
-                let task_group_name = |t: &&runme::task::TaskDef| -> String {
-                    group_names.get(t.group).cloned().unwrap_or_else(|| t.group.to_string())
-                };
-
-                let resolved = if let Some((group_query, short_name)) = task_name.split_once(':') {
-                    registry.list().iter()
-                        .find(|t| t.name == short_name && task_group_name(t) == group_query)
-                        .copied()
-                        .ok_or_else(|| format!("unknown task: {}", task_name))
-                } else {
-                    let matches: Vec<_> = registry.list().iter()
-                        .filter(|t| t.name == task_name.as_str())
-                        .collect();
-                    match matches.len() {
-                        0 => Err(format!("unknown task: {}", task_name)),
-                        1 => Ok(*matches[0]),
-                        _ => {
-                            // Root tasks (empty group) win short names
-                            if let Some(root_task) = matches.iter().find(|t| t.group.is_empty()) {
-                                Ok(**root_task)
-                            } else {
-                                let qualified: Vec<String> = matches.iter().map(|t| {
-                                    format!("{}:{}", task_group_name(t), t.name)
-                                }).collect();
-                                Err(format!("ambiguous task '{}', use: {}", task_name, qualified.join(", ")))
-                            }
-                        }
-                    }
-                };
-
-                match resolved {
-                    Ok(task) => {
-                        let mut app = runme::tui::App::with_task(task);
-                        if let Err(e) = app.run().await {
-                            eprintln!("TUI error: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                    Err(msg) => {
-                        eprintln!("Error: {}", msg);
-                        std::process::exit(1);
-                    }
-                }
-            } else {
-                // No task specified — launch TUI with task picker
-                let tasks: Vec<&'static runme::task::TaskDef> = registry.list().to_vec();
-                let group_names_owned: std::collections::HashMap<String, String> = group_names
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect();
-                let mut app = runme::tui::App::with_picker(tasks, group_names_owned);
-                if let Err(e) = app.run().await {
-                    eprintln!("TUI error: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            runme::cli::run(registry, group_names_owned).await;
         });
 }
 "#,

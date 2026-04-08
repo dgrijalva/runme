@@ -4,11 +4,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use globset::GlobBuilder;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 
 use crate::cmd::Cmd;
-use crate::error::TaskError;
+use crate::error::{TaskError, TaskResult};
 use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
 use crate::process::{self, Output, ProcessError, ProcessHandle, ProcessResult};
@@ -17,22 +18,51 @@ use crate::watch::{self, Watch, WatchInfo, WatchKind};
 
 /// The type of async task functions.
 ///
-/// Task functions are `async fn(&TaskContext) -> Result<(), TaskError>` — this
+/// Task functions are `async fn(&TaskContext, &[String]) -> Result<(), TaskError>` — this
 /// type alias represents that as a function pointer returning a boxed future.
-pub type TaskFn =
-    fn(&TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>>;
+/// The `&[String]` carries CLI arguments; zero-arg tasks ignore the slice.
+///
+/// The returned future borrows from `&TaskContext` (lifetime `'a`).
+/// The `&[String]` args slice need not outlive the future.
+pub type TaskFn = for<'a> fn(
+    &'a TaskContext,
+    &[String],
+) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>>;
+
+/// Function that returns clap metadata for a task's arguments, if any.
+///
+/// Returns `None` for zero-arg tasks. The `clap::Command` describes the
+/// argument schema so that `--help` and validation work.
+pub type ArgMetadataFn = fn() -> Option<clap::Command>;
 
 /// Task metadata — what the macro extracts and registers.
 ///
 /// Uses `&'static str` for name/description so that instances can be
 /// constructed in static context and satisfy `Send + Sync + 'static`
 /// (required by `inventory`).
+/// UI mode hint — tasks can declare a preferred execution mode.
+///
+/// When set on a `TaskDef`, the CLI dispatch will use this mode instead of
+/// the user's `--ui` flag. Useful for utility tasks (like `list`) that
+/// should always run in CLI mode regardless of the default.
+#[derive(Clone, Copy, Debug)]
+pub enum UiHint {
+    /// Interactive TUI with log viewer
+    Tui,
+    /// Direct CLI execution with stdio output
+    Cli,
+}
+
 pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
     pub group: &'static str,
     pub depends_on: &'static [&'static str],
     pub func: TaskFn,
+    pub arg_metadata: ArgMetadataFn,
+    /// Optional UI mode override. When set, the CLI dispatch uses this
+    /// instead of the user's `--ui` flag.
+    pub ui_hint: Option<UiHint>,
 }
 
 // Safety: TaskDef contains only 'static references and function pointers,
@@ -70,6 +100,10 @@ pub struct TaskContext {
     watches: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<WatchInfo>>>>>,
     /// Working directory for file watches. Defaults to the current directory.
     watch_dir: PathBuf,
+    /// Shared registry for cross-file task invocation via `ctx.run()`.
+    /// Injected by the runtime when tasks are launched through `Registry::run_with_registry()`.
+    /// `None` when running outside the full runtime (e.g., standalone tests).
+    registry: Option<Arc<Registry>>,
 }
 
 /// Event emitted when a process is spawned through a TaskContext.
@@ -101,6 +135,7 @@ impl TaskContext {
             tui_output: Arc::new(Mutex::new(TuiOutput::new())),
             watches: Arc::new(std::sync::Mutex::new(Vec::new())),
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            registry: None,
         }
     }
 
@@ -116,6 +151,7 @@ impl TaskContext {
             tui_output: Arc::new(Mutex::new(TuiOutput::new())),
             watches: Arc::new(std::sync::Mutex::new(Vec::new())),
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            registry: None,
         }
     }
 
@@ -178,6 +214,26 @@ impl TaskContext {
                 .clone()
                 .unwrap_or_else(|| self.output.clone()),
         )
+    }
+
+    /// Print raw, undecorated text to the task output.
+    ///
+    /// Works in all modes:
+    /// - **TUI**: appears as a raw entry in the log viewer
+    /// - **CLI**: forwarded to stdout by the output subscriber
+    /// - **ctx.run()**: flows through the calling task's log engine
+    ///
+    /// Use this instead of `println!()` for task output that should be
+    /// visible regardless of UI mode.
+    pub async fn println(&self, text: impl std::fmt::Display) {
+        let text = text.to_string();
+        let entry = LogEntry::raw(&text, &self.name);
+        // Push to the tracing buffer if available (TUI mode), otherwise exec buffer
+        let buffer = self
+            .tracing_output
+            .as_ref()
+            .unwrap_or(&self.output);
+        buffer.lock().await.push(entry);
     }
 
     /// Get the `tui_wait` flag as a shared Arc for external observation.
@@ -388,10 +444,221 @@ impl TaskContext {
         self.watches.clone()
     }
 
+    /// Start observing a task. Returns a `TaskGuard` that emits a tracing
+    /// event when dropped.
+    pub fn start_task(&self, name: &str) -> TaskGuard {
+        TaskGuard::new(name)
+    }
+
+    /// Begin a step within the current task. Returns a `StepGuard` that emits
+    /// a tracing event when dropped, recording success or failure.
+    pub fn begin_step(&self, name: &str) -> StepGuard {
+        StepGuard::new(name)
+    }
+
+    /// Set the shared registry for cross-file task invocation.
+    ///
+    /// Called by the runtime when launching tasks through `Registry::run_with_registry()`.
+    /// Once set, `ctx.run()` and `ctx.tasks()` become available.
+    pub fn set_registry(&mut self, registry: Arc<Registry>) {
+        self.registry = Some(registry);
+    }
+
+    /// Invoke a task by name with string arguments.
+    ///
+    /// Resolves the task through the registry (supporting short names,
+    /// `group:task` qualified names, and `:builtin` aliases) and runs it.
+    /// The invoked task receives its own `TaskContext` with the same
+    /// registry, enabling transitive cross-file invocation.
+    ///
+    /// Returns an error if no registry is available (e.g., standalone test
+    /// context) or if the task cannot be resolved.
+    ///
+    /// ```ignore
+    /// ctx.run("test", &["--verbose"]).await?;
+    /// ctx.run("services/auth:deploy", &["--env", "staging"]).await?;
+    /// ctx.run(":list", &[]).await?;
+    /// ```
+    pub async fn run(&self, name: &str, args: &[&str]) -> TaskResult {
+        let registry = self
+            .registry
+            .as_ref()
+            .ok_or_else(|| TaskError::from_display("no registry available"))?;
+        let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        registry.run_with_registry(name, &string_args, registry).await
+    }
+
+    /// Query the task registry for discovery and listing.
+    ///
+    /// Returns `None` if no registry is available (standalone test context).
+    ///
+    /// ```ignore
+    /// if let Some(query) = ctx.tasks() {
+    ///     for task in query.all() {
+    ///         println!("{}: {}", task.qualified_name, task.description.unwrap_or(""));
+    ///     }
+    ///     for task in query.matching("services/*:test") {
+    ///         ctx.run(&task.qualified_name, &[]).await?;
+    ///     }
+    /// }
+    /// ```
+    pub fn tasks(&self) -> Option<TaskQuery> {
+        self.registry.as_ref().map(|r| TaskQuery {
+            registry: r.clone(),
+        })
+    }
+
     /// Access the output buffer (read the captured log entries).
     pub async fn output_lines(&self) -> Vec<LogEntry> {
         let buffer = self.output.lock().await;
         buffer.lines().iter().cloned().collect()
+    }
+}
+
+/// Lightweight task descriptor for discovery and listing.
+///
+/// Unlike `TaskDef` (which carries a function pointer and is `'static`),
+/// `TaskInfo` is an owned value suitable for serialization, display, or
+/// passing across API boundaries.
+pub struct TaskInfo {
+    pub name: &'static str,
+    pub group: &'static str,
+    pub description: Option<&'static str>,
+    /// Fully qualified name: "group:name" for grouped tasks, just "name" for root.
+    pub qualified_name: String,
+}
+
+impl TaskInfo {
+    /// Build a `TaskInfo` from a `TaskDef`.
+    pub fn from_def(def: &'static TaskDef) -> Self {
+        let qualified_name = if def.group.is_empty() {
+            def.name.to_string()
+        } else {
+            format!("{}:{}", def.group, def.name)
+        };
+        Self {
+            name: def.name,
+            group: def.group,
+            description: def.description,
+            qualified_name,
+        }
+    }
+}
+
+/// Query handle for discovering tasks in the registry.
+///
+/// Obtained via `ctx.tasks()`. Supports listing all tasks or matching
+/// by glob pattern against qualified names (`"group:name"`).
+pub struct TaskQuery {
+    registry: Arc<Registry>,
+}
+
+impl TaskQuery {
+    /// Return info for all registered tasks.
+    pub fn all(&self) -> Vec<TaskInfo> {
+        self.registry.list().iter().map(|def| TaskInfo::from_def(def)).collect()
+    }
+
+    /// Return tasks whose qualified name matches a glob pattern.
+    ///
+    /// The pattern is matched against the fully qualified name: `"group:name"`
+    /// for grouped tasks, or just `"name"` for root tasks.
+    ///
+    /// Examples: `"*:test"`, `"services/*:deploy"`, `"build"`.
+    pub fn matching(&self, pattern: &str) -> Vec<TaskInfo> {
+        let glob = match GlobBuilder::new(pattern)
+            .literal_separator(false)
+            .build()
+        {
+            Ok(g) => g.compile_matcher(),
+            Err(_) => return Vec::new(),
+        };
+
+        self.registry
+            .list()
+            .iter()
+            .filter_map(|def| {
+                let info = TaskInfo::from_def(def);
+                if glob.is_match(&info.qualified_name) {
+                    Some(info)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// RAII guard for task-level observation.
+///
+/// Created via `TaskContext::start_task()`. Emits a tracing event when
+/// dropped, recording task entry and exit for observability tooling.
+pub struct TaskGuard {
+    name: String,
+}
+
+impl TaskGuard {
+    fn new(name: &str) -> Self {
+        tracing::info!(task = name, event = "task_start", "task started");
+        Self {
+            name: name.to_string(),
+        }
+    }
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        tracing::info!(task = %self.name, event = "task_end", "task ended");
+    }
+}
+
+/// RAII guard for step-level observation within a task.
+///
+/// Created via `TaskContext::begin_step()`. Call `fail()` to mark the step
+/// as failed before it is dropped. On drop, emits a tracing event recording
+/// success or failure.
+pub struct StepGuard {
+    name: String,
+    failed: bool,
+    failure_reason: Option<String>,
+}
+
+impl StepGuard {
+    fn new(name: &str) -> Self {
+        tracing::info!(step = name, event = "step_start", "step started");
+        Self {
+            name: name.to_string(),
+            failed: false,
+            failure_reason: None,
+        }
+    }
+
+    /// Mark the step as failed with a reason.
+    pub fn fail(&mut self, reason: &str) {
+        self.failed = true;
+        self.failure_reason = Some(reason.to_string());
+    }
+}
+
+impl Drop for StepGuard {
+    fn drop(&mut self) {
+        if self.failed {
+            let reason = self.failure_reason.as_deref().unwrap_or("unknown");
+            tracing::error!(
+                step = %self.name,
+                event = "step_end",
+                success = false,
+                reason = reason,
+                "step failed"
+            );
+        } else {
+            tracing::info!(
+                step = %self.name,
+                event = "step_end",
+                success = true,
+                "step completed"
+            );
+        }
     }
 }
 
@@ -428,12 +695,103 @@ impl Registry {
 
     /// Look up a task by name, create a context, and call its function.
     pub async fn run(&self, name: &str) -> Result<(), TaskError> {
+        self.run_with_args(name, &[]).await
+    }
+
+    /// Look up a task by name, create a context, and call its function with arguments.
+    pub async fn run_with_args(&self, name: &str, args: &[String]) -> Result<(), TaskError> {
         match self.get(name) {
             Some(task) => {
                 let ctx = TaskContext::new(task.name);
-                (task.func)(&ctx).await
+                (task.func)(&ctx, args).await
             }
             None => Err(TaskError::from_display(format!("unknown task: {}", name))),
+        }
+    }
+
+    /// Resolve and run a task, injecting the registry into the TaskContext.
+    ///
+    /// This is the primary entry point for cross-file invocation. The created
+    /// `TaskContext` receives the registry so that the invoked task can itself
+    /// call `ctx.run()` for transitive invocation.
+    pub async fn run_with_registry(
+        &self,
+        name: &str,
+        args: &[String],
+        registry: &Arc<Registry>,
+    ) -> Result<(), TaskError> {
+        let task = self.resolve(name)?;
+        let mut ctx = TaskContext::new(task.name);
+        ctx.set_registry(registry.clone());
+        (task.func)(&ctx, args).await
+    }
+
+    /// Resolve a task name to a `TaskDef` using 3-tier resolution.
+    ///
+    /// Resolution rules:
+    /// 1. **`:` prefix** — stripped and resolved as `builtin:name`
+    ///    (e.g., `:list` finds the `list` task in group `"builtin"`)
+    /// 2. **`group:name` qualified** — exact match on group key and task name
+    /// 3. **Short name** — match by task name alone:
+    ///    - If exactly one task matches, return it
+    ///    - If multiple match but one is in the root group (`""`), root wins
+    ///    - Otherwise, return an error listing the qualified alternatives
+    pub fn resolve(&self, name: &str) -> Result<&'static TaskDef, TaskError> {
+        // Handle `:` prefix → builtin: group
+        if let Some(short) = name.strip_prefix(':') {
+            return self
+                .tasks
+                .iter()
+                .find(|t| t.name == short && t.group == "builtin")
+                .copied()
+                .ok_or_else(|| {
+                    TaskError::from_display(format!("unknown built-in task: {}", short))
+                });
+        }
+
+        // Handle group:task explicit lookup
+        if let Some((group, task_name)) = name.split_once(':') {
+            return self
+                .tasks
+                .iter()
+                .find(|t| t.name == task_name && t.group == group)
+                .copied()
+                .ok_or_else(|| TaskError::from_display(format!("unknown task: {}", name)));
+        }
+
+        // Short name lookup with root-wins disambiguation
+        let matches: Vec<&'static TaskDef> = self
+            .tasks
+            .iter()
+            .filter(|t| t.name == name)
+            .copied()
+            .collect();
+
+        match matches.len() {
+            0 => Err(TaskError::from_display(format!("unknown task: {}", name))),
+            1 => Ok(matches[0]),
+            _ => {
+                // Root group ("") wins short names
+                if let Some(root_task) = matches.iter().find(|t| t.group.is_empty()) {
+                    Ok(root_task)
+                } else {
+                    let qualified: Vec<String> = matches
+                        .iter()
+                        .map(|t| {
+                            if t.group.is_empty() {
+                                t.name.to_string()
+                            } else {
+                                format!("{}:{}", t.group, t.name)
+                            }
+                        })
+                        .collect();
+                    Err(TaskError::from_display(format!(
+                        "ambiguous task '{}', use: {}",
+                        name,
+                        qualified.join(", ")
+                    )))
+                }
+            }
         }
     }
 
@@ -463,7 +821,7 @@ impl Registry {
             let name = task_def.name.to_string();
             join_set.spawn(async move {
                 let ctx = TaskContext::new(&name);
-                func(&ctx).await
+                func(&ctx, &[]).await
             });
         }
 
@@ -489,18 +847,24 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn dummy_task(
-        ctx: &TaskContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+    fn no_arg_metadata() -> Option<clap::Command> {
+        None
+    }
+
+    fn dummy_task<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>> {
         Box::pin(async move {
             println!("Running dummy task: {}", ctx.name);
             Ok(())
         })
     }
 
-    fn another_task(
-        ctx: &TaskContext,
-    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+    fn another_task<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>> {
         Box::pin(async move {
             println!("Running another task: {}", ctx.name);
             Ok(())
@@ -513,6 +877,8 @@ mod tests {
         group: "",
         depends_on: &[],
         func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
     };
 
     static TEST_TASK_B: TaskDef = TaskDef {
@@ -521,6 +887,8 @@ mod tests {
         group: "",
         depends_on: &["alpha"],
         func: another_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
     };
 
     #[test]
@@ -593,18 +961,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_parallel() {
-        fn task_a(
-            ctx: &TaskContext,
-        ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+        fn task_a<'a>(
+            ctx: &'a TaskContext,
+            _args: &[String],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>> {
             Box::pin(async move {
                 println!("parallel task A: {}", ctx.name);
                 Ok(())
             })
         }
 
-        fn task_b(
-            ctx: &TaskContext,
-        ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>> {
+        fn task_b<'a>(
+            ctx: &'a TaskContext,
+            _args: &[String],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>> {
             Box::pin(async move {
                 println!("parallel task B: {}", ctx.name);
                 Ok(())
@@ -617,6 +987,8 @@ mod tests {
             group: "",
             depends_on: &[],
             func: task_a,
+            arg_metadata: no_arg_metadata,
+            ui_hint: None,
         };
 
         static PARB: TaskDef = TaskDef {
@@ -625,6 +997,8 @@ mod tests {
             group: "",
             depends_on: &[],
             func: task_b,
+            arg_metadata: no_arg_metadata,
+            ui_hint: None,
         };
 
         let mut reg = Registry::new();
@@ -688,5 +1062,282 @@ mod tests {
         // Initially empty
         let entries = output.entries().await;
         assert!(entries.is_empty());
+    }
+
+    // --- resolve() tests ---
+
+    // Additional static task defs for resolve tests (various groups)
+    static RESOLVE_ROOT_BUILD: TaskDef = TaskDef {
+        name: "build",
+        description: Some("Root build"),
+        group: "",
+        depends_on: &[],
+        func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
+    };
+
+    static RESOLVE_SERVICES_BUILD: TaskDef = TaskDef {
+        name: "build",
+        description: Some("Services build"),
+        group: "services",
+        depends_on: &[],
+        func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
+    };
+
+    static RESOLVE_AUTH_DEPLOY: TaskDef = TaskDef {
+        name: "deploy",
+        description: Some("Auth deploy"),
+        group: "services/auth",
+        depends_on: &[],
+        func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
+    };
+
+    static RESOLVE_WEB_DEPLOY: TaskDef = TaskDef {
+        name: "deploy",
+        description: Some("Web deploy"),
+        group: "web",
+        depends_on: &[],
+        func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
+    };
+
+    static RESOLVE_BUILTIN_LIST: TaskDef = TaskDef {
+        name: "list",
+        description: Some("List tasks"),
+        group: "builtin",
+        depends_on: &[],
+        func: dummy_task,
+        arg_metadata: no_arg_metadata,
+        ui_hint: None,
+    };
+
+    fn resolve_registry() -> Registry {
+        let mut reg = Registry::new();
+        reg.register(&RESOLVE_ROOT_BUILD);
+        reg.register(&RESOLVE_SERVICES_BUILD);
+        reg.register(&RESOLVE_AUTH_DEPLOY);
+        reg.register(&RESOLVE_WEB_DEPLOY);
+        reg.register(&RESOLVE_BUILTIN_LIST);
+        reg
+    }
+
+    #[test]
+    fn test_resolve_exact_short_name() {
+        let reg = resolve_registry();
+        // "deploy" exists in two non-root groups, but "alpha" is unique in root
+        let mut reg2 = Registry::new();
+        reg2.register(&TEST_TASK_A); // "alpha" in root group
+        let task = reg2.resolve("alpha").unwrap();
+        assert_eq!(task.name, "alpha");
+
+        // Single match in a non-root group also resolves
+        let task = reg.resolve("list").unwrap();
+        assert_eq!(task.name, "list");
+        assert_eq!(task.group, "builtin");
+    }
+
+    #[test]
+    fn test_resolve_group_task_qualified() {
+        let reg = resolve_registry();
+        let task = reg.resolve("services/auth:deploy").unwrap();
+        assert_eq!(task.name, "deploy");
+        assert_eq!(task.group, "services/auth");
+
+        let task = reg.resolve("web:deploy").unwrap();
+        assert_eq!(task.name, "deploy");
+        assert_eq!(task.group, "web");
+
+        let task = reg.resolve("services:build").unwrap();
+        assert_eq!(task.name, "build");
+        assert_eq!(task.group, "services");
+    }
+
+    #[test]
+    fn test_resolve_ambiguous_root_wins() {
+        let reg = resolve_registry();
+        // "build" exists in root ("") and in "services". Root wins.
+        let task = reg.resolve("build").unwrap();
+        assert_eq!(task.name, "build");
+        assert_eq!(task.group, "");
+    }
+
+    #[test]
+    fn test_resolve_ambiguous_no_root_errors() {
+        let reg = resolve_registry();
+        // "deploy" exists in "services/auth" and "web", neither is root.
+        let result = reg.resolve("deploy");
+        assert!(result.is_err());
+        let msg = result.err().unwrap().to_string();
+        assert!(msg.contains("ambiguous task 'deploy'"));
+        assert!(msg.contains("services/auth:deploy"));
+        assert!(msg.contains("web:deploy"));
+    }
+
+    #[test]
+    fn test_resolve_colon_prefix_builtin() {
+        let reg = resolve_registry();
+        let task = reg.resolve(":list").unwrap();
+        assert_eq!(task.name, "list");
+        assert_eq!(task.group, "builtin");
+    }
+
+    #[test]
+    fn test_resolve_colon_prefix_unknown() {
+        let reg = resolve_registry();
+        let result = reg.resolve(":nonexistent");
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "unknown built-in task: nonexistent"
+        );
+    }
+
+    #[test]
+    fn test_resolve_unknown_task() {
+        let reg = resolve_registry();
+        let result = reg.resolve("nonexistent");
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "unknown task: nonexistent"
+        );
+    }
+
+    #[test]
+    fn test_resolve_unknown_qualified() {
+        let reg = resolve_registry();
+        let result = reg.resolve("nope:build");
+        assert!(result.is_err());
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "unknown task: nope:build"
+        );
+    }
+
+    // --- TaskQuery tests ---
+
+    #[test]
+    fn test_task_query_all() {
+        let reg = Arc::new(resolve_registry());
+        let query = TaskQuery {
+            registry: reg.clone(),
+        };
+        let all = query.all();
+        assert_eq!(all.len(), 5);
+        let names: Vec<&str> = all.iter().map(|t| t.name).collect();
+        assert!(names.contains(&"build"));
+        assert!(names.contains(&"deploy"));
+        assert!(names.contains(&"list"));
+    }
+
+    #[test]
+    fn test_task_query_matching() {
+        let reg = Arc::new(resolve_registry());
+        let query = TaskQuery {
+            registry: reg.clone(),
+        };
+
+        // Match all deploy tasks
+        let deploys = query.matching("*:deploy");
+        assert_eq!(deploys.len(), 2);
+        let groups: Vec<&str> = deploys.iter().map(|t| t.group).collect();
+        assert!(groups.contains(&"services/auth"));
+        assert!(groups.contains(&"web"));
+
+        // Match root tasks (no colon in qualified name)
+        let root = query.matching("build");
+        assert_eq!(root.len(), 1);
+        assert_eq!(root[0].group, "");
+
+        // Match everything
+        let all = query.matching("*");
+        // Root "build" has qualified name "build" (no colon), matches "*"
+        // Others have "group:name", which also matches "*"
+        assert!(all.len() >= 1);
+    }
+
+    #[test]
+    fn test_task_query_matching_no_results() {
+        let reg = Arc::new(resolve_registry());
+        let query = TaskQuery {
+            registry: reg.clone(),
+        };
+        let results = query.matching("nonexistent:*");
+        assert!(results.is_empty());
+    }
+
+    // --- ctx.run() and ctx.tasks() tests ---
+
+    #[tokio::test]
+    async fn test_ctx_run_with_registry() {
+        let mut reg = Registry::new();
+        reg.register(&TEST_TASK_A);
+        let reg = Arc::new(reg);
+
+        let mut ctx = TaskContext::new("caller");
+        ctx.set_registry(reg.clone());
+
+        // Should be able to invoke "alpha" through ctx.run()
+        let result = ctx.run("alpha", &[]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_ctx_run_without_registry() {
+        let ctx = TaskContext::new("caller");
+        let result = ctx.run("alpha", &[]).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "no registry available");
+    }
+
+    #[test]
+    fn test_ctx_tasks_with_registry() {
+        let mut reg = Registry::new();
+        reg.register(&TEST_TASK_A);
+        reg.register(&TEST_TASK_B);
+        let reg = Arc::new(reg);
+
+        let mut ctx = TaskContext::new("caller");
+        ctx.set_registry(reg.clone());
+
+        let query = ctx.tasks();
+        assert!(query.is_some());
+        let all = query.unwrap().all();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_ctx_tasks_without_registry() {
+        let ctx = TaskContext::new("caller");
+        assert!(ctx.tasks().is_none());
+    }
+
+    // --- run_with_registry test ---
+
+    #[tokio::test]
+    async fn test_run_with_registry() {
+        let mut reg = Registry::new();
+        reg.register(&TEST_TASK_A);
+        let reg = Arc::new(reg);
+
+        let result = reg.run_with_registry("alpha", &[], &reg).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_run_with_registry_resolve_fails() {
+        let reg = Arc::new(Registry::new());
+        let result = reg.run_with_registry("nonexistent", &[], &reg).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "unknown task: nonexistent"
+        );
     }
 }

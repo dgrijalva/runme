@@ -106,6 +106,25 @@ impl LogEntry {
         }
     }
 
+    /// Create a raw, undecorated log entry (no timestamp, level, or fields).
+    ///
+    /// Used by `TaskContext::println()` for plain text output that should
+    /// appear without log decoration in any UI mode.
+    pub fn raw(text: &str, source: &str) -> Self {
+        Self {
+            raw: text.to_string(),
+            parsed: ParsedContent::PlainText,
+            source: source.to_string(),
+            seq: 0,
+            received_at: Utc::now(),
+            timestamp: None,
+            level: None,
+            message: Some(text.to_string()),
+            fields: HashMap::new(),
+            stream: None,
+        }
+    }
+
     /// Get the best available timestamp string for display.
     /// Prefers the extracted timestamp from log content; falls back to received_at.
     pub fn display_timestamp(&self) -> String {

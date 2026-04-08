@@ -16,7 +16,7 @@ pub use filter::FilterInputState;
 pub use output::{TuiOutput, TuiOutputHandle, TuiOutputStreamHandle};
 pub use picker::PickerState;
 pub use render::{DisplayMode, SourceColors};
-pub use runner::{TaskRunner, TaskStatus};
+pub use runner::{TaskRunner, TaskSession, TaskStatus};
 pub use search::SearchState;
 pub use sidebar::SidebarState;
 pub use viewport::ScrollState;

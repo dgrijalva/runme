@@ -1,3 +1,5 @@
+pub mod builtin;
+pub mod cli;
 pub mod cmd;
 pub mod error;
 pub mod init;
@@ -22,3 +24,6 @@ pub use tokio;
 
 // Re-export serde_json so macro-generated code can reference it
 pub use serde_json;
+
+// Re-export clap so macro-generated arg_metadata code can reference it
+pub use clap;

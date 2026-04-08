@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 use crate::log::LogEntry;
 use crate::log::filter as log_filter;
 use crate::log::store::LogStore;
-use crate::task::TaskDef;
+use crate::task::{Registry, TaskDef};
 
 use super::event::run_event_loop;
 use super::filter::FilterInputState;
@@ -118,6 +118,8 @@ pub struct AppState {
     /// Post-TUI output buffer. Shared with the TaskContext via the runner.
     /// Flushed to real stdio after `restore_terminal()`.
     pub tui_output: Option<Arc<Mutex<TuiOutput>>>,
+    /// Shared registry for task discovery and cross-invocation.
+    pub registry: Option<Arc<Registry>>,
 }
 
 impl Default for AppState {
@@ -161,6 +163,7 @@ impl AppState {
             filter_history_index: None,
             tui_wait: None,
             tui_output: None,
+            registry: None,
         }
     }
 
@@ -249,15 +252,21 @@ impl AppState {
 
     /// Launch a task from the picker. Sets up the TaskRunner and transitions
     /// to Normal mode. Called from the event loop when pending_task is set.
-    pub fn launch_picked_task(&mut self, task: &'static TaskDef) {
+    pub fn launch_picked_task(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
         let mut runner = TaskRunner::new();
+        if let Some(ref registry) = self.registry {
+            runner.set_registry(registry.clone());
+        }
         let log_store = runner.log_store.clone();
-        let task_status = runner.status.clone();
-        let processes = runner.processes.clone();
         let tui_wait = runner.tui_wait.clone();
         let tui_output = runner.tui_output.clone();
 
-        runner.launch(task);
+        runner.launch(task, task_args);
+
+        // Capture status/processes AFTER launch — launch() replaces these
+        // with the session's Arcs for the first session.
+        let task_status = runner.status.clone();
+        let processes = runner.processes.clone();
 
         self.log_store = log_store;
         self.task_status = Some(task_status);
@@ -297,21 +306,27 @@ impl App {
     ///
     /// Shows all available tasks grouped by their source file, with fuzzy
     /// filtering. The user selects a task to launch.
-    pub fn with_picker(tasks: Vec<&'static TaskDef>, group_names: HashMap<String, String>) -> Self {
+    pub fn with_picker(
+        tasks: Vec<&'static TaskDef>,
+        group_names: HashMap<String, String>,
+        registry: Arc<Registry>,
+    ) -> Self {
         let picker = PickerState::new(&tasks, &group_names);
         let mut state = AppState::new();
         state.mode = AppMode::TaskPicker;
         state.picker = Some(picker);
         state.all_tasks = tasks;
         state.group_names = group_names;
+        state.registry = Some(registry);
 
         Self { state }
     }
 
     /// Create an App configured to run a specific task immediately.
-    pub fn with_task(task: &'static TaskDef) -> Self {
+    pub fn with_task(task: &'static TaskDef, task_args: Vec<String>, registry: Arc<Registry>) -> Self {
         let mut state = AppState::new();
-        state.launch_picked_task(task);
+        state.registry = Some(registry);
+        state.launch_picked_task(task, task_args);
         Self { state }
     }
 
@@ -494,6 +509,7 @@ mod tests {
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
@@ -502,6 +518,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
 
@@ -546,6 +563,7 @@ mod tests {
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
+                depth: 0,
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
@@ -554,6 +572,7 @@ mod tests {
                 status_color: Color::Green,
                 visible: true,
                 is_task: false,
+                depth: 1,
             },
         ];
 

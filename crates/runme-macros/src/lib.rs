@@ -1,34 +1,211 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{Expr, ExprLit, ItemFn, Lit, Meta, MetaNameValue, ReturnType, parse_macro_input};
+use syn::{
+    Expr, ExprLit, FnArg, GenericArgument, ItemFn, Lit, Meta, MetaNameValue, Pat, PathArguments,
+    ReturnType, Type, TypePath, parse_macro_input,
+};
+
+/// Known primitive type names for the detection heuristic.
+/// If a single remaining parameter has one of these types, it's Form 2 (simple args).
+/// If it has a non-primitive type, it's Form 3 (parser struct).
+const KNOWN_PRIMITIVES: &[&str] = &[
+    "String", "bool", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128",
+    "f32", "f64", "usize", "isize",
+];
+
+/// Describes which argument form a task function uses.
+enum ArgForm {
+    /// Zero extra params after ctx: async fn build(ctx: &TaskContext) -> TaskResult
+    ZeroArgs,
+    /// Simple params: async fn deploy(ctx: &TaskContext, env: String, port: u16) -> TaskResult
+    SimpleArgs(Vec<SimpleParam>),
+    /// Parser struct: async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult
+    ParserStruct {
+        #[allow(dead_code)]
+        param_name: syn::Ident,
+        param_type: Box<syn::Type>,
+    },
+}
+
+/// A simple parameter extracted from the function signature.
+struct SimpleParam {
+    name: syn::Ident,
+    ty: syn::Type,
+    kind: SimpleParamKind,
+}
+
+/// Classification of a simple parameter for clap arg generation.
+enum SimpleParamKind {
+    /// bool -> --flag (no value, presence = true)
+    Bool,
+    /// String, numeric types -> --name <value> (required)
+    Required,
+    /// Option<T> -> --name <value> (optional)
+    Optional(syn::Type),
+    /// Vec<T> -> --name <value> (repeatable)
+    Repeatable(syn::Type),
+}
+
+/// Check if a type path's last segment matches a given name (ignoring generics).
+fn type_ident_is(ty: &Type, name: &str) -> bool {
+    if let Type::Path(TypePath { path, .. }) = ty
+        && let Some(seg) = path.segments.last()
+    {
+        return seg.ident == name;
+    }
+    false
+}
+
+/// Extract the inner type from Option<T> or Vec<T>.
+fn extract_generic_inner(ty: &Type) -> Option<syn::Type> {
+    if let Type::Path(TypePath { path, .. }) = ty
+        && let Some(seg) = path.segments.last()
+        && let PathArguments::AngleBracketed(ref args) = seg.arguments
+        && let Some(GenericArgument::Type(inner)) = args.args.first()
+    {
+        return Some(inner.clone());
+    }
+    None
+}
+
+/// Check if a type is a known primitive (not Option/Vec wrapper).
+fn is_known_primitive(ty: &Type) -> bool {
+    if let Type::Path(TypePath { path, .. }) = ty
+        && let Some(seg) = path.segments.last()
+    {
+        let name = seg.ident.to_string();
+        if KNOWN_PRIMITIVES.contains(&name.as_str()) {
+            return true;
+        }
+        // Option<T> and Vec<T> are considered "primitive wrappers"
+        if (name == "Option" || name == "Vec") && extract_generic_inner(ty).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Classify a simple parameter for clap arg generation.
+fn classify_param(name: syn::Ident, ty: syn::Type) -> SimpleParam {
+    let kind = if type_ident_is(&ty, "bool") {
+        SimpleParamKind::Bool
+    } else if type_ident_is(&ty, "Option") {
+        let inner = extract_generic_inner(&ty).unwrap();
+        SimpleParamKind::Optional(inner)
+    } else if type_ident_is(&ty, "Vec") {
+        let inner = extract_generic_inner(&ty).unwrap();
+        SimpleParamKind::Repeatable(inner)
+    } else {
+        SimpleParamKind::Required
+    };
+    SimpleParam { name, ty, kind }
+}
+
+/// Detect the argument form from function parameters.
+fn detect_arg_form(input_fn: &ItemFn) -> Result<ArgForm, syn::Error> {
+    // Collect params after the first (ctx: &TaskContext)
+    let params: Vec<_> = input_fn
+        .sig
+        .inputs
+        .iter()
+        .skip(1) // skip ctx
+        .collect();
+
+    if params.is_empty() {
+        return Ok(ArgForm::ZeroArgs);
+    }
+
+    if params.len() > 1 {
+        // Multiple params -> Form 2 (simple args)
+        let mut simple_params = Vec::new();
+        for param in params {
+            let (name, ty) = extract_typed_param(param)?;
+            simple_params.push(classify_param(name, ty));
+        }
+        return Ok(ArgForm::SimpleArgs(simple_params));
+    }
+
+    // Exactly one param. Check if it's a known primitive -> Form 2, else -> Form 3.
+    let (name, ty) = extract_typed_param(params[0])?;
+    if is_known_primitive(&ty) {
+        let simple = classify_param(name, ty);
+        return Ok(ArgForm::SimpleArgs(vec![simple]));
+    }
+
+    // Non-primitive single param -> Form 3 (parser struct)
+    Ok(ArgForm::ParserStruct {
+        param_name: name,
+        param_type: Box::new(ty),
+    })
+}
+
+/// Extract the name and type from a function parameter.
+fn extract_typed_param(arg: &FnArg) -> Result<(syn::Ident, syn::Type), syn::Error> {
+    match arg {
+        FnArg::Typed(pat_type) => {
+            let name = match pat_type.pat.as_ref() {
+                Pat::Ident(pat_ident) => pat_ident.ident.clone(),
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        other,
+                        "expected a simple identifier pattern for task parameter",
+                    ));
+                }
+            };
+            Ok((name, (*pat_type.ty).clone()))
+        }
+        FnArg::Receiver(r) => Err(syn::Error::new_spanned(
+            r,
+            "task functions cannot have a `self` parameter",
+        )),
+    }
+}
 
 /// Attribute macro for defining a runme task.
 ///
 /// Supports both sync and async task functions. The function is wrapped
-/// to produce the `TaskFn` signature: `fn(&TaskContext) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>`.
+/// to produce the `TaskFn` signature: `fn(&TaskContext, &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>`.
 ///
 /// The generated `TaskDef` includes `group: __RUNME_GROUP`. This constant is
 /// injected by the code generator at compile time. For standalone usage (tests,
 /// examples), define `const __RUNME_GROUP: &str = "";` manually.
 ///
-/// Usage:
+/// # Three argument forms
+///
+/// **Form 1: Zero args**
 /// ```ignore
 /// #[runme::task(desc = "Build the project")]
-/// async fn build(ctx: &TaskContext) {
-///     ctx.exec("cargo build").await.unwrap();
+/// async fn build(ctx: &TaskContext) -> TaskResult {
+///     ctx.exec("cargo build").await?.ok()?;
+///     Ok(())
 /// }
 /// ```
 ///
-/// Also works with sync functions:
+/// **Form 2: Simple args** (auto-generates clap from params)
 /// ```ignore
-/// #[runme::task(desc = "Say hello")]
-/// fn hello(ctx: &TaskContext) {
-///     println!("Hello from task: {}", ctx.name);
+/// #[runme::task(desc = "Deploy to environment")]
+/// async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
+///     // env -> --env <value>, port -> --port <value>, verbose -> --verbose (flag)
+///     Ok(())
+/// }
+/// ```
+///
+/// **Form 3: Parser struct** (single non-primitive param, uses clap derive)
+/// ```ignore
+/// #[derive(clap::Parser)]
+/// struct DeployArgs {
+///     #[arg(long)]
+///     env: String,
+/// }
+///
+/// #[runme::task(desc = "Deploy to environment")]
+/// async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult {
+///     Ok(())
 /// }
 /// ```
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
-    let input_fn = parse_macro_input!(item as ItemFn);
+    let mut input_fn = parse_macro_input!(item as ItemFn);
     let fn_name = &input_fn.sig.ident;
     let fn_name_str = fn_name.to_string();
     let is_async = input_fn.sig.asyncness.is_some();
@@ -120,29 +297,120 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! { &[#(#dep_strs),*] }
     };
 
+    // Detect argument form
+    let arg_form = match detect_arg_form(&input_fn) {
+        Ok(form) => form,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    // Inject start_task() as the first statement in the function body
+    {
+        let task_name_str = &fn_name_str;
+        // Extract the actual context parameter name (first param) instead of hardcoding "ctx"
+        let ctx_ident = match input_fn.sig.inputs.first() {
+            Some(FnArg::Typed(pat_type)) => match pat_type.pat.as_ref() {
+                Pat::Ident(pat_ident) => pat_ident.ident.clone(),
+                _ => syn::Ident::new("ctx", proc_macro2::Span::call_site()),
+            },
+            _ => syn::Ident::new("ctx", proc_macro2::Span::call_site()),
+        };
+        let start_task_stmt: syn::Stmt = syn::parse_quote! {
+            let _task = #ctx_ident.start_task(#task_name_str);
+        };
+        input_fn.block.stmts.insert(0, start_task_stmt);
+    }
+
     // Generate a wrapper function name for the TaskFn registration
     let wrapper_name = syn::Ident::new(&format!("__runme_taskfn_{}", fn_name), fn_name.span());
+
+    // Generate the arg_metadata function name
+    let arg_metadata_name =
+        syn::Ident::new(&format!("__runme_argmeta_{}", fn_name), fn_name.span());
 
     // Detect whether the function has an explicit return type (Result) or returns ()
     let has_return_type = !matches!(input_fn.sig.output, ReturnType::Default);
 
-    // The wrapper adapts the user's function (sync/async, void/Result)
-    // to TaskFn: fn(&TaskContext) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + '_>>
+    // Generate the parse block, function call expression, and arg_metadata function
+    // based on argument form.
+    //
+    // For forms with arguments:
+    // - The parse_block uses `match`/`Err` (not `?`) to return parse errors as futures,
+    //   since the wrapper function returns `Pin<Box<Future<Result>>>`, not `Result`.
+    // - The parse_block runs synchronously (before `Box::pin`) so `__args` doesn't need
+    //   to outlive the function body.
+    // - Parsed values are moved into the async block for async tasks.
+    let (parse_block, fn_call, arg_metadata_tokens) = match &arg_form {
+        ArgForm::ZeroArgs => {
+            let parse = quote! {};
+            let call = quote! { #fn_name(ctx) };
+            let metadata = quote! {
+                fn #arg_metadata_name() -> Option<::runme::clap::Command> {
+                    None
+                }
+            };
+            (parse, call, metadata)
+        }
+        ArgForm::SimpleArgs(params) => {
+            let (parse_stmts, call_args, cmd_build) =
+                generate_simple_args(fn_name_str.clone(), params);
+            let parse = parse_stmts;
+            let call = quote! { #fn_name(ctx, #(#call_args),*) };
+            let metadata = quote! {
+                fn #arg_metadata_name() -> Option<::runme::clap::Command> {
+                    Some({ #cmd_build })
+                }
+            };
+            (parse, call, metadata)
+        }
+        ArgForm::ParserStruct {
+            param_name: _,
+            param_type,
+        } => {
+            let parse = quote! {
+                let __parsed = match <#param_type as ::runme::clap::Parser>::try_parse_from(
+                    ::std::iter::once(::std::string::String::from(#fn_name_str))
+                        .chain(__args.iter().cloned())
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return ::std::boxed::Box::pin(::std::future::ready(
+                        Err(::runme::error::TaskError::from_display(e))
+                    )),
+                };
+            };
+            let call = quote! { #fn_name(ctx, __parsed) };
+            let metadata = quote! {
+                fn #arg_metadata_name() -> Option<::runme::clap::Command> {
+                    Some(<#param_type as ::runme::clap::CommandFactory>::command())
+                }
+            };
+            (parse, call, metadata)
+        }
+    };
+
+    // Build the wrapper function. The wrapper adapts the user's function
+    // (sync/async, void/Result, with/without args) to TaskFn:
+    //   for<'a> fn(&'a TaskContext, &[String]) -> Pin<Box<dyn Future<...> + Send + 'a>>
+    //
+    // The parse_block runs synchronously (before `Box::pin`), so that `__args`
+    // doesn't need to live into the async future. The parsed values are moved
+    // into the async block.
     let wrapper = match (is_async, has_return_type) {
         (true, true) => {
             // async fn(...) -> Result<(), TaskError>
             quote! {
-                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
-                    ::std::boxed::Box::pin(#fn_name(ctx))
+                fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::runme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '__runme_lt>> {
+                    #parse_block
+                    ::std::boxed::Box::pin(async move { #fn_call .await })
                 }
             }
         }
         (true, false) => {
             // async fn(...) — no return type, wrap with Ok(())
             quote! {
-                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
+                fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::runme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '__runme_lt>> {
+                    #parse_block
                     ::std::boxed::Box::pin(async move {
-                        #fn_name(ctx).await;
+                        #fn_call .await;
                         Ok(())
                     })
                 }
@@ -151,8 +419,9 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         (false, true) => {
             // fn(...) -> Result<(), TaskError>
             quote! {
-                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
-                    let result = #fn_name(ctx);
+                fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::runme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '__runme_lt>> {
+                    #parse_block
+                    let result = #fn_call;
                     ::std::boxed::Box::pin(::std::future::ready(result))
                 }
             }
@@ -160,8 +429,9 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         (false, false) => {
             // fn(...) — no return type, wrap with Ok(())
             quote! {
-                fn #wrapper_name(ctx: &::runme::task::TaskContext) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '_>> {
-                    #fn_name(ctx);
+                fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::runme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::runme::error::TaskError>> + Send + '__runme_lt>> {
+                    #parse_block
+                    #fn_call;
                     ::std::boxed::Box::pin(::std::future::ready(Ok(())))
                 }
             }
@@ -173,6 +443,8 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #wrapper
 
+        #arg_metadata_tokens
+
         ::runme::inventory::submit! {
             ::runme::task::TaskDef {
                 name: #fn_name_str,
@@ -180,11 +452,160 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 group: __RUNME_GROUP,
                 depends_on: #deps_tokens,
                 func: #wrapper_name,
+                arg_metadata: #arg_metadata_name,
+                ui_hint: None,
             }
         }
     };
 
     expanded.into()
+}
+
+/// Generate the parsing block, call arguments, and clap::Command builder
+/// for Form 2 (simple args).
+fn generate_simple_args(
+    task_name: String,
+    params: &[SimpleParam],
+) -> (
+    proc_macro2::TokenStream,
+    Vec<proc_macro2::TokenStream>,
+    proc_macro2::TokenStream,
+) {
+    // Build the clap::Command with args
+    let mut arg_builders = Vec::new();
+    for param in params {
+        let name_str = param.name.to_string();
+        let long_name = name_str.replace('_', "-");
+        let arg_build = match &param.kind {
+            SimpleParamKind::Bool => {
+                quote! {
+                    ::runme::clap::Arg::new(#name_str)
+                        .long(#long_name)
+                        .action(::runme::clap::ArgAction::SetTrue)
+                }
+            }
+            SimpleParamKind::Required => {
+                quote! {
+                    ::runme::clap::Arg::new(#name_str)
+                        .long(#long_name)
+                        .required(true)
+                        .action(::runme::clap::ArgAction::Set)
+                }
+            }
+            SimpleParamKind::Optional(_) => {
+                quote! {
+                    ::runme::clap::Arg::new(#name_str)
+                        .long(#long_name)
+                        .required(false)
+                        .action(::runme::clap::ArgAction::Set)
+                }
+            }
+            SimpleParamKind::Repeatable(_) => {
+                quote! {
+                    ::runme::clap::Arg::new(#name_str)
+                        .long(#long_name)
+                        .action(::runme::clap::ArgAction::Append)
+                }
+            }
+        };
+        arg_builders.push(arg_build);
+    }
+
+    // Build the Command construction code (shared between wrapper and metadata)
+    let cmd_build = quote! {
+        ::runme::clap::Command::new(#task_name)
+            #(.arg(#arg_builders))*
+    };
+
+    // Generate the parsing code for the wrapper
+    let mut parse_stmts = Vec::new();
+    let mut call_args = Vec::new();
+
+    // Parse the args with clap. Uses match + early return instead of `?`
+    // because the wrapper function returns Pin<Box<Future<Result>>>, not Result.
+    let parse_match = quote! {
+        let __clap_matches = match ({
+            #cmd_build
+        }).try_get_matches_from(
+            ::std::iter::once(::std::string::String::from(#task_name))
+                .chain(__args.iter().cloned())
+        ) {
+            Ok(m) => m,
+            Err(e) => return ::std::boxed::Box::pin(::std::future::ready(
+                Err(::runme::error::TaskError::from_display(e))
+            )),
+        };
+    };
+    parse_stmts.push(parse_match);
+
+    // Extract each parameter. Uses match + early return for parse errors.
+    for param in params {
+        let param_name = &param.name;
+        let name_str = param.name.to_string();
+        let ty = &param.ty;
+
+        let extract = match &param.kind {
+            SimpleParamKind::Bool => {
+                quote! {
+                    let #param_name: #ty = __clap_matches.get_flag(#name_str);
+                }
+            }
+            SimpleParamKind::Required => {
+                quote! {
+                    let #param_name: #ty = match __clap_matches.get_one::<String>(#name_str) {
+                        Some(v) => match v.parse::<#ty>() {
+                            Ok(parsed) => parsed,
+                            Err(e) => return ::std::boxed::Box::pin(::std::future::ready(
+                                Err(::runme::error::TaskError::from_display(
+                                    format!("invalid value for --{}: {}", #name_str, e)
+                                ))
+                            )),
+                        },
+                        None => return ::std::boxed::Box::pin(::std::future::ready(
+                            Err(::runme::error::TaskError::from_display(
+                                format!("missing required argument: --{}", #name_str)
+                            ))
+                        )),
+                    };
+                }
+            }
+            SimpleParamKind::Optional(inner) => {
+                quote! {
+                    let #param_name: #ty = match __clap_matches.get_one::<String>(#name_str)
+                        .map(|v| v.parse::<#inner>())
+                        .transpose()
+                    {
+                        Ok(v) => v,
+                        Err(e) => return ::std::boxed::Box::pin(::std::future::ready(
+                            Err(::runme::error::TaskError::from_display(
+                                format!("invalid value for --{}: {}", #name_str, e)
+                            ))
+                        )),
+                    };
+                }
+            }
+            SimpleParamKind::Repeatable(inner) => {
+                quote! {
+                    let #param_name: #ty = match __clap_matches.get_many::<String>(#name_str)
+                        .map(|vals| vals.map(|v| v.parse::<#inner>()).collect::<Result<Vec<_>, _>>())
+                        .transpose()
+                    {
+                        Ok(v) => v.unwrap_or_default(),
+                        Err(e) => return ::std::boxed::Box::pin(::std::future::ready(
+                            Err(::runme::error::TaskError::from_display(
+                                format!("invalid value for --{}: {}", #name_str, e)
+                            ))
+                        )),
+                    };
+                }
+            }
+        };
+        parse_stmts.push(extract);
+        call_args.push(quote! { #param_name });
+    }
+
+    let parse_block = quote! { #(#parse_stmts)* };
+    (parse_block, call_args, cmd_build)
 }
 
 /// Attribute macro for per-file initialization hooks.
