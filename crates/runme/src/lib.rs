@@ -7,6 +7,7 @@ pub mod builtin;
 pub mod cli;
 pub mod cmd;
 pub mod error;
+pub mod execution;
 pub mod init;
 pub mod log;
 pub mod prelude;

@@ -466,7 +466,11 @@ mod tests {
             task_status_display(&TaskStatus::Done),
             ("DONE".to_string(), Color::DarkGray)
         );
-        let (tag, color) = task_status_display(&TaskStatus::Failed("err".to_string()));
+        let (tag, color) = task_status_display(&TaskStatus::Failed(crate::execution::TaskFailure {
+            message: "err".to_string(),
+            exit_code: 1,
+            output_json: "{}".to_string(),
+        }));
         assert_eq!(tag, "FAIL");
         assert_eq!(color, Color::Red);
     }

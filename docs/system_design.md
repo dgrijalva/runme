@@ -79,6 +79,32 @@ runme --ui cli deploy --env staging --port 8080
 └─ RunmeArgs ─┘ └─ task ─┘ └──── task args ────┘
 ```
 
+### Execution Layer
+
+The execution layer is the system. UI modes (CLI, TUI, Agent) are thin consumers that subscribe to its output and render it in their own way. This boundary is critical: every execution concern (launching tasks, capturing output, tracking processes, cleanup) lives in the execution layer so that all modes behave identically.
+
+The core abstraction is `TaskExecution` — a single task execution from launch to cleanup. It owns:
+
+- **TaskContext** — the runtime object passed to task functions. Provides `exec()`, `spawn()`, `run()`, file watching, etc.
+- **LogStore** — aggregated output from all sources. All output flows here.
+- **Process tracking** — pid, pgid, status, and output buffer for each spawned process.
+- **Task status** — lifecycle state (Setup → Done/Failed).
+- **Cleanup** — `shutdown()` sends SIGTERM/SIGKILL to all spawned process groups.
+
+**Output flow:** Every output source converges on the LogStore through the same pipeline:
+
+- `ctx.exec()` → process stdout/stderr → `OutputBuffer` → `LogStore`
+- `ctx.spawn()` → `SpawnEvent` → subscribe to process buffer → `LogStore`
+- `info!()` / `error!()` in task code → `LogEntryLayer` (tracing) → `OutputBuffer` → `LogStore`
+
+The UI subscribes to the LogStore's broadcast channel and renders entries. CLI writes them to stdio. TUI feeds them to the log viewer. Agent ignores them.
+
+**Process lifecycle:** `TaskExecution` tracks every spawned process group. When `shutdown()` is called (on quit, task completion, or interrupt), it signals all tracked process groups — including grandchild processes (e.g., a server spawned by `cargo run`). This is handled once in the execution layer, not per-UI.
+
+**`LaunchConfig`:** Optional hooks for TUI-specific behavior (`tui_wait`, `tui_output`) are passed in at launch time. CLI and Agent pass defaults. This keeps TUI concerns out of the execution layer while allowing task code to interact with the TUI when present.
+
+**Multiple executions:** The TUI picker can launch multiple tasks. Each gets its own `TaskExecution`, but they share a single `LogStore` (via `TaskExecution::with_log_store()`). The TUI's `TaskRunner` is a thin wrapper that manages this sharing and provides session-level organization for the sidebar.
+
 ### Built-in Commands
 
 Built-in commands (`list`, `init`, etc.) are task functions defined in the `runme` library, registered in a `builtin` group via `inventory` like any other task. They are always included in every compiled binary.
@@ -198,7 +224,7 @@ The boundary is clean: the moment you need help text, short flags, or defaults, 
 
 ### Dual Interface
 
-All tasks work in all UI modes, controlled by `--ui` (or defaulting based on context):
+All tasks work in all UI modes, controlled by `--ui` (or defaulting based on context). Every mode uses the same execution layer (`TaskExecution`) — the UI is just a viewport over the same output stream and process state:
 - **TUI mode** (`--ui tui`, default) — ratatui-based interface for interactive navigation, log viewing, task management. No args launches the task picker.
 - **CLI mode** (`--ui cli`) — stdio only. Streaming output, meaningful exit codes.
 - **Agent mode** (`--ui agent`) — quiet by default, structured output (`--format json`), minimal token footprint.

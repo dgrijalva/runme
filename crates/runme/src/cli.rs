@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use crate::log::{LogEntry, Stream};
-use crate::task::{Registry, TaskContext};
+use crate::task::Registry;
 use crate::tui::App;
 
 /// UI mode for task execution.
@@ -125,59 +125,55 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
 
 /// Run a task in CLI mode: direct execution with stdio output, no TUI.
 ///
-/// Sets up a tracing subscriber for task log events (info!, warn!, etc.)
-/// and forwards process output (from ctx.exec() and ctx.spawn()) to
-/// stdout/stderr in real time.
+/// Uses the shared execution layer (`TaskExecution`). All output flows
+/// through the LogStore; we subscribe and forward entries to stdio.
 async fn run_cli(
     task: &'static crate::task::TaskDef,
     args: &[String],
     registry: &Arc<Registry>,
 ) {
-    use crate::task::SpawnEvent;
-    use tokio::sync::mpsc;
+    use crate::execution::{LaunchConfig, TaskExecution};
 
-    // Install a simple tracing subscriber for task log events → stderr
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_target(false)
-        .try_init();
+    let mut exec = TaskExecution::new();
+    exec.set_registry(registry.clone());
 
-    let (spawn_tx, mut spawn_rx) = mpsc::unbounded_channel::<SpawnEvent>();
-
-    let mut ctx = TaskContext::new(task.name);
-    ctx.set_registry(registry.clone());
-    ctx.set_spawn_notifier(spawn_tx);
-
-    // Subscribe to the exec output buffer BEFORE running the task so we
-    // don't miss early output. Forward entries to stdout/stderr in real time.
-    let rx = {
-        let buf = ctx.output_buffer().lock().await;
-        buf.subscribe()
-    };
+    // Subscribe to LogStore → stdio BEFORE launching the task.
+    let rx = exec.subscribe().await;
     tokio::spawn(forward_output_to_stdio(rx));
 
-    // Monitor spawn events and forward each spawned process's output to stdio.
-    tokio::spawn(async move {
-        while let Some(event) = spawn_rx.recv().await {
-            let rx = {
-                let buf = event.buffer.lock().await;
-                buf.subscribe()
-            };
-            tokio::spawn(forward_output_to_stdio(rx));
+    exec.launch(task, args.to_vec(), LaunchConfig::default());
+
+    // Wait for the task function to complete, or Ctrl-C.
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+
+    tokio::select! {
+        _ = exec.wait() => {}
+        _ = &mut ctrl_c => {
+            exec.shutdown(std::time::Duration::from_secs(5)).await;
+            std::process::exit(130); // 128 + SIGINT
         }
-    });
+    }
 
-    let result = task.func.call(&ctx, args).await;
-
-    // Clean up all spawned processes
-    ctx.stop_all(std::time::Duration::from_secs(5)).await;
-
-    match result {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(e.exit_code());
+    // Task function returned. Stay alive while spawned processes are
+    // still running — same as TUI staying open. Ctrl-C triggers shutdown.
+    loop {
+        if !exec.has_running_processes().await {
+            break;
         }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            _ = &mut ctrl_c => {
+                exec.shutdown(std::time::Duration::from_secs(5)).await;
+                std::process::exit(130);
+            }
+        }
+    }
+
+    let status = exec.task_status().lock().await.clone();
+    if let crate::execution::TaskStatus::Failed(failure) = status {
+        eprintln!("Error: {}", failure.message);
+        std::process::exit(failure.exit_code);
     }
 }
 
@@ -202,42 +198,55 @@ async fn forward_output_to_stdio(mut rx: tokio::sync::broadcast::Receiver<LogEnt
 }
 
 /// Run a task in Agent mode: structured output, minimal UI.
+///
+/// Uses the shared execution layer. No output subscription — only
+/// the final result is reported.
 async fn run_agent(
     task: &'static crate::task::TaskDef,
     args: &[String],
     registry: &Arc<Registry>,
     format: &OutputFormat,
 ) {
-    let mut ctx = TaskContext::new(task.name);
-    ctx.set_registry(registry.clone());
+    use crate::execution::{LaunchConfig, TaskExecution, TaskStatus};
 
-    match task.func.call(&ctx, args).await {
-        Ok(()) => {
+    let mut exec = TaskExecution::new();
+    exec.set_registry(registry.clone());
+
+    exec.launch(task, args.to_vec(), LaunchConfig::default());
+    exec.wait().await;
+    exec.shutdown(std::time::Duration::from_secs(5)).await;
+
+    let status = exec.task_status().lock().await.clone();
+    match status {
+        TaskStatus::Done => {
             match format {
                 OutputFormat::Json => {
                     println!("{}", serde_json::json!({"status": "ok", "task": task.name}));
                 }
-                OutputFormat::Text => {
-                    // Silent success in text mode
-                }
+                OutputFormat::Text => {}
             }
         }
-        Err(e) => {
+        TaskStatus::Failed(failure) => {
             match format {
                 OutputFormat::Json => {
+                    // Parse the stored JSON output back to a Value for structured output.
+                    let error_output: serde_json::Value =
+                        serde_json::from_str(&failure.output_json)
+                            .unwrap_or_else(|_| serde_json::json!({"message": failure.message}));
                     let output = serde_json::json!({
                         "status": "error",
                         "task": task.name,
-                        "error": e.output(),
+                        "error": error_output,
                     });
                     println!("{}", output);
                 }
                 OutputFormat::Text => {
-                    eprintln!("Error: {}", e);
+                    eprintln!("Error: {}", failure.message);
                 }
             }
-            std::process::exit(e.exit_code());
+            std::process::exit(failure.exit_code);
         }
+        _ => {}
     }
 }
 
