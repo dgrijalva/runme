@@ -1,6 +1,7 @@
 pub mod buffer;
 pub mod extract;
 pub mod filter;
+pub mod format;
 pub mod parse;
 pub mod search;
 pub mod store;

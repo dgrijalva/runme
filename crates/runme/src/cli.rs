@@ -178,12 +178,15 @@ async fn run_cli(
 }
 
 /// Forward log entries from a broadcast receiver to stdout/stderr.
+///
+/// Uses the shared log formatter so CLI output matches the TUI's preview layout.
 async fn forward_output_to_stdio(mut rx: tokio::sync::broadcast::Receiver<LogEntry>) {
+    use crate::log::format::format_entry;
     use std::io::Write;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     while let Ok(entry) = rx.recv().await {
-        let line = &entry.raw;
+        let line = format_entry(&entry);
         match entry.stream {
             Some(Stream::Stderr) => {
                 let mut out = stderr.lock();

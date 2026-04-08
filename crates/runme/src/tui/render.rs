@@ -9,6 +9,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::log::LogEntry;
+use crate::log::format as log_fmt;
 
 /// Display mode for log entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,11 +20,10 @@ pub enum DisplayMode {
     Raw,
 }
 
-/// Fixed column widths for preview mode.
-const TIMESTAMP_WIDTH: usize = 12; // "HH:MM:SS.mmm"
-const LEVEL_WIDTH: usize = 5; // "ERROR" / "WARN " / "INFO " / "DEBUG"
-const SOURCE_WIDTH: usize = 10;
-const COLUMN_GAP: usize = 2; // spaces between columns
+// Column widths and shared helpers from the format module.
+use log_fmt::{
+    COLUMN_GAP_WIDTH as COLUMN_GAP, LEVEL_WIDTH, SOURCE_WIDTH, TIMESTAMP_WIDTH, pad_or_truncate,
+};
 
 /// The palette of colors assigned to sources.
 const SOURCE_PALETTE: &[Color] = &[
@@ -236,69 +236,36 @@ fn render_raw(entry: &LogEntry, width: u16, wrap: bool) -> (Vec<Line<'static>>, 
 }
 
 /// Format a level string and return (display text, color).
-fn format_level(level: &Option<String>) -> (String, Color) {
-    match level.as_deref() {
-        Some("error") => ("ERROR".to_string(), Color::Red),
-        Some("warn") => ("WARN".to_string(), Color::Yellow),
-        Some("info") => ("INFO".to_string(), Color::Green),
-        Some("debug") => ("DEBUG".to_string(), Color::DarkGray),
-        Some("trace") => ("TRACE".to_string(), Color::DarkGray),
-        Some(other) => (other.to_uppercase(), Color::White),
-        None => ("---".to_string(), Color::DarkGray),
-    }
-}
-
-/// Pad or truncate a string to exactly the given width.
-fn pad_or_truncate(s: &str, width: usize) -> String {
-    if s.len() >= width {
-        s[..width].to_string()
-    } else {
-        format!("{:<width$}", s, width = width)
-    }
-}
-
-/// Truncate a string to fit within the given width.
-/// Format structured fields as `key=value key=value`, fitting within `max_width`.
 ///
-/// Fills as many fields as fit, truncating the last one if needed.
+/// Uses the shared `format_level` for the text, adds TUI color.
+fn format_level(level: &Option<String>) -> (String, Color) {
+    let text = log_fmt::format_level(level);
+    let color = match level.as_deref() {
+        Some("error") => Color::Red,
+        Some("warn") => Color::Yellow,
+        Some("info") => Color::Green,
+        Some("debug") | Some("trace") => Color::DarkGray,
+        Some(_) => Color::White,
+        None => Color::DarkGray,
+    };
+    (text, color)
+}
+
+/// Width-aware field formatting for the TUI.
+///
+/// Truncates the shared field output to fit within `max_width`.
 fn format_fields_inline(fields: &HashMap<String, serde_json::Value>, max_width: usize) -> String {
-    if fields.is_empty() || max_width < 3 {
+    if max_width < 3 {
         return String::new();
     }
-
-    let mut parts: Vec<String> = fields
-        .iter()
-        .map(|(k, v)| {
-            let val = match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            format!("{}={}", k, val)
-        })
-        .collect();
-    parts.sort(); // deterministic order
-
-    let mut result = String::new();
-    for part in &parts {
-        if result.is_empty() {
-            if part.len() <= max_width {
-                result.push_str(part);
-            } else {
-                result.push_str(&part[..max_width]);
-                break;
-            }
-        } else {
-            let needed = result.len() + 1 + part.len(); // space + part
-            if needed <= max_width {
-                result.push(' ');
-                result.push_str(part);
-            } else {
-                // No room for more fields
-                break;
-            }
-        }
+    let full = log_fmt::format_fields_inline(fields);
+    if full.len() <= max_width {
+        full
+    } else if max_width >= 1 {
+        full[..max_width].to_string()
+    } else {
+        String::new()
     }
-    result
 }
 
 fn truncate_str(s: &str, width: usize) -> String {
