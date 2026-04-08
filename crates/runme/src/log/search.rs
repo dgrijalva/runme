@@ -350,7 +350,7 @@ mod tests {
         let result = Search::new("disk full").execute(&entries);
         assert_eq!(result.matches.len(), 1);
         // Should find ranges in both raw and message.
-        assert!(result.matches[0].match_ranges.len() >= 1);
+        assert!(!result.matches[0].match_ranges.is_empty());
     }
 
     #[test]

@@ -262,3 +262,88 @@ async fn test_exec_nonexistent_command() {
     let result = reg.run_with_args("fail_spawn", &[]).await;
     assert!(result.is_err(), "fail_spawn should return Err");
 }
+
+// ============================================================
+// Task discovery + invocation (ctx.tasks() → ctx.run())
+// ============================================================
+
+#[runme::task(desc = "Step A")]
+async fn step_a(_ctx: &TaskContext) -> TaskResult {
+    info!("step_a ran");
+    Ok(())
+}
+
+#[runme::task(desc = "Step B")]
+async fn step_b(_ctx: &TaskContext) -> TaskResult {
+    info!("step_b ran");
+    Ok(())
+}
+
+#[runme::task(desc = "Step C — fails")]
+async fn step_c(_ctx: &TaskContext) -> TaskResult {
+    Err("step_c failed".into())
+}
+
+/// Discovers tasks matching "step_*", runs each, collects results.
+#[runme::task(desc = "Run all steps")]
+async fn run_discovered_steps(ctx: &TaskContext) -> TaskResult {
+    let query = ctx.tasks().expect("registry should be injected");
+    let steps = query.matching("step_*");
+    assert!(!steps.is_empty(), "should discover step tasks");
+
+    let mut ran = Vec::new();
+    for step in &steps {
+        let result = ctx.run(step.name, &[]).await;
+        ran.push((step.name.to_string(), result.is_ok()));
+    }
+
+    // Verify we found and ran the expected tasks
+    let names: Vec<&str> = ran.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"step_a"), "should have found step_a");
+    assert!(names.contains(&"step_b"), "should have found step_b");
+    assert!(names.contains(&"step_c"), "should have found step_c");
+
+    // step_a and step_b succeed, step_c fails
+    for (name, ok) in &ran {
+        match name.as_str() {
+            "step_a" | "step_b" => assert!(ok, "{} should succeed", name),
+            "step_c" => assert!(!ok, "{} should fail", name),
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_discover_and_run_tasks() {
+    let reg = Arc::new(Registry::from_inventory());
+    let result = reg
+        .run_with_registry("run_discovered_steps", &[], &reg)
+        .await;
+    assert!(result.is_ok(), "coordinator should succeed: {:?}", result);
+}
+
+/// Discovers tasks matching a pattern and runs only the ones that match.
+#[runme::task(desc = "Run matching steps selectively")]
+async fn run_matching_steps(ctx: &TaskContext) -> TaskResult {
+    let query = ctx.tasks().expect("registry should be injected");
+
+    // Only run step_a and step_b (skip step_c which fails)
+    let steps = query.matching("step_[ab]");
+    assert_eq!(steps.len(), 2, "should match exactly step_a and step_b");
+
+    for step in &steps {
+        ctx.run(step.name, &[]).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_discover_and_run_matching_tasks() {
+    let reg = Arc::new(Registry::from_inventory());
+    let result = reg
+        .run_with_registry("run_matching_steps", &[], &reg)
+        .await;
+    assert!(result.is_ok(), "selective run should succeed: {:?}", result);
+}

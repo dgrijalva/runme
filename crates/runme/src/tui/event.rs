@@ -701,9 +701,8 @@ mod tests {
         assert!(state.running);
         // Test quit via the match logic directly
         let key = make_key_event(KeyCode::Char('q'), KeyModifiers::NONE);
-        match key.code {
-            KeyCode::Char('q') => state.running = false,
-            _ => {}
+        if let KeyCode::Char('q') = key.code {
+            state.running = false;
         }
         assert!(!state.running);
     }

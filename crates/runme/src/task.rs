@@ -1287,7 +1287,7 @@ mod tests {
         let all = query.matching("*");
         // Root "build" has qualified name "build" (no colon), matches "*"
         // Others have "group:name", which also matches "*"
-        assert!(all.len() >= 1);
+        assert!(!all.is_empty());
     }
 
     #[test]

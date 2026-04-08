@@ -417,7 +417,7 @@ mod tests {
         let (tx, _) = broadcast::channel::<LogEntry>(16);
         let rx = tx.subscribe();
         // Filter: only even sequence numbers
-        let mut filtered = FilteredStream::new(rx, |e: &LogEntry| e.seq % 2 == 0);
+        let mut filtered = FilteredStream::new(rx, |e: &LogEntry| e.seq.is_multiple_of(2));
 
         let _ = tx.send(make_entry("app", 0, "even"));
         let _ = tx.send(make_entry("app", 1, "odd"));
@@ -659,7 +659,7 @@ mod tests {
 
         let mut buffer = OutputBuffer::new(100);
         // Subscribe via tail()
-        let mut rx = tail(&buffer.subscribe_sender());
+        let mut rx = tail(buffer.subscribe_sender());
 
         buffer.push(make_entry("task", 0, "from buffer"));
 
@@ -731,7 +731,7 @@ mod tests {
         use crate::log::store::LogStore;
 
         let mut store = LogStore::new();
-        let mut rx = tail(&store.sender());
+        let mut rx = tail(store.sender());
 
         store.push(make_entry("task_a", 0, "from store"));
 

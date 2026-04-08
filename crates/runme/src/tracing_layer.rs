@@ -257,7 +257,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        tracing::info!(count = 42_i64, ratio = 3.14_f64, active = true, "metrics");
+        tracing::info!(count = 42_i64, ratio = 2.72_f64, active = true, "metrics");
 
         tokio::task::yield_now().await;
 
@@ -266,7 +266,7 @@ mod tests {
 
         let entry = &buf.lines()[0];
         assert_eq!(entry.fields.get("count"), Some(&serde_json::json!(42)));
-        assert_eq!(entry.fields.get("ratio"), Some(&serde_json::json!(3.14)));
+        assert_eq!(entry.fields.get("ratio"), Some(&serde_json::json!(2.72)));
         assert_eq!(entry.fields.get("active"), Some(&serde_json::json!(true)));
     }
 
