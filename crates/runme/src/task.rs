@@ -16,18 +16,51 @@ use crate::process::{self, Output, ProcessError, ProcessHandle, ProcessResult};
 use crate::tui::output::{TuiOutput, TuiOutputHandle};
 use crate::watch::{self, Watch, WatchInfo, WatchKind};
 
-/// The type of async task functions.
+/// The type of static async task functions (from `#[runme::task]` macro).
 ///
-/// Task functions are `async fn(&TaskContext, &[String]) -> Result<(), TaskError>` — this
-/// type alias represents that as a function pointer returning a boxed future.
-/// The `&[String]` carries CLI arguments; zero-arg tasks ignore the slice.
-///
-/// The returned future borrows from `&TaskContext` (lifetime `'a`).
-/// The `&[String]` args slice need not outlive the future.
+/// A function pointer returning a boxed future. Used in `inventory::submit!`
+/// which requires const-constructible values.
 pub type TaskFn = for<'a> fn(
     &'a TaskContext,
     &[String],
 ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>>;
+
+/// The type of dynamic async task functions (from runtime registration).
+///
+/// An `Arc<dyn Fn>` that can capture state — needed for dynamic tasks like
+/// "run cargo {subcommand}" where the subcommand is discovered at init time.
+pub type DynamicTaskFn = Arc<
+    dyn for<'a> Fn(
+            &'a TaskContext,
+            &[String],
+        ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
+
+/// How a task function is stored — either a compile-time function pointer
+/// or a runtime closure.
+#[derive(Clone)]
+pub enum TaskFnKind {
+    /// From `#[runme::task]` — const-constructible for `inventory::submit!`.
+    Static(TaskFn),
+    /// From `InitContext::register_task()` — can capture state.
+    Dynamic(DynamicTaskFn),
+}
+
+impl TaskFnKind {
+    /// Call the task function, regardless of variant.
+    pub fn call<'a>(
+        &self,
+        ctx: &'a TaskContext,
+        args: &[String],
+    ) -> Pin<Box<dyn Future<Output = Result<(), TaskError>> + Send + 'a>> {
+        match self {
+            TaskFnKind::Static(f) => f(ctx, args),
+            TaskFnKind::Dynamic(f) => f(ctx, args),
+        }
+    }
+}
 
 /// Function that returns clap metadata for a task's arguments, if any.
 ///
@@ -57,15 +90,15 @@ pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
     pub group: &'static str,
-    pub func: TaskFn,
+    pub func: TaskFnKind,
     pub arg_metadata: ArgMetadataFn,
     /// Optional UI mode override. When set, the CLI dispatch uses this
     /// instead of the user's `--ui` flag.
     pub ui_hint: Option<UiHint>,
 }
 
-// Safety: TaskDef contains only 'static references and function pointers,
-// which are inherently Send + Sync.
+// Safety: TaskDef fields are Send + Sync: &'static str, function pointers,
+// and TaskFnKind (fn pointer or Arc<dyn Fn + Send + Sync>).
 unsafe impl Send for TaskDef {}
 unsafe impl Sync for TaskDef {}
 
@@ -702,7 +735,7 @@ impl Registry {
         match self.get(name) {
             Some(task) => {
                 let ctx = TaskContext::new(task.name);
-                (task.func)(&ctx, args).await
+                task.func.call(&ctx, args).await
             }
             None => Err(TaskError::from_display(format!("unknown task: {}", name))),
         }
@@ -722,7 +755,7 @@ impl Registry {
         let task = self.resolve(name)?;
         let mut ctx = TaskContext::new(task.name);
         ctx.set_registry(registry.clone());
-        (task.func)(&ctx, args).await
+        task.func.call(&ctx, args).await
     }
 
     /// Resolve a task name to a `TaskDef` using 3-tier resolution.
@@ -816,11 +849,11 @@ impl Registry {
         let mut join_set = JoinSet::new();
 
         for task_def in &task_defs {
-            let func = task_def.func;
+            let func = task_def.func.clone();
             let name = task_def.name.to_string();
             join_set.spawn(async move {
                 let ctx = TaskContext::new(&name);
-                func(&ctx, &[]).await
+                func.call(&ctx, &[]).await
             });
         }
 
@@ -874,7 +907,7 @@ mod tests {
         name: "alpha",
         description: Some("The alpha task"),
         group: "",
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -883,7 +916,7 @@ mod tests {
         name: "beta",
         description: None,
         group: "",
-        func: another_task,
+        func: TaskFnKind::Static(another_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -982,7 +1015,7 @@ mod tests {
             name: "para_a",
             description: Some("Parallel A"),
             group: "",
-            func: task_a,
+            func: TaskFnKind::Static(task_a),
             arg_metadata: no_arg_metadata,
             ui_hint: None,
         };
@@ -991,7 +1024,7 @@ mod tests {
             name: "para_b",
             description: Some("Parallel B"),
             group: "",
-            func: task_b,
+            func: TaskFnKind::Static(task_b),
             arg_metadata: no_arg_metadata,
             ui_hint: None,
         };
@@ -1067,7 +1100,7 @@ mod tests {
         description: Some("Root build"),
         group: "",
 
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -1077,7 +1110,7 @@ mod tests {
         description: Some("Services build"),
         group: "services",
 
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -1087,7 +1120,7 @@ mod tests {
         description: Some("Auth deploy"),
         group: "services/auth",
 
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -1097,7 +1130,7 @@ mod tests {
         description: Some("Web deploy"),
         group: "web",
 
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -1107,7 +1140,7 @@ mod tests {
         description: Some("List tasks"),
         group: "builtin",
 
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };

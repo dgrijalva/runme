@@ -438,7 +438,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 name: #fn_name_str,
                 description: #desc_tokens,
                 group: __RUNME_GROUP,
-                func: #wrapper_name,
+                func: ::runme::task::TaskFnKind::Static(#wrapper_name),
                 arg_metadata: #arg_metadata_name,
                 ui_hint: None,
             }

@@ -11,8 +11,8 @@ pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawR
 pub use crate::process::{Output, ProcessError, ProcessHandle, ProcessResult};
 pub use crate::signal::SignalHandler;
 pub use crate::task::{
-    ArgMetadataFn, Registry, SpawnEvent, StepGuard, TaskContext, TaskDef, TaskFn, TaskGuard,
-    TaskInfo, TaskQuery, UiHint,
+    ArgMetadataFn, DynamicTaskFn, Registry, SpawnEvent, StepGuard, TaskContext, TaskDef, TaskFn,
+    TaskFnKind, TaskGuard, TaskInfo, TaskQuery, UiHint,
 };
 pub use crate::tui::output::{TuiOutput, TuiOutputHandle, TuiOutputStreamHandle};
 pub use crate::watch::{Watch, WatchInfo, WatchKind, glob_filter};

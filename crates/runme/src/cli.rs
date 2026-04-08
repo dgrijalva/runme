@@ -149,7 +149,7 @@ async fn run_cli(
     };
     let forwarder = tokio::spawn(forward_output_to_stdio(rx));
 
-    let result = (task.func)(&ctx, args).await;
+    let result = task.func.call(&ctx, args).await;
 
     // Give the forwarder a moment to drain, then drop it
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -194,7 +194,7 @@ async fn run_agent(
     let mut ctx = TaskContext::new(task.name);
     ctx.set_registry(registry.clone());
 
-    match (task.func)(&ctx, args).await {
+    match task.func.call(&ctx, args).await {
         Ok(()) => {
             match format {
                 OutputFormat::Json => {

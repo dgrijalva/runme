@@ -207,7 +207,7 @@ async fn test_output_capture_from_exec() {
     let reg = Registry::from_inventory();
     let task = reg.get("spawn_echo").unwrap();
     let ctx = TaskContext::new(task.name);
-    let result = (task.func)(&ctx, &[]).await;
+    let result = task.func.call(&ctx, &[]).await;
     assert!(result.is_ok(), "spawn_echo should succeed");
 
     let found = common::output_contains(&ctx, "hello from spawn_echo").await;

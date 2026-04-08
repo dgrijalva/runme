@@ -392,7 +392,7 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
 mod tests {
     use super::*;
     use crate::error::TaskError;
-    use crate::task::TaskContext;
+    use crate::task::{TaskContext, TaskFnKind};
     use std::future::Future;
     use std::pin::Pin;
 
@@ -411,7 +411,7 @@ mod tests {
         name: "build",
         description: Some("Build the project"),
         group: "",
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -420,7 +420,7 @@ mod tests {
         name: "test",
         description: Some("Run tests"),
         group: "services/auth",
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -429,7 +429,7 @@ mod tests {
         name: "build",
         description: Some("Build the auth service"),
         group: "services/auth",
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -438,7 +438,7 @@ mod tests {
         name: "dev",
         description: Some("Start dev server"),
         group: "web-app",
-        func: dummy_task,
+        func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };

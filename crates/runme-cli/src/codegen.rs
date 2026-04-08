@@ -51,15 +51,21 @@ pub(crate) fn generate_runner_main(entries: &[CrateEntry]) -> String {
                 group_names.insert(group.key, group.key.to_string());
             }
 
+            let mut dynamic_tasks: Vec<&'static runme::task::TaskDef> = Vec::new();
             for init in &inits {
                 let default_name = group_names.get(init.group).cloned().unwrap_or_else(|| init.group.to_string());
                 let mut ctx = runme::init::InitContext::new(&default_name);
                 (init.func)(&mut ctx);
                 group_names.insert(init.group, ctx.group_name().to_string());
+                dynamic_tasks.extend(ctx.drain_tasks());
             }
 
-            // Build registry and convert group_names to owned types for cli::run()
-            let registry = std::sync::Arc::new(runme::task::Registry::from_inventory());
+            // Build registry from inventory + dynamic tasks
+            let mut registry = runme::task::Registry::from_inventory();
+            for task in dynamic_tasks {
+                registry.register(task);
+            }
+            let registry = std::sync::Arc::new(registry);
             let group_names_owned: std::collections::HashMap<String, String> = group_names
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v))

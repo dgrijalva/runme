@@ -292,7 +292,7 @@ impl TaskRunner {
         tokio::spawn(async move {
             // Run the task function directly (no nested spawn — the global
             // subscriber covers us, and we get simpler error handling)
-            let result = (task.func)(&ctx, &task_args).await;
+            let result = task.func.call(&ctx, &task_args).await;
 
             let result: Result<(), String> = match result {
                 Ok(()) => Ok(()),
@@ -440,7 +440,7 @@ impl Default for TaskRunner {
 mod tests {
     use super::*;
     use crate::error::TaskError;
-    use crate::task::TaskDef;
+    use crate::task::{TaskDef, TaskFnKind};
     use std::future::Future;
     use std::pin::Pin;
 
@@ -482,7 +482,7 @@ mod tests {
         name: "success",
         description: Some("A successful task"),
         group: "",
-        func: success_task,
+        func: TaskFnKind::Static(success_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -491,7 +491,7 @@ mod tests {
         name: "failing",
         description: Some("A failing task"),
         group: "",
-        func: failing_task,
+        func: TaskFnKind::Static(failing_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };
@@ -500,7 +500,7 @@ mod tests {
         name: "spawning",
         description: Some("A task that spawns a process"),
         group: "",
-        func: spawning_task,
+        func: TaskFnKind::Static(spawning_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
     };

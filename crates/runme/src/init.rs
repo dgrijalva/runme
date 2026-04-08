@@ -33,9 +33,11 @@ inventory::collect!(InitDef);
 /// InitContext — passed to init functions registered via `#[runme::init]`.
 ///
 /// Pre-populated with the path-based group name. The init function can
-/// override the display name or configure other per-file settings.
+/// override the display name, register dynamic tasks, or configure
+/// other per-file settings.
 pub struct InitContext {
     group_name: String,
+    dynamic_tasks: Vec<&'static crate::task::TaskDef>,
 }
 
 impl InitContext {
@@ -43,6 +45,7 @@ impl InitContext {
     pub fn new(default_group: &str) -> Self {
         Self {
             group_name: default_group.to_string(),
+            dynamic_tasks: Vec::new(),
         }
     }
 
@@ -54,6 +57,69 @@ impl InitContext {
     /// Get the current group name (display name).
     pub fn group_name(&self) -> &str {
         &self.group_name
+    }
+
+    /// Register a dynamic task discovered at init time.
+    ///
+    /// The task's name, description, and group are leaked to `&'static str`
+    /// so the resulting `TaskDef` has the same lifetime as macro-generated tasks.
+    /// This is fine — dynamic tasks live for the entire process.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// #[runme::init]
+    /// fn setup(ctx: &mut InitContext) {
+    ///     for cmd in ["build", "test", "clippy"] {
+    ///         let cmd = cmd.to_string();
+    ///         ctx.register_task(&cmd, Some(&format!("cargo {}", cmd)), move |ctx, _args| {
+    ///             let cmd = cmd.clone();
+    ///             Box::pin(async move {
+    ///                 ctx.exec(format!("cargo {}", cmd)).await?.ok()?;
+    ///                 Ok(())
+    ///             })
+    ///         });
+    ///     }
+    /// }
+    /// ```
+    pub fn register_task<F>(&mut self, name: &str, description: Option<&str>, func: F)
+    where
+        F: for<'a> Fn(
+                &'a crate::task::TaskContext,
+                &[String],
+            )
+                -> std::pin::Pin<
+                    Box<
+                        dyn std::future::Future<
+                                Output = Result<(), crate::error::TaskError>,
+                            > + Send
+                            + 'a,
+                    >,
+                > + Send
+            + Sync
+            + 'static,
+    {
+        let leaked_name: &'static str = Box::leak(name.to_string().into_boxed_str());
+        let leaked_desc: Option<&'static str> =
+            description.map(|d| &*Box::leak(d.to_string().into_boxed_str()));
+        let leaked_group: &'static str =
+            Box::leak(self.group_name.clone().into_boxed_str());
+
+        let task_def = Box::leak(Box::new(crate::task::TaskDef {
+            name: leaked_name,
+            description: leaked_desc,
+            group: leaked_group,
+            func: crate::task::TaskFnKind::Dynamic(std::sync::Arc::new(func)),
+            arg_metadata: || None,
+            ui_hint: None,
+        }));
+
+        self.dynamic_tasks.push(task_def);
+    }
+
+    /// Drain collected dynamic tasks. Called by the runner after init completes.
+    pub fn drain_tasks(&mut self) -> Vec<&'static crate::task::TaskDef> {
+        std::mem::take(&mut self.dynamic_tasks)
     }
 }
 
