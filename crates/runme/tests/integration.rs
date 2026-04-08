@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use runme::cli::{resolve_ui_mode, UiMode};
 use runme::prelude::*;
+use nix::sys::signal;
+use nix::unistd::Pid;
 
 mod common;
 #[path = "fixtures.rs"]
@@ -346,4 +348,46 @@ async fn test_discover_and_run_matching_tasks() {
         .run_with_registry("run_matching_steps", &[], &reg)
         .await;
     assert!(result.is_ok(), "selective run should succeed: {:?}", result);
+}
+
+// ============================================================
+// Priority 1: Process cleanup on exit
+// ============================================================
+
+/// Verify that stop_all() kills spawned processes and their children.
+///
+/// Spawns a long-running process (sleep 300) via ctx.spawn(), confirms
+/// it is alive, then calls ctx.stop_all() and confirms it is dead.
+#[tokio::test]
+async fn test_stop_all_kills_spawned_processes() {
+    let reg = Registry::from_inventory();
+    let task = reg.get("spawn_sleeper").unwrap();
+    let ctx = TaskContext::new(task.name);
+    let result = task.func.call(&ctx, &[]).await;
+    assert!(result.is_ok(), "spawn_sleeper should succeed");
+
+    // Collect the PGIDs that were tracked
+    let pgids = {
+        let guard = ctx.spawned_pgids().await;
+        guard.clone()
+    };
+    assert!(!pgids.is_empty(), "should have tracked at least one PGID");
+
+    // Verify the process group is alive (signal 0 = existence check)
+    for &pgid in &pgids {
+        let alive = signal::killpg(Pid::from_raw(pgid), None);
+        assert!(alive.is_ok(), "PGID {} should be alive before stop_all", pgid);
+    }
+
+    // Stop all spawned processes
+    ctx.stop_all(std::time::Duration::from_secs(2)).await;
+
+    // Give the OS a moment to reap
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Verify the process group is dead
+    for &pgid in &pgids {
+        let dead = signal::killpg(Pid::from_raw(pgid), None);
+        assert!(dead.is_err(), "PGID {} should be dead after stop_all", pgid);
+    }
 }

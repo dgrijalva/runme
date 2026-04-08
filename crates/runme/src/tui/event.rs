@@ -524,7 +524,7 @@ async fn poll_lsof(state: &mut AppState) {
 
     if let Some(pid) = pid {
         let output = tokio::process::Command::new("lsof")
-            .args(["-p", &pid.to_string(), "-i", "-P", "-n"])
+            .args(["-a", "-p", &pid.to_string(), "-i", "-P", "-n"])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .output()

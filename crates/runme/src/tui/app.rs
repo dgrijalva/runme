@@ -348,6 +348,13 @@ impl App {
 
         let result = run_event_loop(&mut self.state, &mut terminal).await;
 
+        // Kill all spawned processes before leaving the TUI.
+        if let Some(ref runner) = self.state.runner {
+            runner
+                .shutdown(std::time::Duration::from_secs(5))
+                .await;
+        }
+
         restore_terminal()?;
 
         // Flush staged TUI output to real stdout/stderr now that we've

@@ -342,6 +342,11 @@ impl TaskContext {
         Ok(handle)
     }
 
+    /// Get the tracked process group IDs (for testing/inspection).
+    pub async fn spawned_pgids(&self) -> tokio::sync::MutexGuard<'_, Vec<i32>> {
+        self.spawned_pgids.lock().await
+    }
+
     /// Stop all processes spawned through this context.
     ///
     /// Sends SIGTERM to each process group, waits for the timeout, then

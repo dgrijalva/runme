@@ -91,3 +91,15 @@ async fn invoke_other(ctx: &TaskContext) -> TaskResult {
     ctx.run("succeed", &[]).await?;
     Ok(())
 }
+
+// ============================================================
+// Process lifecycle
+// ============================================================
+
+/// A task that spawns a long-running process and returns immediately.
+/// Used to test that stop_all() cleans up spawned processes.
+#[runme::task(desc = "Spawns a sleep process")]
+async fn spawn_sleeper(ctx: &TaskContext) -> TaskResult {
+    let _handle = ctx.spawn("sleep 300").await?;
+    Ok(())
+}

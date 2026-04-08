@@ -126,20 +126,27 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
 /// Run a task in CLI mode: direct execution with stdio output, no TUI.
 ///
 /// Sets up a tracing subscriber for task log events (info!, warn!, etc.)
-/// and forwards process output (from ctx.exec()) to stdout/stderr in real time.
+/// and forwards process output (from ctx.exec() and ctx.spawn()) to
+/// stdout/stderr in real time.
 async fn run_cli(
     task: &'static crate::task::TaskDef,
     args: &[String],
     registry: &Arc<Registry>,
 ) {
+    use crate::task::SpawnEvent;
+    use tokio::sync::mpsc;
+
     // Install a simple tracing subscriber for task log events → stderr
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_target(false)
         .try_init();
 
+    let (spawn_tx, mut spawn_rx) = mpsc::unbounded_channel::<SpawnEvent>();
+
     let mut ctx = TaskContext::new(task.name);
     ctx.set_registry(registry.clone());
+    ctx.set_spawn_notifier(spawn_tx);
 
     // Subscribe to the exec output buffer BEFORE running the task so we
     // don't miss early output. Forward entries to stdout/stderr in real time.
@@ -147,13 +154,23 @@ async fn run_cli(
         let buf = ctx.output_buffer().lock().await;
         buf.subscribe()
     };
-    let forwarder = tokio::spawn(forward_output_to_stdio(rx));
+    tokio::spawn(forward_output_to_stdio(rx));
+
+    // Monitor spawn events and forward each spawned process's output to stdio.
+    tokio::spawn(async move {
+        while let Some(event) = spawn_rx.recv().await {
+            let rx = {
+                let buf = event.buffer.lock().await;
+                buf.subscribe()
+            };
+            tokio::spawn(forward_output_to_stdio(rx));
+        }
+    });
 
     let result = task.func.call(&ctx, args).await;
 
-    // Give the forwarder a moment to drain, then drop it
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    forwarder.abort();
+    // Clean up all spawned processes
+    ctx.stop_all(std::time::Duration::from_secs(5)).await;
 
     match result {
         Ok(()) => {}

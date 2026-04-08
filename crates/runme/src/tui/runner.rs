@@ -306,6 +306,7 @@ impl TaskRunner {
                     *s = TaskStatus::Done;
                 }
                 Err(msg) => {
+                    tracing::error!("task failed: {}", msg);
                     *s = TaskStatus::Failed(msg);
                 }
             }
@@ -383,6 +384,44 @@ impl TaskRunner {
     /// Subscribe to the LogStore's broadcast channel for new entries.
     pub async fn subscribe(&self) -> tokio::sync::broadcast::Receiver<LogEntry> {
         self.log_store.lock().await.subscribe()
+    }
+
+    /// Shut down all spawned processes across all sessions.
+    ///
+    /// Sends SIGTERM to each process group, waits for the grace period,
+    /// then sends SIGKILL to any survivors. Should be called when the TUI exits.
+    pub async fn shutdown(&self, timeout: std::time::Duration) {
+        let mut pgids: Vec<i32> = Vec::new();
+
+        for session in &self.sessions {
+            let procs = session.processes.lock().await;
+            for proc in procs.iter() {
+                if proc.status == ProcessStatus::Running {
+                    if let Some(pgid) = proc.pgid {
+                        if !pgids.contains(&pgid) {
+                            pgids.push(pgid);
+                        }
+                    }
+                }
+            }
+        }
+
+        if pgids.is_empty() {
+            return;
+        }
+
+        // SIGTERM all process groups
+        for &pgid in &pgids {
+            let _ = signal::killpg(Pid::from_raw(pgid), Some(signal::Signal::SIGTERM));
+        }
+
+        // Grace period
+        tokio::time::sleep(timeout).await;
+
+        // SIGKILL any survivors
+        for &pgid in &pgids {
+            let _ = signal::killpg(Pid::from_raw(pgid), Some(signal::Signal::SIGKILL));
+        }
     }
 }
 
