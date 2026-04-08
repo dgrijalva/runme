@@ -508,6 +508,40 @@ At task launch, a custom `tracing::Layer` converts `tracing::Event`s into `LogEn
 
 This means all output — from the task function itself and from every child process it spawns — flows through the same log pipeline and is available for filtering, search, and export.
 
+### Raw Text Output
+
+For tasks that need to emit plain, undecorated text (no timestamps, no log levels), `ctx.println()` pushes a raw `LogEntry` into the output buffer:
+
+```rust
+#[runme::task]
+async fn list(ctx: &TaskContext) -> TaskResult {
+    if let Some(query) = ctx.tasks() {
+        for task in query.all() {
+            ctx.println(format!("{}: {}", task.name, task.description.unwrap_or(""))).await;
+        }
+    }
+    Ok(())
+}
+```
+
+`ctx.println()` works in all modes:
+- **TUI**: appears as a raw entry in the log viewer
+- **CLI**: forwarded to stdout by the output subscriber
+- **Cross-invocation** (`ctx.run()`): flows through the calling task's log engine
+
+Use `ctx.println()` instead of `println!()` — direct `println!()` writes to the TUI's alternate screen buffer and is invisible.
+
+### UI Mode Hints
+
+Tasks can declare a preferred UI mode via `UiHint` on `TaskDef`. When the user doesn't explicitly pass `--ui`, the task's hint is used instead of the default. This is useful for utility tasks like `list` that should always run in CLI mode:
+
+```rust
+// In TaskDef (manual registration):
+ui_hint: Some(UiHint::Cli),
+```
+
+Resolution priority: explicit `--ui` flag > task's `ui_hint` > terminal detection (TUI if TTY, CLI otherwise).
+
 ### Process Observation
 
 All child processes are spawned through `TaskContext`, which gives the runtime full visibility into what's running. The runtime observes process creation, status changes, and output without the task author needing to do anything explicit. A task can optionally report its own status via `ctx` for richer UI feedback, but the baseline observation is automatic.

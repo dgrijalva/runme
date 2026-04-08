@@ -1,3 +1,8 @@
+// Allow the #[runme::task] macro to work inside this crate.
+// The macro expands to `::runme::task::TaskDef` etc., which requires
+// `runme` to be a resolvable crate name. This self-import provides that.
+extern crate self as runme;
+
 pub mod builtin;
 pub mod cli;
 pub mod cmd;

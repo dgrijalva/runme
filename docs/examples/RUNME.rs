@@ -173,3 +173,98 @@ async fn concurrent(ctx: &TaskContext) -> TaskResult {
     info!("concurrent setup complete");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: Task arguments, cross-file invocation, and steps
+// ---------------------------------------------------------------------------
+
+/// Deploy to an environment — demonstrates simple typed parameters.
+///
+/// Each parameter becomes a CLI flag:
+///   runme deploy --env staging --port 8080 --verbose
+#[runme::task(desc = "Deploy to an environment")]
+async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
+    info!("Deploying to {} on port {} (verbose: {})", env, port, verbose);
+    if verbose {
+        ctx.exec("echo 'Running pre-deploy checks...'").await?;
+    }
+    ctx.exec(
+        Cmd::shell(format!("echo 'Deployed to {} on port {}'", env, port)),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Greet args — demonstrates a clap::Parser struct for full control.
+///
+/// `use runme::clap;` brings clap into scope so derive macros resolve correctly.
+use runme::clap;
+
+#[derive(clap::Parser)]
+struct GreetArgs {
+    /// Name to greet
+    #[arg(long)]
+    name: String,
+    /// Number of times to greet
+    #[arg(long, default_value = "1")]
+    count: u32,
+}
+
+/// Greet someone — demonstrates clap::Parser struct for full CLI control.
+///
+/// Usage:
+///   runme greet --name world --count 3
+#[runme::task(desc = "Greet someone by name")]
+async fn greet(ctx: &TaskContext, args: GreetArgs) -> TaskResult {
+    for i in 0..args.count {
+        ctx.println(format!("[{}/{}] Hello, {}!", i + 1, args.count, args.name)).await;
+    }
+    Ok(())
+}
+
+/// Run all test tasks across groups — demonstrates cross-file invocation.
+///
+/// Uses `ctx.tasks()` to discover tasks matching a glob pattern, then
+/// `ctx.run()` to invoke each one.
+#[runme::task(desc = "Run all test tasks")]
+async fn test_all(ctx: &TaskContext) -> TaskResult {
+    if let Some(query) = ctx.tasks() {
+        let test_tasks = query.matching("*:test");
+        if test_tasks.is_empty() {
+            info!("No test tasks found matching *:test");
+        }
+        for task in test_tasks {
+            info!("Running {}", task.qualified_name);
+            ctx.run(&task.qualified_name, &[]).await?;
+        }
+    } else {
+        warn!("No registry available — running outside the full runtime?");
+    }
+    info!("test_all complete");
+    Ok(())
+}
+
+/// Multi-phase pipeline — demonstrates `ctx.begin_step()` for labeled phases.
+///
+/// Each step is an RAII guard: when the guard is dropped the step is recorded
+/// as complete (or failed, if `step.fail()` was called).
+#[runme::task(desc = "Run a multi-phase pipeline")]
+async fn pipeline(ctx: &TaskContext) -> TaskResult {
+    {
+        let _step = ctx.begin_step("compile");
+        info!("Compiling...");
+        ctx.exec("echo 'compiling...'").await?;
+    }
+    {
+        let _step = ctx.begin_step("test");
+        info!("Testing...");
+        ctx.exec("echo 'testing...'").await?;
+    }
+    {
+        let _step = ctx.begin_step("package");
+        info!("Packaging...");
+        ctx.exec("echo 'packaging...'").await?;
+    }
+    info!("Pipeline complete");
+    Ok(())
+}
