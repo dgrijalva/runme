@@ -30,10 +30,12 @@ pub enum UiMode {
 /// Output format for CLI and Agent modes.
 #[derive(Clone, Debug, clap::ValueEnum)]
 pub enum OutputFormat {
-    /// Human-readable text
+    /// Human-readable text (structured columns)
     Text,
     /// Structured JSON
     Json,
+    /// Raw process output (unformatted, good for piping)
+    Raw,
 }
 
 /// Top-level CLI arguments for the generated runner binary.
@@ -115,7 +117,7 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
             }
         }
         UiMode::Cli => {
-            run_cli(task, &task_args, &registry).await;
+            run_cli(task, &task_args, &registry, &args.format).await;
         }
         UiMode::Agent => {
             run_agent(task, &task_args, &registry, &args.format).await;
@@ -131,6 +133,7 @@ async fn run_cli(
     task: &'static crate::task::TaskDef,
     args: &[String],
     registry: &Arc<Registry>,
+    format: &OutputFormat,
 ) {
     use crate::execution::{LaunchConfig, TaskExecution};
 
@@ -139,7 +142,8 @@ async fn run_cli(
 
     // Subscribe to LogStore → stdio BEFORE launching the task.
     let rx = exec.subscribe().await;
-    tokio::spawn(forward_output_to_stdio(rx));
+    let use_raw = matches!(format, OutputFormat::Raw);
+    tokio::spawn(forward_output_to_stdio(rx, use_raw));
 
     exec.launch(task, args.to_vec(), LaunchConfig::default());
 
@@ -179,14 +183,19 @@ async fn run_cli(
 
 /// Forward log entries from a broadcast receiver to stdout/stderr.
 ///
-/// Uses the shared log formatter so CLI output matches the TUI's preview layout.
-async fn forward_output_to_stdio(mut rx: tokio::sync::broadcast::Receiver<LogEntry>) {
+/// When `raw` is false, uses the shared log formatter so CLI output matches
+/// the TUI's preview layout. When `raw` is true, passes through `entry.raw`
+/// unformatted (useful for piping into jq, grep, etc.).
+async fn forward_output_to_stdio(
+    mut rx: tokio::sync::broadcast::Receiver<LogEntry>,
+    raw: bool,
+) {
     use crate::log::format::format_entry;
     use std::io::Write;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
     while let Ok(entry) = rx.recv().await {
-        let line = format_entry(&entry);
+        let line = if raw { &entry.raw } else { &format_entry(&entry) };
         match entry.stream {
             Some(Stream::Stderr) => {
                 let mut out = stderr.lock();
@@ -226,7 +235,7 @@ async fn run_agent(
                 OutputFormat::Json => {
                     println!("{}", serde_json::json!({"status": "ok", "task": task.name}));
                 }
-                OutputFormat::Text => {}
+                OutputFormat::Text | OutputFormat::Raw => {}
             }
         }
         TaskStatus::Failed(failure) => {
@@ -243,7 +252,7 @@ async fn run_agent(
                     });
                     println!("{}", output);
                 }
-                OutputFormat::Text => {
+                OutputFormat::Text | OutputFormat::Raw => {
                     eprintln!("Error: {}", failure.message);
                 }
             }
