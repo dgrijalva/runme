@@ -19,12 +19,3 @@ Possible approaches:
 - Collapse `\r`-delimited chunks into a single entry that updates in place
 - Strip `\r` progress output entirely and only show the final line
 
-## Copy menu in TUI
-
-`y` copies the selected entry (keep as-is). Add `c` to open a copy menu modal (same pattern as the `?` help window) with options:
-
-- `v` — copy viewport (all entries currently visible on screen)
-- `s` — copy stream (all entries for the selected source)
-- `a` — copy all (every entry matching the current filter)
-
-Output format should match the export format. Esc or any non-option key dismisses the menu.

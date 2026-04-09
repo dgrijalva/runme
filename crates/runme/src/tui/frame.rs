@@ -94,6 +94,7 @@ pub fn render_frame(
         // -- Log viewer --
         let log_width = log_area.width;
         let log_height = log_area.height;
+        state.last_viewport_height = Some(log_height);
 
         // Build the filtered log lines for display
         let visible_entries: Vec<&LogEntry> = state.visible_log_lines();
@@ -198,6 +199,7 @@ pub fn render_frame(
                 AppMode::SearchInput => "SEARCH",
                 AppMode::EntryDetail => "DETAIL",
                 AppMode::ProcessDetail => "PROCESS",
+                AppMode::CopyMenu => "COPY",
             };
 
             let focus_text = if state.sidebar.focused {
@@ -289,6 +291,11 @@ pub fn render_frame(
         // -- Help overlay --
         if state.mode == AppMode::Help {
             render_help_overlay(frame, area);
+        }
+
+        // -- Copy menu overlay --
+        if state.mode == AppMode::CopyMenu {
+            render_copy_menu(frame, area);
         }
 
         // -- Entry detail overlay --
@@ -447,9 +454,20 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
-            "Export",
+            "Copy / Export",
             Style::default().fg(Color::Yellow),
         )]),
+        Line::from(vec![
+            Span::raw("  y      "),
+            Span::styled("Copy selected entry", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::raw("  c      "),
+            Span::styled(
+                "Copy menu (viewport/stream/all)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
         Line::from(vec![
             Span::raw("  e      "),
             Span::styled(
@@ -498,6 +516,63 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         .wrap(Wrap { trim: false });
 
     frame.render_widget(help_paragraph, popup_area);
+}
+
+/// Render the copy menu overlay.
+fn render_copy_menu(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::widgets::{Borders, Clear, Wrap};
+
+    let menu_text = vec![
+        Line::from(Span::styled(
+            "Copy to Clipboard",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  v  "),
+            Span::styled("Viewport (on-screen entries)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::raw("  s  "),
+            Span::styled("Stream (selected source)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::raw("  a  "),
+            Span::styled("All (matching filter)", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let menu_height = (menu_text.len() + 2) as u16;
+    let menu_width = 40u16;
+
+    let x = area.width.saturating_sub(menu_width) / 2;
+    let y = area.height.saturating_sub(menu_height) / 2;
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + x,
+        area.y + y,
+        menu_width.min(area.width),
+        menu_height.min(area.height),
+    );
+
+    frame.render_widget(Clear, popup_area);
+
+    let menu_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(" Copy ", Style::default().fg(Color::Cyan)));
+
+    let menu_paragraph = Paragraph::new(menu_text)
+        .block(menu_block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(menu_paragraph, popup_area);
 }
 
 /// Render the entry detail overlay showing all fields of the focused log entry.

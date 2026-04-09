@@ -392,6 +392,13 @@ fn handle_key(
         return;
     }
 
+    // Copy menu mode: dispatch to copy menu handler
+    if state.mode == AppMode::CopyMenu {
+        keys::handle_copy_menu_key(key, state);
+        state.dirty = true;
+        return;
+    }
+
     // Global keys (work regardless of focus)
     match key.code {
         // '?' toggles help overlay
@@ -454,7 +461,11 @@ fn handle_mouse(
     // Ignore mouse in overlay modes
     if matches!(
         state.mode,
-        AppMode::Help | AppMode::EntryDetail | AppMode::ProcessDetail | AppMode::TaskPicker
+        AppMode::Help
+            | AppMode::EntryDetail
+            | AppMode::ProcessDetail
+            | AppMode::TaskPicker
+            | AppMode::CopyMenu
     ) {
         return;
     }

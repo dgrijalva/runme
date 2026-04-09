@@ -43,6 +43,8 @@ pub enum AppMode {
     EntryDetail,
     /// Process detail overlay (expanded process info view)
     ProcessDetail,
+    /// Copy menu overlay (choose what to copy)
+    CopyMenu,
 }
 
 /// Core application state, shared across the event loop and rendering.
@@ -118,6 +120,8 @@ pub struct AppState {
     pub current_task_args: Vec<String>,
     /// Flag: the event loop should restart the current task.
     pub pending_restart: bool,
+    /// Last known viewport height (rows available for log entries), cached for copy operations.
+    pub last_viewport_height: Option<u16>,
     /// Whether the TUI should stay open after the task completes.
     /// None when no task is running. Shared with the TaskContext via the runner.
     pub tui_wait: Option<Arc<AtomicBool>>,
@@ -170,6 +174,7 @@ impl AppState {
             current_task: None,
             current_task_args: Vec::new(),
             pending_restart: false,
+            last_viewport_height: None,
             tui_wait: None,
             tui_output: None,
             registry: None,

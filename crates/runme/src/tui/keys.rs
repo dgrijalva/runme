@@ -205,6 +205,11 @@ pub(super) fn handle_log_viewer_key(
             copy_entry_to_clipboard(state);
         }
 
+        // c: open copy menu
+        KeyCode::Char('c') => {
+            state.mode = AppMode::CopyMenu;
+        }
+
         // e: export visible log to file
         KeyCode::Char('e') => {
             export_visible_log(state);
@@ -860,6 +865,140 @@ pub(super) fn navigate_to_entry(
             };
         }
     }
+}
+
+/// Handle keys in the copy menu overlay.
+pub(super) fn handle_copy_menu_key(key: KeyEvent, state: &mut AppState) {
+    match key.code {
+        KeyCode::Char('v') => {
+            copy_viewport_to_clipboard(state);
+            state.mode = AppMode::Normal;
+        }
+        KeyCode::Char('s') => {
+            copy_stream_to_clipboard(state);
+            state.mode = AppMode::Normal;
+        }
+        KeyCode::Char('a') => {
+            copy_all_to_clipboard(state);
+            state.mode = AppMode::Normal;
+        }
+        // Any other key dismisses the menu
+        _ => {
+            state.mode = AppMode::Normal;
+        }
+    }
+}
+
+/// Copy all entries currently visible on screen (viewport) to clipboard via OSC 52.
+fn copy_viewport_to_clipboard(state: &mut AppState) {
+    let visible_indices = state.visible_line_indices();
+    if visible_indices.is_empty() {
+        return;
+    }
+
+    // Determine the viewport range from scroll state
+    let (start, end) = match state.scroll {
+        viewport::ScrollState::Tail => {
+            let end = visible_indices.len();
+            let height = state.last_viewport_height.unwrap_or(40) as usize;
+            let start = end.saturating_sub(height);
+            (start, end)
+        }
+        viewport::ScrollState::Pinned { top, .. } => {
+            let height = state.last_viewport_height.unwrap_or(40) as usize;
+            let end = (top + height).min(visible_indices.len());
+            (top, end)
+        }
+    };
+
+    let content: String = visible_indices[start..end]
+        .iter()
+        .filter_map(|&idx| state.log_lines.get(idx))
+        .map(|entry| entry.raw.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let count = end - start;
+    osc52_copy(&content);
+    state.notifications.push((
+        format!("Copied {} viewport entries", count),
+        std::time::Instant::now(),
+    ));
+    state.dirty = true;
+}
+
+/// Copy all entries for the selected source to clipboard via OSC 52.
+fn copy_stream_to_clipboard(state: &mut AppState) {
+    let visible_indices = state.visible_line_indices();
+    if visible_indices.is_empty() {
+        return;
+    }
+
+    // Determine the source of the currently selected entry
+    let cursor_idx = match state.scroll {
+        viewport::ScrollState::Tail => *visible_indices.last().unwrap(),
+        viewport::ScrollState::Pinned { cursor, .. } => {
+            if cursor >= visible_indices.len() {
+                *visible_indices.last().unwrap()
+            } else {
+                visible_indices[cursor]
+            }
+        }
+    };
+
+    let source = match state.log_lines.get(cursor_idx) {
+        Some(entry) => entry.source.clone(),
+        None => return,
+    };
+
+    let entries: Vec<&str> = visible_indices
+        .iter()
+        .filter_map(|&idx| state.log_lines.get(idx))
+        .filter(|entry| entry.source == source)
+        .map(|entry| entry.raw.as_str())
+        .collect();
+
+    let count = entries.len();
+    let content = entries.join("\n");
+    osc52_copy(&content);
+    state.notifications.push((
+        format!("Copied {} entries from '{}'", count, source),
+        std::time::Instant::now(),
+    ));
+    state.dirty = true;
+}
+
+/// Copy all entries matching the current filter to clipboard via OSC 52.
+fn copy_all_to_clipboard(state: &mut AppState) {
+    let visible = state.visible_log_lines();
+    if visible.is_empty() {
+        return;
+    }
+
+    let count = visible.len();
+    let content: String = visible
+        .iter()
+        .map(|entry| entry.raw.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    osc52_copy(&content);
+    state.notifications.push((
+        format!("Copied {} entries", count),
+        std::time::Instant::now(),
+    ));
+    state.dirty = true;
+}
+
+/// Write a string to the system clipboard via OSC 52 escape sequence.
+fn osc52_copy(content: &str) {
+    use base64::Engine;
+    use std::io::Write;
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(content);
+    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+    let _ = std::io::stdout().write_all(osc52.as_bytes());
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]
