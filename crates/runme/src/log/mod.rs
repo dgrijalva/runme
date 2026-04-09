@@ -7,7 +7,7 @@ pub mod search;
 pub mod store;
 pub mod stream;
 
-use chrono::Utc;
+use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 
@@ -128,9 +128,14 @@ impl LogEntry {
 
     /// Get the best available timestamp string for display.
     /// Prefers the extracted timestamp from log content; falls back to received_at.
+    /// ISO 8601 timestamps are parsed and normalized to HH:MM:SS.mmm local time.
     pub fn display_timestamp(&self) -> String {
         if let Some(ts) = &self.timestamp {
-            ts.clone()
+            if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+                dt.with_timezone(&Local).format("%H:%M:%S%.3f").to_string()
+            } else {
+                ts.clone()
+            }
         } else {
             self.received_at.format("%H:%M:%S%.3f").to_string()
         }
