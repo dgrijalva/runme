@@ -112,6 +112,12 @@ pub struct AppState {
     pub filter_history: Vec<String>,
     /// Current position in filter history (for Up/Down cycling). None = not browsing history.
     pub filter_history_index: Option<usize>,
+    /// The currently running task definition (kept for restart).
+    pub current_task: Option<&'static TaskDef>,
+    /// The arguments the current task was launched with (kept for restart).
+    pub current_task_args: Vec<String>,
+    /// Flag: the event loop should restart the current task.
+    pub pending_restart: bool,
     /// Whether the TUI should stay open after the task completes.
     /// None when no task is running. Shared with the TaskContext via the runner.
     pub tui_wait: Option<Arc<AtomicBool>>,
@@ -161,6 +167,9 @@ impl AppState {
             notifications: Vec::new(),
             filter_history: Vec::new(),
             filter_history_index: None,
+            current_task: None,
+            current_task_args: Vec::new(),
+            pending_restart: false,
             tui_wait: None,
             tui_output: None,
             registry: None,
@@ -253,6 +262,8 @@ impl AppState {
     /// Launch a task from the picker. Sets up the TaskRunner and transitions
     /// to Normal mode. Called from the event loop when pending_task is set.
     pub fn launch_picked_task(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
+        self.current_task = Some(task);
+        self.current_task_args = task_args.clone();
         let mut runner = TaskRunner::new();
         if let Some(ref registry) = self.registry {
             runner.set_registry(registry.clone());

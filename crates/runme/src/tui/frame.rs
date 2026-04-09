@@ -459,6 +459,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         ]),
         Line::from(""),
         Line::from(vec![
+            Span::raw("  r      "),
+            Span::styled("Restart task", Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
             Span::raw("  q      "),
             Span::styled("Quit", Style::default().fg(Color::DarkGray)),
         ]),

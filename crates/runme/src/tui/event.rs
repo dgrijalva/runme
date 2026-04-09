@@ -86,6 +86,46 @@ pub async fn run_event_loop(
                             log_rx = store.subscribe();
                             drop(store);
                         }
+
+                        // Check if a restart was requested
+                        if state.pending_restart {
+                            state.pending_restart = false;
+                            if let Some(task) = state.current_task {
+                                // Shut down old runner's processes in the background
+                                if let Some(old_runner) = state.runner.take() {
+                                    tokio::spawn(async move {
+                                        old_runner
+                                            .shutdown(Duration::from_secs(5))
+                                            .await;
+                                    });
+                                }
+
+                                // Reset UI state
+                                state.scroll = super::viewport::ScrollState::Tail;
+                                state.sidebar.selection = 0;
+                                state.sidebar.focused = false;
+                                state.search = super::search::SearchState::new();
+                                state.sidebar_entries.clear();
+                                state.detail_scroll = 0;
+                                state.process_detail_index = None;
+                                state.process_detail_scroll = 0;
+                                state.process_detail_sockets = None;
+                                prev_process_statuses.clear();
+
+                                // Re-launch the same task
+                                let args = state.current_task_args.clone();
+                                state.launch_picked_task(task, args);
+
+                                // Re-subscribe to the new LogStore
+                                let store = state.log_store.lock().await;
+                                let existing = store.compose_owned();
+                                if !existing.is_empty() {
+                                    state.log_lines = existing;
+                                }
+                                log_rx = store.subscribe();
+                                drop(store);
+                            }
+                        }
                     }
                     Some(Err(_)) => {
                         // Terminal event read error — shut down
@@ -363,6 +403,12 @@ fn handle_key(
         // 'q' quits the application
         KeyCode::Char('q') => {
             state.running = false;
+            state.dirty = true;
+            return;
+        }
+        // 'r' restarts the current task
+        KeyCode::Char('r') if state.current_task.is_some() => {
+            state.pending_restart = true;
             state.dirty = true;
             return;
         }
