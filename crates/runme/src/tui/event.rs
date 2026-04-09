@@ -503,7 +503,11 @@ fn handle_mouse(
                                 cursor: ve.entry_index,
                                 top: match state.scroll {
                                     viewport::ScrollState::Pinned { top, .. } => top,
-                                    viewport::ScrollState::Tail => 0,
+                                    viewport::ScrollState::Tail => vp_layout
+                                        .entries
+                                        .first()
+                                        .map(|e| e.entry_index)
+                                        .unwrap_or(0),
                                 },
                             };
                             state.sidebar.focused = false;
