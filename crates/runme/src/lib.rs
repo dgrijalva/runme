@@ -3,6 +3,7 @@
 // `runme` to be a resolvable crate name. This self-import provides that.
 extern crate self as runme;
 
+pub mod ansi;
 pub mod builtin;
 pub mod cli;
 pub mod cmd;
@@ -14,6 +15,7 @@ pub mod prelude;
 pub mod process;
 pub mod signal;
 pub mod task;
+pub mod theme;
 pub mod tracing_layer;
 pub mod tui;
 pub mod watch;

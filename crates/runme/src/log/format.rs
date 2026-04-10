@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 
 use super::LogEntry;
+use crate::ansi;
+use crate::theme::{THEME, SourceColors};
 
 /// Fixed column widths — shared between CLI formatter and TUI renderer.
 pub const TIMESTAMP_WIDTH: usize = 12;
@@ -37,6 +39,35 @@ pub fn format_entry(entry: &LogEntry) -> String {
         format!(
             "{}{}{}{}{}{}{} {}",
             ts, gap, level, gap, source, gap, message, fields_str
+        )
+    }
+}
+
+/// Format a LogEntry with ANSI colors for terminal display.
+///
+/// Same column layout as `format_entry`, but with theme-derived ANSI colors
+/// on timestamp, level, source, and field columns.
+pub fn format_entry_colored(entry: &LogEntry, source_colors: &mut SourceColors) -> String {
+    let gap = " ".repeat(COLUMN_GAP_WIDTH);
+    let ts = pad_or_truncate(&entry.display_timestamp(), TIMESTAMP_WIDTH);
+    let level = pad_or_truncate(&format_level(&entry.level), LEVEL_WIDTH);
+    let source = pad_or_truncate(&entry.source, SOURCE_WIDTH);
+    let message = entry.message.as_deref().unwrap_or(&entry.raw);
+
+    let level_color = ansi::fg(THEME.level_color(&entry.level));
+    let source_color = ansi::fg(source_colors.color_for(&entry.source));
+    let dim = ansi::fg(THEME.dim);
+    let r = ansi::RESET;
+
+    let fields_str = format_fields_inline(&entry.fields);
+
+    if fields_str.is_empty() {
+        format!(
+            "{dim}{ts}{r}{gap}{level_color}{level}{r}{gap}{source_color}{source}{r}{gap}{message}"
+        )
+    } else {
+        format!(
+            "{dim}{ts}{r}{gap}{level_color}{level}{r}{gap}{source_color}{source}{r}{gap}{message} {dim}{fields_str}{r}"
         )
     }
 }

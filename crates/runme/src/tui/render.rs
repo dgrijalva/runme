@@ -5,11 +5,15 @@
 
 use std::collections::HashMap;
 
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::log::LogEntry;
 use crate::log::format as log_fmt;
+use crate::theme::THEME;
+
+// Re-export so existing imports from `render::SourceColors` keep working.
+pub use crate::theme::SourceColors;
 
 /// Display mode for log entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,47 +28,6 @@ pub enum DisplayMode {
 use log_fmt::{
     COLUMN_GAP_WIDTH as COLUMN_GAP, LEVEL_WIDTH, SOURCE_WIDTH, TIMESTAMP_WIDTH, pad_or_truncate,
 };
-
-/// The palette of colors assigned to sources.
-const SOURCE_PALETTE: &[Color] = &[
-    Color::Cyan,
-    Color::Green,
-    Color::Yellow,
-    Color::Blue,
-    Color::Magenta,
-    Color::Red,
-];
-
-/// Manages source-to-color assignment, cycling through a palette.
-#[derive(Debug, Clone)]
-pub struct SourceColors {
-    map: HashMap<String, Color>,
-}
-
-impl SourceColors {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
-
-    /// Get or assign a color for the given source name.
-    pub fn color_for(&mut self, source: &str) -> Color {
-        if let Some(&color) = self.map.get(source) {
-            return color;
-        }
-        let idx = self.map.len() % SOURCE_PALETTE.len();
-        let color = SOURCE_PALETTE[idx];
-        self.map.insert(source.to_string(), color);
-        color
-    }
-}
-
-impl Default for SourceColors {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Render a single log entry into styled lines.
 ///
@@ -95,7 +58,7 @@ fn render_preview(
     let ts_text = entry.display_timestamp();
     let ts_span = Span::styled(
         pad_or_truncate(&ts_text, TIMESTAMP_WIDTH),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(THEME.dim),
     );
 
     // Level column
@@ -136,7 +99,7 @@ fn render_preview(
             } else {
                 Span::styled(
                     format!(" {}", fields_str),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(THEME.dim),
                 )
             }
         } else {
@@ -237,17 +200,10 @@ fn render_raw(entry: &LogEntry, width: u16, wrap: bool) -> (Vec<Line<'static>>, 
 
 /// Format a level string and return (display text, color).
 ///
-/// Uses the shared `format_level` for the text, adds TUI color.
-fn format_level(level: &Option<String>) -> (String, Color) {
+/// Uses the shared `format_level` for the text, color from theme.
+fn format_level(level: &Option<String>) -> (String, ratatui::style::Color) {
     let text = log_fmt::format_level(level);
-    let color = match level.as_deref() {
-        Some("error") => Color::Red,
-        Some("warn") => Color::Yellow,
-        Some("info") => Color::Green,
-        Some("debug") | Some("trace") => Color::DarkGray,
-        Some(_) => Color::White,
-        None => Color::DarkGray,
-    };
+    let color = THEME.level_color(level);
     (text, color)
 }
 
@@ -310,6 +266,7 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Color;
     use std::collections::HashMap;
 
     fn make_entry(
@@ -348,7 +305,7 @@ mod tests {
     #[test]
     fn source_colors_cycles_palette() {
         let mut sc = SourceColors::new();
-        let palette_len = SOURCE_PALETTE.len();
+        let palette_len = THEME.source_palette.len();
         // Assign more sources than palette colors
         for i in 0..palette_len + 2 {
             sc.color_for(&format!("source{}", i));

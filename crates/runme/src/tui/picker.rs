@@ -14,6 +14,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::theme::THEME;
+
 use crate::task::TaskDef;
 
 /// A task entry in the picker, with precomputed display information.
@@ -295,12 +297,12 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
     // Input bar at the top
     let input_line = if picker.input.is_empty() {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(Color::Cyan)),
-            Span::styled("type to filter...", Style::default().fg(Color::DarkGray)),
+            Span::styled(" > ", Style::default().fg(THEME.accent)),
+            Span::styled("type to filter...", Style::default().fg(THEME.dim)),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" > ", Style::default().fg(Color::Cyan)),
+            Span::styled(" > ", Style::default().fg(THEME.accent)),
             Span::styled(picker.input.clone(), Style::default().fg(Color::White)),
         ])
     };
@@ -310,7 +312,7 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  No tasks match the filter.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.dim),
         )));
     } else {
         // Render visible items with scroll offset
@@ -331,7 +333,7 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
                         Span::styled(
                             display.to_string(),
                             Style::default()
-                                .fg(Color::Yellow)
+                                .fg(THEME.level_warn)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ])
@@ -347,12 +349,12 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
                         Style::default().fg(Color::White)
                     };
                     let desc_style = if is_selected {
-                        Style::default().fg(Color::Cyan)
+                        Style::default().fg(THEME.accent)
                     } else {
-                        Style::default().fg(Color::DarkGray)
+                        Style::default().fg(THEME.dim)
                     };
                     let bg_style = if is_selected {
-                        Style::default().bg(Color::DarkGray)
+                        Style::default().bg(THEME.selection_bg)
                     } else {
                         Style::default()
                     };
@@ -364,7 +366,7 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
                         .unwrap_or_default();
 
                     Line::from(vec![
-                        Span::styled(indicator.to_string(), bg_style.fg(Color::Cyan)),
+                        Span::styled(indicator.to_string(), bg_style.fg(THEME.accent)),
                         Span::styled(pt.task.name.to_string(), name_style.patch(bg_style)),
                         Span::styled(desc, desc_style.patch(bg_style)),
                     ])
@@ -379,10 +381,10 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
         .title(" Pick a task ")
         .title_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(THEME.accent)
                 .add_modifier(Modifier::BOLD),
         )
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(THEME.border));
 
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);

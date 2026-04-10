@@ -9,7 +9,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::render::SourceColors;
+use crate::theme::{THEME, SourceColors};
 use super::runner::{ProcessInfo, ProcessStatus, TaskSession, TaskStatus};
 
 /// Fixed sidebar width in columns.
@@ -131,7 +131,7 @@ pub fn build_sidebar_entries(
             name: proc.display_name().to_string(),
             source: proc.task_name.clone(),
             status_tag: "RUN".to_string(),
-            status_color: Color::Green,
+            status_color: THEME.status_running,
             visible: visible_sources.is_empty() || visible_sources.contains(&proc.task_name),
             is_task: false,
             depth: proc_depth,
@@ -203,7 +203,7 @@ pub async fn build_sidebar_entries_multi(
                 name: proc.display_name().to_string(),
                 source: proc.task_name.clone(),
                 status_tag: "RUN".to_string(),
-                status_color: Color::Green,
+                status_color: THEME.status_running,
                 visible: visible_sources.is_empty()
                     || visible_sources.contains(&proc.task_name),
                 is_task: false,
@@ -241,14 +241,14 @@ pub fn render_sidebar(
 ) {
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(THEME.border))
         .title(Span::styled(
             " processes ",
             Style::default()
                 .fg(if state.focused {
-                    Color::Cyan
+                    THEME.accent
                 } else {
-                    Color::DarkGray
+                    THEME.dim
                 })
                 .add_modifier(Modifier::BOLD),
         ));
@@ -259,7 +259,7 @@ pub fn render_sidebar(
     if entries.is_empty() {
         let placeholder = Paragraph::new(Line::from(Span::styled(
             "  No task running",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.dim),
         )));
         frame.render_widget(placeholder, inner);
         return;
@@ -284,7 +284,7 @@ pub fn render_sidebar(
         // Source color for the name
         let name_color = source_colors.color_for(&entry.source);
         let name_style = if !entry.visible {
-            Style::default().fg(Color::DarkGray) // dimmed when filtered out
+            Style::default().fg(THEME.dim) // dimmed when filtered out
         } else if entry.is_task {
             Style::default()
                 .fg(name_color)
@@ -312,14 +312,14 @@ pub fn render_sidebar(
 
         // Dim everything when the source is hidden
         let tag_style = if !entry.visible {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(THEME.dim)
         } else {
             Style::default().fg(entry.status_color)
         };
 
         let visibility_marker = if !entry.visible { "-" } else { "*" };
         let marker_style = if !entry.visible {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(THEME.dim)
         } else {
             Style::default().fg(name_color)
         };
@@ -328,9 +328,9 @@ pub fn render_sidebar(
         spans.push(Span::styled(
             prefix.to_string(),
             if is_selected {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(THEME.accent)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(THEME.dim)
             },
         ));
         if indent_width > 0 {
@@ -354,7 +354,7 @@ pub fn render_sidebar(
 
         let mut line = Line::from(spans);
         if is_selected {
-            line = line.patch_style(Style::default().bg(Color::DarkGray));
+            line = line.patch_style(Style::default().bg(THEME.selection_bg));
         }
         lines.push(line);
     }
@@ -366,20 +366,20 @@ pub fn render_sidebar(
 /// Get display tag and color for a TaskStatus.
 fn task_status_display(status: &TaskStatus) -> (String, Color) {
     match status {
-        TaskStatus::Setup => ("SETUP".to_string(), Color::Yellow),
-        TaskStatus::Ready => ("READY".to_string(), Color::Green),
-        TaskStatus::Done => ("DONE".to_string(), Color::DarkGray),
-        TaskStatus::Failed(_) => ("FAIL".to_string(), Color::Red),
+        TaskStatus::Setup => ("SETUP".to_string(), THEME.status_setup),
+        TaskStatus::Ready => ("READY".to_string(), THEME.status_running),
+        TaskStatus::Done => ("DONE".to_string(), THEME.status_done),
+        TaskStatus::Failed(_) => ("FAIL".to_string(), THEME.status_failed),
     }
 }
 
 /// Get display tag and color for a ProcessStatus.
 fn process_status_display(status: &ProcessStatus) -> (String, Color) {
     match status {
-        ProcessStatus::Running => ("RUN".to_string(), Color::Green),
-        ProcessStatus::Done => ("DONE".to_string(), Color::DarkGray),
-        ProcessStatus::Failed(code) => (format!("FAIL:{}", code), Color::Red),
-        ProcessStatus::Stopped => ("STOP".to_string(), Color::Yellow),
+        ProcessStatus::Running => ("RUN".to_string(), THEME.status_running),
+        ProcessStatus::Done => ("DONE".to_string(), THEME.status_done),
+        ProcessStatus::Failed(code) => (format!("FAIL:{}", code), THEME.status_failed),
+        ProcessStatus::Stopped => ("STOP".to_string(), THEME.status_stopped),
     }
 }
 
@@ -510,7 +510,7 @@ mod tests {
                 name: "echo hello".to_string(),
                 source: "my-task".to_string(),
                 status_tag: "RUN".to_string(),
-                status_color: Color::Green,
+                status_color: THEME.status_running,
                 visible: true,
                 is_task: false,
                 depth: 1,

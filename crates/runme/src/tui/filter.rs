@@ -11,6 +11,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::theme::THEME;
+
 use crate::log::filter::{self, FilterExpr};
 
 /// State for the filter input widget.
@@ -178,13 +180,13 @@ pub fn render_filter_input(frame: &mut Frame, area: Rect, filter_state: &FilterI
     let mut spans: Vec<Span> = Vec::new();
 
     // Prefix
-    spans.push(Span::styled(" filter: ", Style::default().fg(Color::Cyan)));
+    spans.push(Span::styled(" filter: ", Style::default().fg(THEME.accent)));
 
     if filter_state.text.is_empty() {
         // Placeholder
         spans.push(Span::styled(
             "level:error AND source:api ...",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.dim),
         ));
     } else {
         // Split text at cursor position for rendering
@@ -220,13 +222,13 @@ pub fn render_filter_input(frame: &mut Frame, area: Rect, filter_state: &FilterI
     if let Some(ref err) = filter_state.parse_error {
         spans.push(Span::styled(
             format!("  {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(THEME.level_error),
         ));
     }
 
     let line = Line::from(spans);
     let paragraph =
-        Paragraph::new(line).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
     frame.render_widget(paragraph, area);
 }
 
@@ -239,7 +241,7 @@ pub fn filter_status_spans(filter_state: &FilterInputState) -> Vec<Span<'static>
                 Span::raw(" "),
                 Span::styled(
                     format!(" filter: {} ", text),
-                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(THEME.accent),
                 ),
             ]
         }

@@ -143,7 +143,8 @@ async fn run_cli(
     // Subscribe to LogStore → stdio BEFORE launching the task.
     let rx = exec.subscribe().await;
     let use_raw = matches!(format, OutputFormat::Raw);
-    tokio::spawn(forward_output_to_stdio(rx, use_raw));
+    let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    tokio::spawn(forward_output_to_stdio(rx, use_raw, use_color));
 
     exec.launch(task, args.to_vec(), LaunchConfig::default());
 
@@ -183,19 +184,36 @@ async fn run_cli(
 
 /// Forward log entries from a broadcast receiver to stdout/stderr.
 ///
-/// When `raw` is false, uses the shared log formatter so CLI output matches
-/// the TUI's preview layout. When `raw` is true, passes through `entry.raw`
-/// unformatted (useful for piping into jq, grep, etc.).
+/// Color handling by mode:
+/// - Text (`raw=false`): colored columns if `color=true`, plain if not.
+/// - Raw (`raw=true`): ANSI passthrough if `color=true`, stripped if not.
 async fn forward_output_to_stdio(
     mut rx: tokio::sync::broadcast::Receiver<LogEntry>,
     raw: bool,
+    color: bool,
 ) {
-    use crate::log::format::format_entry;
+    use crate::log::format::{format_entry, format_entry_colored};
+    use crate::theme::SourceColors;
     use std::io::Write;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
+    let mut source_colors = SourceColors::new();
     while let Ok(entry) = rx.recv().await {
-        let line = if raw { &entry.raw } else { &format_entry(&entry) };
+        let formatted;
+        let line: &str = if raw {
+            if color {
+                &entry.raw
+            } else {
+                formatted = crate::ansi::strip(&entry.raw);
+                &formatted
+            }
+        } else if color {
+            formatted = format_entry_colored(&entry, &mut source_colors);
+            &formatted
+        } else {
+            formatted = format_entry(&entry);
+            &formatted
+        };
         match entry.stream {
             Some(Stream::Stderr) => {
                 let mut out = stderr.lock();

@@ -4,10 +4,12 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
+
+use crate::theme::THEME;
 
 use super::app::{AppMode, AppState};
 use super::filter::{filter_status_spans, render_filter_input};
@@ -104,23 +106,23 @@ pub fn render_frame(
                 if state.log_lines.is_empty() {
                     vec![Line::from(Span::styled(
                         "  Waiting for output...",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(THEME.dim),
                     ))]
                 } else if state.filter_input.has_active_filter() {
                     vec![Line::from(Span::styled(
                         "  No entries match the current filter. Press 'f' to edit.",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(THEME.dim),
                     ))]
                 } else {
                     vec![Line::from(Span::styled(
                         "  All sources filtered out. Press 'a' to show all.",
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(THEME.dim),
                     ))]
                 }
             } else {
                 vec![Line::from(Span::styled(
                     "  No task running. Press q to quit.",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(THEME.dim),
                 ))]
             }
         } else {
@@ -151,7 +153,7 @@ pub fn render_frame(
             let current_search_entry = state.search.current_match_index();
 
             // Place rendered entries into the buffer at their Y positions
-            let cursor_style = Style::default().bg(Color::DarkGray);
+            let cursor_style = Style::default().bg(THEME.selection_bg);
             for ve in &vp_layout.entries {
                 // Determine if this entry is the current search match
                 let is_current_search_match = current_search_entry == Some(ve.entry_index);
@@ -210,11 +212,11 @@ pub fn render_frame(
 
             // Build status line with task info
             let mut spans = vec![
-                Span::styled(" runme ", Style::default().fg(Color::Black).bg(Color::Cyan)),
+                Span::styled(" runme ", Style::default().fg(Color::Black).bg(THEME.accent)),
                 Span::raw(" "),
                 Span::styled(
                     format!(" {} ", focus_text),
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
+                    Style::default().fg(Color::Black).bg(THEME.dim),
                 ),
             ];
 
@@ -223,7 +225,7 @@ pub fn render_frame(
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
                     format!(" {} ", name),
-                    Style::default().fg(Color::White).bg(Color::DarkGray),
+                    Style::default().fg(Color::White).bg(THEME.dim),
                 ));
             }
 
@@ -236,7 +238,7 @@ pub fn render_frame(
             spans.push(Span::raw(" "));
             spans.push(Span::styled(
                 format!(" {} {} ", mode_indicator, wrap_indicator),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(THEME.dim),
             ));
 
             // Source filter indicator
@@ -246,7 +248,7 @@ pub fn render_frame(
                     spans.push(Span::raw(" "));
                     spans.push(Span::styled(
                         format!(" {} hidden ", hidden_count),
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(THEME.level_warn),
                     ));
                 }
             }
@@ -265,7 +267,7 @@ pub fn render_frame(
                     ScrollState::Tail => {
                         spans.push(Span::styled(
                             format!(" TAIL | {} ", visible_count),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(THEME.dim),
                         ));
                     }
                     ScrollState::Pinned { cursor, .. } => {
@@ -275,7 +277,7 @@ pub fn render_frame(
                         } else {
                             format!(" {} / {} ", cursor + 1, visible_count)
                         };
-                        spans.push(Span::styled(pos_text, Style::default().fg(Color::DarkGray)));
+                        spans.push(Span::styled(pos_text, Style::default().fg(THEME.dim)));
                     }
                 }
             }
@@ -283,7 +285,7 @@ pub fn render_frame(
             let status_line = Line::from(spans);
 
             let status_bar = Paragraph::new(status_line)
-                .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                .style(Style::default().bg(THEME.dim).fg(Color::White));
 
             frame.render_widget(status_bar, status_bar_area);
         }
@@ -321,172 +323,118 @@ pub fn render_frame(
 fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     use ratatui::widgets::{Borders, Clear, Wrap};
 
+    let section = Style::default().fg(THEME.level_warn);
+    let desc = Style::default().fg(THEME.dim);
+
     let help_text = vec![
         Line::from(Span::styled(
             "Keyboard Shortcuts",
             Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "Navigation",
-            Style::default().fg(Color::Yellow),
-        )]),
+        Line::from(vec![Span::styled("Navigation", section)]),
         Line::from(vec![
             Span::raw("  j/k    "),
-            Span::styled("Move cursor down/up", Style::default().fg(Color::DarkGray)),
+            Span::styled("Move cursor down/up", desc),
         ]),
         Line::from(vec![
             Span::raw("  [/]    "),
-            Span::styled("Page up/down", Style::default().fg(Color::DarkGray)),
+            Span::styled("Page up/down", desc),
         ]),
         Line::from(vec![
             Span::raw("  g/G    "),
-            Span::styled(
-                "Jump to top / bottom (tail)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Jump to top / bottom (tail)", desc),
         ]),
         Line::from(vec![
             Span::raw("  Enter  "),
-            Span::styled(
-                "Open entry detail view",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Open entry detail view", desc),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "Display",
-            Style::default().fg(Color::Yellow),
-        )]),
+        Line::from(vec![Span::styled("Display", section)]),
         Line::from(vec![
             Span::raw("  v      "),
-            Span::styled(
-                "Toggle preview/raw mode",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Toggle preview/raw mode", desc),
         ]),
         Line::from(vec![
             Span::raw("  w      "),
-            Span::styled("Toggle wrap/truncate", Style::default().fg(Color::DarkGray)),
+            Span::styled("Toggle wrap/truncate", desc),
         ]),
         Line::from(vec![
             Span::raw("  \\      "),
-            Span::styled(
-                "Toggle sidebar visibility",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Toggle sidebar visibility", desc),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "Filter & Search",
-            Style::default().fg(Color::Yellow),
-        )]),
+        Line::from(vec![Span::styled("Filter & Search", section)]),
         Line::from(vec![
             Span::raw("  f      "),
-            Span::styled(
-                "Open filter bar (Enter confirm, Esc cancel)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Open filter bar (Enter confirm, Esc cancel)", desc),
         ]),
         Line::from(vec![
             Span::raw("  /      "),
-            Span::styled(
-                "Open search (Enter confirm, Esc cancel)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Open search (Enter confirm, Esc cancel)", desc),
         ]),
         Line::from(vec![
             Span::raw("  n/N    "),
-            Span::styled(
-                "Next/previous search match",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Next/previous search match", desc),
         ]),
         Line::from(vec![
             Span::raw("  Up/Dn  "),
-            Span::styled(
-                "Cycle filter history (in filter input)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Cycle filter history (in filter input)", desc),
         ]),
         Line::from(vec![
             Span::raw("  1-9    "),
-            Span::styled(
-                "Toggle source N visibility",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Toggle source N visibility", desc),
         ]),
         Line::from(vec![
             Span::raw("  a      "),
-            Span::styled("Show all sources", Style::default().fg(Color::DarkGray)),
+            Span::styled("Show all sources", desc),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "Sidebar (Tab to focus)",
-            Style::default().fg(Color::Yellow),
-        )]),
+        Line::from(vec![Span::styled("Sidebar (Tab to focus)", section)]),
         Line::from(vec![
             Span::raw("  Tab    "),
-            Span::styled("Toggle sidebar focus", Style::default().fg(Color::DarkGray)),
+            Span::styled("Toggle sidebar focus", desc),
         ]),
         Line::from(vec![
             Span::raw("  Enter  "),
-            Span::styled(
-                "Process detail / toggle source visibility",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Process detail / toggle source visibility", desc),
         ]),
         Line::from(vec![
             Span::raw("  s      "),
-            Span::styled(
-                "Stop selected process (SIGTERM)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Stop selected process (SIGTERM)", desc),
         ]),
         Line::from(vec![
             Span::raw("  S      "),
-            Span::styled(
-                "Send SIGHUP to selected process",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Send SIGHUP to selected process", desc),
         ]),
         Line::from(""),
-        Line::from(vec![Span::styled(
-            "Copy / Export",
-            Style::default().fg(Color::Yellow),
-        )]),
+        Line::from(vec![Span::styled("Copy / Export", section)]),
         Line::from(vec![
             Span::raw("  y      "),
-            Span::styled("Copy selected entry", Style::default().fg(Color::DarkGray)),
+            Span::styled("Copy selected entry", desc),
         ]),
         Line::from(vec![
             Span::raw("  c      "),
-            Span::styled(
-                "Copy menu (viewport/stream/all)",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Copy menu (viewport/stream/all)", desc),
         ]),
         Line::from(vec![
             Span::raw("  e      "),
-            Span::styled(
-                "Export visible log to file",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("Export visible log to file", desc),
         ]),
         Line::from(""),
         Line::from(vec![
             Span::raw("  r      "),
-            Span::styled("Restart task", Style::default().fg(Color::DarkGray)),
+            Span::styled("Restart task", desc),
         ]),
         Line::from(vec![
             Span::raw("  q      "),
-            Span::styled("Quit", Style::default().fg(Color::DarkGray)),
+            Span::styled("Quit", desc),
         ]),
         Line::from(vec![
             Span::raw("  ?      "),
-            Span::styled("Toggle this help", Style::default().fg(Color::DarkGray)),
+            Span::styled("Toggle this help", desc),
         ]),
     ];
 
@@ -508,8 +456,8 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
 
     let help_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" Help ", Style::default().fg(Color::Cyan)));
+        .border_style(Style::default().fg(THEME.accent))
+        .title(Span::styled(" Help ", Style::default().fg(THEME.accent)));
 
     let help_paragraph = Paragraph::new(help_text)
         .block(help_block)
@@ -522,31 +470,29 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
 fn render_copy_menu(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     use ratatui::widgets::{Borders, Clear, Wrap};
 
+    let desc = Style::default().fg(THEME.dim);
     let menu_text = vec![
         Line::from(Span::styled(
             "Copy to Clipboard",
             Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(ratatui::style::Modifier::BOLD),
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
             Span::raw("  v  "),
-            Span::styled("Viewport (on-screen entries)", Style::default().fg(Color::DarkGray)),
+            Span::styled("Viewport (on-screen entries)", desc),
         ]),
         Line::from(vec![
             Span::raw("  s  "),
-            Span::styled("Stream (selected source)", Style::default().fg(Color::DarkGray)),
+            Span::styled("Stream (selected source)", desc),
         ]),
         Line::from(vec![
             Span::raw("  a  "),
-            Span::styled("All (matching filter)", Style::default().fg(Color::DarkGray)),
+            Span::styled("All (matching filter)", desc),
         ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "  Esc to cancel",
-            Style::default().fg(Color::DarkGray),
-        )),
+        Line::from(Span::styled("  Esc to cancel", desc)),
     ];
 
     let menu_height = (menu_text.len() + 2) as u16;
@@ -565,8 +511,8 @@ fn render_copy_menu(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
 
     let menu_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(" Copy ", Style::default().fg(Color::Cyan)));
+        .border_style(Style::default().fg(THEME.accent))
+        .title(Span::styled(" Copy ", Style::default().fg(THEME.accent)));
 
     let menu_paragraph = Paragraph::new(menu_text)
         .block(menu_block)
@@ -606,21 +552,22 @@ fn render_entry_detail(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
     };
 
     // Build the detail lines
+    let label = Style::default().fg(THEME.accent);
     let mut detail_lines: Vec<Line<'static>> = vec![
         Line::from(vec![
-            Span::styled("timestamp: ", Style::default().fg(Color::Cyan)),
+            Span::styled("timestamp: ", label),
             Span::raw(entry.display_timestamp()),
         ]),
         Line::from(vec![
-            Span::styled("level:     ", Style::default().fg(Color::Cyan)),
+            Span::styled("level:     ", label),
             Span::raw(entry.level.clone().unwrap_or_else(|| "---".to_string())),
         ]),
         Line::from(vec![
-            Span::styled("source:    ", Style::default().fg(Color::Cyan)),
+            Span::styled("source:    ", label),
             Span::raw(entry.source.clone()),
         ]),
         Line::from(vec![
-            Span::styled("message:   ", Style::default().fg(Color::Cyan)),
+            Span::styled("message:   ", label),
             Span::raw(
                 entry
                     .message
@@ -651,7 +598,7 @@ fn render_entry_detail(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
             detail_lines.push(Line::from(vec![
                 Span::styled(
                     format!("{}:{} ", key, padding),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(THEME.level_warn),
                 ),
                 Span::raw(value_str),
             ]));
@@ -662,7 +609,7 @@ fn render_entry_detail(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
     detail_lines.push(Line::from(""));
     detail_lines.push(Line::from(Span::styled(
         "--- raw ---",
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(THEME.dim),
     )));
     for raw_line in entry.raw.lines() {
         detail_lines.push(Line::from(raw_line.to_string()));
@@ -701,10 +648,10 @@ fn render_entry_detail(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
 
     let detail_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(THEME.accent))
         .title(Span::styled(
             " Entry Detail (j/k scroll, y copy, Esc close) ",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(THEME.accent),
         ));
 
     let detail_paragraph = Paragraph::new(visible_lines)
@@ -733,20 +680,21 @@ fn render_process_detail(
     };
 
     // Build the detail lines
+    let label = Style::default().fg(THEME.accent);
     let mut detail_lines: Vec<Line<'static>> = Vec::new();
 
     detail_lines.push(Line::from(vec![
-        Span::styled("Command:  ", Style::default().fg(Color::Cyan)),
+        Span::styled("Command:  ", label),
         Span::raw(entry.name.clone()),
     ]));
 
     detail_lines.push(Line::from(vec![
-        Span::styled("Source:   ", Style::default().fg(Color::Cyan)),
+        Span::styled("Source:   ", label),
         Span::raw(entry.source.clone()),
     ]));
 
     detail_lines.push(Line::from(vec![
-        Span::styled("Status:   ", Style::default().fg(Color::Cyan)),
+        Span::styled("Status:   ", label),
         Span::styled(
             entry.status_tag.clone(),
             Style::default().fg(entry.status_color),
@@ -786,14 +734,14 @@ fn render_process_detail(
 
                 if let Some(pid) = proc.pid {
                     detail_lines.push(Line::from(vec![
-                        Span::styled("PID:      ", Style::default().fg(Color::Cyan)),
+                        Span::styled("PID:      ", label),
                         Span::raw(pid.to_string()),
                     ]));
                 }
 
                 if let Some(pgid) = proc.pgid {
                     detail_lines.push(Line::from(vec![
-                        Span::styled("PGID:     ", Style::default().fg(Color::Cyan)),
+                        Span::styled("PGID:     ", label),
                         Span::raw(pgid.to_string()),
                     ]));
                 }
@@ -805,26 +753,26 @@ fn render_process_detail(
     detail_lines.push(Line::from(""));
     if let Some(ref sockets) = state.process_detail_sockets {
         detail_lines.push(Line::from(vec![
-            Span::styled("Ports:   ", Style::default().fg(Color::Cyan)),
+            Span::styled("Ports:   ", label),
             Span::raw(sockets.clone()),
         ]));
     } else {
         detail_lines.push(Line::from(vec![
-            Span::styled("Ports:   ", Style::default().fg(Color::Cyan)),
-            Span::styled("scanning...", Style::default().fg(Color::Yellow)),
+            Span::styled("Ports:   ", label),
+            Span::styled("scanning...", Style::default().fg(THEME.level_warn)),
         ]));
     }
 
     // Controls hint at bottom
     detail_lines.push(Line::from(""));
     detail_lines.push(Line::from(vec![
-        Span::styled("s", Style::default().fg(Color::Cyan)),
+        Span::styled("s", Style::default().fg(THEME.accent)),
         Span::raw(" stop (SIGTERM)  "),
-        Span::styled("S", Style::default().fg(Color::Cyan)),
+        Span::styled("S", Style::default().fg(THEME.accent)),
         Span::raw(" SIGHUP  "),
-        Span::styled("j/k", Style::default().fg(Color::Cyan)),
+        Span::styled("j/k", Style::default().fg(THEME.accent)),
         Span::raw(" scroll  "),
-        Span::styled("Esc", Style::default().fg(Color::Cyan)),
+        Span::styled("Esc", Style::default().fg(THEME.accent)),
         Span::raw(" close"),
     ]));
 
@@ -862,10 +810,10 @@ fn render_process_detail(
 
     let detail_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(THEME.accent))
         .title(Span::styled(
             " Process Detail ",
-            Style::default().fg(Color::Cyan),
+            Style::default().fg(THEME.accent),
         ));
 
     let detail_paragraph = Paragraph::new(visible_lines)
@@ -894,9 +842,9 @@ fn render_notifications(
 
     frame.render_widget(Clear, notif_area);
     let line = Line::from(vec![
-        Span::styled(" ! ", Style::default().fg(Color::Black).bg(Color::Yellow)),
+        Span::styled(" ! ", Style::default().fg(Color::Black).bg(THEME.level_warn)),
         Span::raw(" "),
-        Span::styled(text.clone(), Style::default().fg(Color::Yellow)),
+        Span::styled(text.clone(), Style::default().fg(THEME.level_warn)),
     ]);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, notif_area);

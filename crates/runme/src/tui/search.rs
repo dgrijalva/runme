@@ -13,6 +13,8 @@ use ratatui::{
     widgets::Paragraph,
 };
 
+use crate::theme::THEME;
+
 /// State for the search feature.
 pub struct SearchState {
     /// Current text in the search input buffer.
@@ -237,13 +239,13 @@ pub fn render_search_input(frame: &mut Frame, area: Rect, search_state: &SearchS
     let mut spans: Vec<Span> = Vec::new();
 
     // Prefix
-    spans.push(Span::styled(" /", Style::default().fg(Color::Yellow)));
+    spans.push(Span::styled(" /", Style::default().fg(THEME.level_warn)));
 
     if search_state.text.is_empty() {
         // Placeholder
         spans.push(Span::styled(
             "search...",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(THEME.dim),
         ));
     } else {
         // Split text at cursor position for rendering
@@ -277,7 +279,7 @@ pub fn render_search_input(frame: &mut Frame, area: Rect, search_state: &SearchS
 
     let line = Line::from(spans);
     let paragraph =
-        Paragraph::new(line).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+        Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
     frame.render_widget(paragraph, area);
 }
 
@@ -292,7 +294,7 @@ pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
             Span::raw(" "),
             Span::styled(
                 format!(" /{} [no matches] ", search_state.pattern),
-                Style::default().fg(Color::Red),
+                Style::default().fg(THEME.level_error),
             ),
         ]
     } else {
@@ -305,7 +307,7 @@ pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
                     search_state.current_match_display(),
                     count,
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(THEME.level_warn),
             ),
         ]
     }
@@ -313,14 +315,14 @@ pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
 
 /// Style for highlighting search matches (non-current).
 pub fn match_highlight_style() -> Style {
-    Style::default().bg(Color::Yellow).fg(Color::Black)
+    Style::default().bg(THEME.search_match_bg).fg(THEME.search_match_fg)
 }
 
 /// Style for highlighting the current search match (where n/N is focused).
 pub fn current_match_highlight_style() -> Style {
     Style::default()
-        .bg(Color::Yellow)
-        .fg(Color::Black)
+        .bg(THEME.search_match_bg)
+        .fg(THEME.search_match_fg)
         .add_modifier(Modifier::BOLD)
 }
 
