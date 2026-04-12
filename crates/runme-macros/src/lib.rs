@@ -1,3 +1,5 @@
+mod cmd_macro;
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
@@ -661,4 +663,23 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Build a structured `Cmd` from shell-like syntax.
+///
+/// Whitespace separates arguments. `{expr}` interpolates a Rust expression
+/// as a single argument. Quoted strings (`"..."`) are single arguments.
+/// Adjacent tokens (no whitespace) merge into one argument.
+///
+/// ```ignore
+/// // These are equivalent:
+/// cmd!(curl -X POST {&url} -H "Content-Type: application/json")
+/// Cmd::new("curl").arg("-X").arg("POST").arg(&url).arg("-H").arg("Content-Type: application/json")
+/// ```
+#[proc_macro]
+pub fn cmd(input: TokenStream) -> TokenStream {
+    match cmd_macro::expand_cmd(input.into()) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
 }

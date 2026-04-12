@@ -364,4 +364,50 @@ mod tests {
         assert!(cmd.parser.is_none());
         assert!(cmd.extractor.is_none());
     }
+
+    #[test]
+    fn test_cmd_macro_simple() {
+        let cmd = runme::cmd!(cargo build --release);
+        assert!(!cmd.is_shell());
+        assert_eq!(cmd.to_string(), "cargo build --release");
+    }
+
+    #[test]
+    fn test_cmd_macro_interpolation() {
+        let url = "http://example.com";
+        let cmd = runme::cmd!(curl -X POST {url});
+        assert_eq!(cmd.to_string(), "curl -X POST http://example.com");
+    }
+
+    #[test]
+    fn test_cmd_macro_string_literal() {
+        let cmd = runme::cmd!(curl -H "Content-Type: application/json");
+        assert_eq!(
+            cmd.to_string(),
+            "curl -H Content-Type: application/json"
+        );
+    }
+
+    #[test]
+    fn test_cmd_macro_mixed() {
+        let url = String::from("http://example.com");
+        let path = "snapshot=@/tmp/file";
+        let cmd = runme::cmd! {
+            curl -X POST {&url}
+                 -H "Content-Type: multipart/form-data"
+                 -F {path}
+        };
+        assert!(!cmd.is_shell());
+        assert_eq!(
+            cmd.to_string(),
+            "curl -X POST http://example.com -H Content-Type: multipart/form-data -F snapshot=@/tmp/file"
+        );
+    }
+
+    #[test]
+    fn test_cmd_macro_ref_interpolation() {
+        let name = String::from("world");
+        let cmd = runme::cmd!(echo {&name});
+        assert_eq!(cmd.to_string(), "echo world");
+    }
 }

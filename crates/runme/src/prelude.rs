@@ -16,6 +16,7 @@ pub use crate::task::{
 };
 pub use crate::tui::output::{TuiOutput, TuiOutputHandle, TuiOutputStreamHandle};
 pub use crate::watch::{Watch, WatchInfo, WatchKind, glob_filter};
+pub use runme_macros::cmd;
 pub use runme_macros::init;
 pub use runme_macros::task;
 

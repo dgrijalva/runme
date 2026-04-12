@@ -10,7 +10,7 @@ Runme is a Rust-based task runner where tasks are defined in `RUNME.rs` files �
 
 - **`runme`** (`crates/runme/`) — Core library. Contains the task runtime, process management, log engine, TUI, and the prelude that RUNME.rs files import. This is what gets compiled into every generated binary.
 - **`runme-cli`** (`crates/runme-cli/`) — The `runme` binary. Handles discovery of RUNME.rs files, workspace generation, compilation, and exec of the resulting binary. Not a runtime dependency — it's the build orchestrator.
-- **`runme-macros`** (`crates/runme-macros/`) — Proc macros: `#[runme::task]` and `#[runme::init]`. Generates `TaskDef`/`InitDef` registrations via `inventory`.
+- **`runme-macros`** (`crates/runme-macros/`) — Proc macros: `#[runme::task]`, `#[runme::init]`, and `cmd!`. Generates `TaskDef`/`InitDef` registrations via `inventory`, and structured `Cmd` values from shell-like syntax.
 
 ### Compilation Pipeline (runme-cli)
 
@@ -32,7 +32,7 @@ Tasks are registered via `inventory` at compile time, or dynamically at init tim
 - **`TaskContext`** — Runtime context passed to task functions. Provides `exec()` (run-and-wait) and `spawn()` (background process with handle). All child processes are spawned in their own process group for clean signal delivery.
 - **`Registry`** — Collects `TaskDef`s from inventory + dynamic registration, provides lookup and execution.
 - **`InitContext`** — Passed to `#[runme::init]` hooks. Can set group display name and register dynamic tasks via `register_task()`. Dynamic tasks have their strings leaked to `&'static str` (process-lifetime, bounded count).
-- **`Cmd`** — Value type describing a command. Two modes: structured (`Cmd::new("cargo").args(["build"])`) or shell (`Cmd::shell("echo hi")`). `&str` auto-converts to shell mode.
+- **`Cmd`** — Value type describing a command. Two modes: structured (`Cmd::new("cargo").args(["build"])`) or shell (`Cmd::shell("echo hi")`). `&str` auto-converts to shell mode. The `cmd!` macro provides shell-like syntax that compiles to structured args: `cmd!(curl -X POST {&url} -H "Content-Type: application/json")`. Whitespace separates args, `{expr}` interpolates, `"..."` is a single literal arg. No shell involved.
 
 ### Log Engine
 

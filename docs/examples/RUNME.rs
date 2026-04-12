@@ -133,7 +133,7 @@ async fn watch_channel_demo(ctx: &TaskContext) -> TaskResult {
 /// Use Cmd builder with env and cwd
 #[runme::task]
 async fn env_demo(ctx: &TaskContext) -> TaskResult {
-    let cmd = Cmd::new("env")
+    let cmd = cmd!(env)
         .env("RUNME_DEMO", "hello")
         .env("RUNME_MODE", "testing");
     ctx.exec(cmd).await?;
@@ -188,10 +188,7 @@ async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> Tas
     if verbose {
         ctx.exec("echo 'Running pre-deploy checks...'").await?;
     }
-    ctx.exec(
-        Cmd::shell(format!("echo 'Deployed to {} on port {}'", env, port)),
-    )
-    .await?;
+    ctx.exec(cmd!(echo {format!("Deployed to {} on port {}", env, port)})).await?;
     Ok(())
 }
 

@@ -21,6 +21,7 @@ pub mod tui;
 pub mod watch;
 
 // Re-export macros at the crate root so users can write #[runme::task], #[runme::init]
+pub use runme_macros::cmd;
 pub use runme_macros::init;
 pub use runme_macros::task;
 
