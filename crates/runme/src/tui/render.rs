@@ -172,6 +172,21 @@ fn render_preview(
             result.push(line);
         }
 
+        // Structured fields: render on their own continuation line(s), dimmed,
+        // wrapped to fit within the message column.
+        if !entry.fields.is_empty() {
+            let fields_str = log_fmt::format_fields_inline(&entry.fields);
+            if !fields_str.is_empty() {
+                let indent = " ".repeat(prefix_width);
+                for chunk in wrap_text(&fields_str, msg_width) {
+                    result.push(Line::from(vec![
+                        Span::raw(indent.clone()),
+                        Span::styled(chunk, Style::default().fg(THEME.dim)),
+                    ]));
+                }
+            }
+        }
+
         let height = result.len();
         (result, height)
     }

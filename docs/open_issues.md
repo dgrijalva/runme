@@ -48,19 +48,3 @@ Possible approaches:
 - Collapse `\r`-delimited chunks into a single entry that updates in place
 - Strip `\r` progress output entirely and only show the final line
 
-## Extra structured fields lost in log rendering
-
-The TUI used to show extra structured fields (beyond timestamp/level/message) in dimmed text after the message. This got lost when CLI and TUI rendering was unified. JSON log entries like:
-
-```json
-{"timestamp":"...","level":"INFO","message":"stream:tool_call","turn":0,"tool_name":"feedback","accumulated_len":39,"service_name":"service"}
-```
-
-should show `turn=0 tool_name=feedback accumulated_len=39 service_name=service` dimmed after the message, but currently only timestamp/level/message render.
-
-Likely regression in the render unification — the extra fields path probably only wired up for one of the two renderers.
-
-## Tail mode should keep bottom padding
-
-In tail mode, the last log line sits flush against the bottom of the viewport. There should be a couple blank lines of padding below the last line so content doesn't feel pinned to the edge.
-

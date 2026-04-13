@@ -66,11 +66,13 @@ pub fn layout(
     let (cursor, top) = match *scroll {
         ScrollState::Tail => {
             let cursor = entries.len() - 1;
-            // Compute top so the last entry is at the bottom
+            // Compute top so the last entry lands `SCROLL_MARGIN` rows above the bottom,
+            // mirroring the cursor margin used when scrolling.
+            let effective_height = viewport_height.saturating_sub(SCROLL_MARGIN).max(1);
             let top = compute_top_for_bottom(
                 cursor,
                 entries,
-                viewport_height,
+                effective_height,
                 width,
                 mode,
                 wrap,

@@ -198,6 +198,7 @@ impl CommonJsonFieldExtractor {
 
     fn extract_from_json(&self, val: &serde_json::Value) -> ExtractedFields {
         let mut fields = HashMap::new();
+        let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Extract level
         let mut level = None;
@@ -208,6 +209,7 @@ impl CommonJsonFieldExtractor {
                 } else {
                     level = Some(Self::value_to_string(v));
                 }
+                consumed.insert(field_name.to_string());
                 break;
             }
         }
@@ -217,6 +219,7 @@ impl CommonJsonFieldExtractor {
         for &field_name in Self::MESSAGE_FIELDS {
             if let Some(v) = Self::json_get(val, field_name) {
                 message = Some(Self::value_to_string(v));
+                consumed.insert(field_name.to_string());
                 break;
             }
         }
@@ -226,6 +229,7 @@ impl CommonJsonFieldExtractor {
         for &field_name in Self::TIMESTAMP_FIELDS {
             if let Some(v) = Self::json_get(val, field_name) {
                 timestamp = Some(Self::value_to_string(v));
+                consumed.insert(field_name.to_string());
                 break;
             }
         }
@@ -237,8 +241,19 @@ impl CommonJsonFieldExtractor {
                     fields
                         .entry(semantic_name.to_string())
                         .or_insert_with(|| v.clone());
+                    consumed.insert(candidate.to_string());
                     break;
                 }
+            }
+        }
+
+        // Capture remaining top-level fields under their original keys.
+        if let Some(obj) = val.as_object() {
+            for (key, value) in obj {
+                if consumed.contains(key) || fields.contains_key(key) {
+                    continue;
+                }
+                fields.insert(key.clone(), value.clone());
             }
         }
 
@@ -252,6 +267,7 @@ impl CommonJsonFieldExtractor {
 
     fn extract_from_logfmt(&self, pairs: &[(String, String)]) -> ExtractedFields {
         let mut fields = HashMap::new();
+        let mut consumed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Extract level
         let mut level = None;
@@ -275,6 +291,7 @@ impl CommonJsonFieldExtractor {
                 } else {
                     level = Some(v.to_string());
                 }
+                consumed.insert(field_name.to_string());
                 break;
             }
         }
@@ -284,6 +301,7 @@ impl CommonJsonFieldExtractor {
         for &field_name in Self::MESSAGE_FIELDS {
             if let Some(v) = Self::logfmt_get(pairs, field_name) {
                 message = Some(v.to_string());
+                consumed.insert(field_name.to_string());
                 break;
             }
         }
@@ -293,6 +311,7 @@ impl CommonJsonFieldExtractor {
         for &field_name in Self::TIMESTAMP_FIELDS {
             if let Some(v) = Self::logfmt_get(pairs, field_name) {
                 timestamp = Some(v.to_string());
+                consumed.insert(field_name.to_string());
                 break;
             }
         }
@@ -304,9 +323,18 @@ impl CommonJsonFieldExtractor {
                     fields
                         .entry(semantic_name.to_string())
                         .or_insert_with(|| serde_json::Value::String(v.to_string()));
+                    consumed.insert(candidate.to_string());
                     break;
                 }
             }
+        }
+
+        // Capture remaining pairs under their original keys.
+        for (key, value) in pairs {
+            if consumed.contains(key) || fields.contains_key(key) {
+                continue;
+            }
+            fields.insert(key.clone(), serde_json::Value::String(value.clone()));
         }
 
         ExtractedFields {
