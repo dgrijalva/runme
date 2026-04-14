@@ -88,7 +88,7 @@ pub fn format_level(level: &Option<String>) -> String {
 /// Pad or truncate a string to exactly the given width.
 pub fn pad_or_truncate(s: &str, width: usize) -> String {
     if s.len() >= width {
-        s[..width].to_string()
+        s[..s.floor_char_boundary(width)].to_string()
     } else {
         format!("{:<width$}", s, width = width)
     }

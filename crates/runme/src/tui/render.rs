@@ -233,7 +233,7 @@ fn format_fields_inline(fields: &HashMap<String, serde_json::Value>, max_width: 
     if full.len() <= max_width {
         full
     } else if max_width >= 1 {
-        full[..max_width].to_string()
+        full[..full.floor_char_boundary(max_width)].to_string()
     } else {
         String::new()
     }
@@ -243,8 +243,9 @@ fn truncate_str(s: &str, width: usize) -> String {
     if s.len() <= width {
         s.to_string()
     } else if width >= 1 {
-        // Truncate without ellipsis — just clip
-        s[..width].to_string()
+        // Truncate without ellipsis — just clip at nearest char boundary
+        let end = s.floor_char_boundary(width);
+        s[..end].to_string()
     } else {
         String::new()
     }
@@ -271,8 +272,16 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
                 result.push(remaining.to_string());
                 break;
             }
-            result.push(remaining[..width].to_string());
-            remaining = &remaining[width..];
+            let split = remaining.floor_char_boundary(width);
+            if split == 0 {
+                // Single char wider than width — take it anyway to avoid infinite loop
+                let c_len = remaining.chars().next().map_or(0, |c| c.len_utf8());
+                result.push(remaining[..c_len].to_string());
+                remaining = &remaining[c_len..];
+            } else {
+                result.push(remaining[..split].to_string());
+                remaining = &remaining[split..];
+            }
         }
     }
     result
