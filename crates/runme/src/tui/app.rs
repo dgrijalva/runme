@@ -12,6 +12,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::Mutex;
 
 use crate::log::LogEntry;
+use crate::log::field_stats::FieldStats;
 use crate::log::filter as log_filter;
 use crate::log::store::LogStore;
 use crate::task::{Registry, TaskDef};
@@ -130,6 +131,8 @@ pub struct AppState {
     pub tui_output: Option<Arc<Mutex<TuiOutput>>>,
     /// Shared registry for task discovery and cross-invocation.
     pub registry: Option<Arc<Registry>>,
+    /// Per-source field importance statistics for inline display filtering.
+    pub field_stats: FieldStats,
 }
 
 impl Default for AppState {
@@ -178,6 +181,7 @@ impl AppState {
             tui_wait: None,
             tui_output: None,
             registry: None,
+            field_stats: FieldStats::new(),
         }
     }
 

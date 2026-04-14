@@ -114,6 +114,61 @@ pub fn format_fields_inline(fields: &HashMap<String, serde_json::Value>) -> Stri
     parts.join(" ")
 }
 
+/// Format fields sorted by interestingness score, hiding those below threshold.
+///
+/// Fields are sorted most-interesting first. Fields not present in `scores`
+/// (e.g., when stats haven't accumulated enough data) are shown with default
+/// alphabetical ordering.
+pub fn format_fields_scored(
+    fields: &HashMap<String, serde_json::Value>,
+    scores: &HashMap<&str, f64>,
+    threshold: f64,
+) -> String {
+    if fields.is_empty() {
+        return String::new();
+    }
+
+    // If no scores available, fall back to unfiltered display.
+    if scores.is_empty() {
+        return format_fields_inline(fields);
+    }
+
+    let mut scored: Vec<(&String, &serde_json::Value, f64)> = fields
+        .iter()
+        .filter_map(|(k, v)| {
+            let score = scores.get(k.as_str()).copied().unwrap_or(1.0);
+            if score >= threshold {
+                Some((k, v, score))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if scored.is_empty() {
+        return String::new();
+    }
+
+    // Sort by score descending, then alphabetically for ties.
+    scored.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(b.0))
+    });
+
+    scored
+        .iter()
+        .map(|(k, v, _)| {
+            let val = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            format!("{}={}", k, val)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

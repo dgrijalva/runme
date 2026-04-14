@@ -138,6 +138,7 @@ pub fn render_frame(
                 state.display_mode,
                 state.wrap,
                 &mut state.source_colors,
+                Some(&state.field_stats),
             );
 
             // Build a line buffer for the entire viewport, initialized to empty

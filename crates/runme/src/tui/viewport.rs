@@ -4,6 +4,7 @@
 //! and the viewport scrolls to keep the cursor within a margin of the edges.
 
 use crate::log::LogEntry;
+use crate::log::field_stats::FieldStats;
 
 use super::render::{DisplayMode, SourceColors, render_entry};
 
@@ -56,6 +57,7 @@ pub fn layout(
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    field_stats: Option<&FieldStats>,
 ) -> ViewportLayout {
     if entries.is_empty() || viewport_height == 0 {
         return ViewportLayout {
@@ -93,7 +95,8 @@ pub fn layout(
     let mut idx = top;
 
     while y < viewport_height && idx < entries.len() {
-        let (lines, height) = render_entry(&entries[idx], width, mode, wrap, source_colors);
+        let (lines, height) =
+            render_entry(&entries[idx], width, mode, wrap, source_colors, field_stats);
         result.push(ViewportEntry {
             entry_index: idx,
             y,
@@ -123,7 +126,7 @@ fn compute_top_for_bottom(
     let mut idx = bottom_entry;
 
     loop {
-        let (_, height) = render_entry(&entries[idx], width, mode, wrap, source_colors);
+        let (_, height) = render_entry(&entries[idx], width, mode, wrap, source_colors, None);
         consumed += height as u16;
         if consumed >= viewport_height || idx == 0 {
             break;
@@ -412,7 +415,7 @@ fn adjust_top_for_cursor(
             if i == cursor {
                 break;
             }
-            let (_, h) = render_entry(entry, width, mode, wrap, source_colors);
+            let (_, h) = render_entry(entry, width, mode, wrap, source_colors, None);
             y += h;
         }
 
@@ -428,6 +431,7 @@ fn adjust_top_for_cursor(
             mode,
             wrap,
             source_colors,
+            None,
         );
         if y + cursor_h + margin > vh {
             // Need to scroll down: recompute top
@@ -436,7 +440,8 @@ fn adjust_top_for_cursor(
             let mut new_top = cursor;
             while new_top > 0 && space < vh {
                 new_top -= 1;
-                let (_, h) = render_entry(&entries[new_top], width, mode, wrap, source_colors);
+                let (_, h) =
+                    render_entry(&entries[new_top], width, mode, wrap, source_colors, None);
                 space += h;
             }
             top = new_top;
@@ -484,6 +489,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            None,
         );
         assert!(result.entries.is_empty());
     }
@@ -500,6 +506,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            None,
         );
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].is_cursor);
@@ -517,6 +524,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            None,
         );
         // Should show ~10 entries (last ones)
         assert!(result.entries.len() <= 10);
@@ -652,6 +660,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            None,
         );
         // Entry 3 should be the cursor
         let cursor_entry = result.entries.iter().find(|e| e.entry_index == 3).unwrap();

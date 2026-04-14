@@ -1,5 +1,6 @@
 pub mod buffer;
 pub mod extract;
+pub mod field_stats;
 pub mod filter;
 pub mod format;
 pub mod parse;

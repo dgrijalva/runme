@@ -148,6 +148,7 @@ pub async fn run_event_loop(
                             let text = entry.message.as_deref().unwrap_or(&entry.raw);
                             state.search.check_new_entry(visible_count, text);
                         }
+                        state.field_stats.observe(&entry.source, &entry.fields);
                         state.log_lines.push(entry);
                         // In tail mode, scroll state stays as Tail (which will
                         // automatically anchor to the new last entry on render).
@@ -159,6 +160,11 @@ pub async fn run_event_loop(
                         // We missed some entries; reload from the store
                         let store = state.log_store.lock().await;
                         state.log_lines = store.compose_owned();
+                        // Rebuild field stats from the entries we now have
+                        state.field_stats = crate::log::field_stats::FieldStats::new();
+                        for entry in &state.log_lines {
+                            state.field_stats.observe(&entry.source, &entry.fields);
+                        }
                         state.dirty = true;
                         drop(store);
                         let _ = n; // acknowledged
@@ -549,6 +555,7 @@ fn handle_mouse(
                         state.display_mode,
                         state.wrap,
                         &mut state.source_colors,
+                        Some(&state.field_stats),
                     );
 
                     // Find which entry was clicked

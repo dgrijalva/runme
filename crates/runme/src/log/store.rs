@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use tokio::sync::broadcast;
 
 use super::LogEntry;
+use super::field_stats::FieldStats;
 
 /// A composition layer for log entries from multiple sources.
 ///
@@ -21,6 +22,8 @@ pub struct LogStore {
     capacity: Option<usize>,
     /// Broadcast channel for live subscription to new entries.
     tx: broadcast::Sender<LogEntry>,
+    /// Per-source field importance stats, updated as entries arrive.
+    field_stats: FieldStats,
 }
 
 impl LogStore {
@@ -31,6 +34,7 @@ impl LogStore {
             sources: HashMap::new(),
             capacity: None,
             tx,
+            field_stats: FieldStats::new(),
         }
     }
 
@@ -41,6 +45,7 @@ impl LogStore {
             sources: HashMap::new(),
             capacity: Some(capacity),
             tx,
+            field_stats: FieldStats::new(),
         }
     }
 
@@ -50,6 +55,7 @@ impl LogStore {
         // Broadcast to live subscribers (ignore errors -- no receivers is OK)
         let _ = self.tx.send(entry.clone());
 
+        self.field_stats.observe(&entry.source, &entry.fields);
         let source = entry.source.clone();
         self.sources.entry(source).or_default().push(entry);
 
@@ -191,6 +197,11 @@ impl LogStore {
     /// The capacity limit, if set.
     pub fn capacity(&self) -> Option<usize> {
         self.capacity
+    }
+
+    /// Per-source field importance statistics.
+    pub fn field_stats(&self) -> &FieldStats {
+        &self.field_stats
     }
 
     /// Enforce the capacity limit by dropping the oldest entries from the largest

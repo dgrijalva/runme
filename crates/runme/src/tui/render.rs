@@ -9,6 +9,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::log::LogEntry;
+use crate::log::field_stats::{self, FieldStats};
 use crate::log::format as log_fmt;
 use crate::theme::THEME;
 
@@ -32,15 +33,17 @@ use log_fmt::{
 /// Render a single log entry into styled lines.
 ///
 /// Returns the styled lines and the visual height (number of lines).
+/// When `field_stats` is provided, fields are scored and filtered for inline display.
 pub fn render_entry(
     entry: &LogEntry,
     width: u16,
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    field_stats: Option<&FieldStats>,
 ) -> (Vec<Line<'static>>, usize) {
     match mode {
-        DisplayMode::Preview => render_preview(entry, width, wrap, source_colors),
+        DisplayMode::Preview => render_preview(entry, width, wrap, source_colors, field_stats),
         DisplayMode::Raw => render_raw(entry, width, wrap),
     }
 }
@@ -51,6 +54,7 @@ fn render_preview(
     width: u16,
     wrap: bool,
     source_colors: &mut SourceColors,
+    field_stats: Option<&FieldStats>,
 ) -> (Vec<Line<'static>>, usize) {
     let width = width as usize;
 
@@ -93,7 +97,16 @@ fn render_preview(
         // Append structured fields in dim color using remaining space
         let fields_width = msg_width.saturating_sub(msg_len + 1);
         let fields_span = if !entry.fields.is_empty() && fields_width > 3 {
-            let fields_str = format_fields_inline(&entry.fields, fields_width);
+            let scores = field_stats
+                .map(|fs| fs.field_scores(&entry.source))
+                .unwrap_or_default();
+            let fields_str = if scores.is_empty() {
+                format_fields_inline(&entry.fields, fields_width)
+            } else {
+                let full =
+                    log_fmt::format_fields_scored(&entry.fields, &scores, field_stats::DEFAULT_THRESHOLD);
+                truncate_fields_str(&full, fields_width)
+            };
             if fields_str.is_empty() {
                 Span::raw("")
             } else {
@@ -175,7 +188,18 @@ fn render_preview(
         // Structured fields: render on their own continuation line(s), dimmed,
         // wrapped to fit within the message column.
         if !entry.fields.is_empty() {
-            let fields_str = log_fmt::format_fields_inline(&entry.fields);
+            let scores = field_stats
+                .map(|fs| fs.field_scores(&entry.source))
+                .unwrap_or_default();
+            let fields_str = if scores.is_empty() {
+                log_fmt::format_fields_inline(&entry.fields)
+            } else {
+                log_fmt::format_fields_scored(
+                    &entry.fields,
+                    &scores,
+                    field_stats::DEFAULT_THRESHOLD,
+                )
+            };
             if !fields_str.is_empty() {
                 let indent = " ".repeat(prefix_width);
                 for chunk in wrap_text(&fields_str, msg_width) {
@@ -230,10 +254,18 @@ fn format_fields_inline(fields: &HashMap<String, serde_json::Value>, max_width: 
         return String::new();
     }
     let full = log_fmt::format_fields_inline(fields);
-    if full.len() <= max_width {
-        full
+    truncate_fields_str(&full, max_width)
+}
+
+/// Truncate a pre-formatted fields string to fit within `max_width`.
+fn truncate_fields_str(s: &str, max_width: usize) -> String {
+    if max_width < 3 {
+        return String::new();
+    }
+    if s.len() <= max_width {
+        s.to_string()
     } else if max_width >= 1 {
-        full[..full.floor_char_boundary(max_width)].to_string()
+        s[..s.floor_char_boundary(max_width)].to_string()
     } else {
         String::new()
     }
@@ -352,7 +384,7 @@ mod tests {
             None,
         );
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc);
+        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc, None);
         assert_eq!(height, 1, "truncated mode should produce exactly 1 line");
         assert_eq!(lines.len(), 1);
     }
@@ -362,7 +394,7 @@ mod tests {
         let long_msg = "x".repeat(200);
         let entry = make_entry("raw", "api", Some("info"), Some(&long_msg), None);
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc);
+        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc, None);
         assert_eq!(height, 1);
         // The combined width should not exceed terminal width
         let total_width: usize = lines[0].spans.iter().map(|s| s.content.len()).sum();
@@ -378,23 +410,23 @@ mod tests {
         let mut sc = SourceColors::new();
 
         let error_entry = make_entry("raw", "api", Some("error"), Some("err"), None);
-        let (lines, _) = render_entry(&error_entry, 80, DisplayMode::Preview, false, &mut sc);
+        let (lines, _) = render_entry(&error_entry, 80, DisplayMode::Preview, false, &mut sc, None);
         // Level span is the 3rd span (index 2, after ts and gap)
         let level_span = &lines[0].spans[2];
         assert_eq!(level_span.style.fg, Some(Color::Red));
 
         let warn_entry = make_entry("raw", "api", Some("warn"), Some("w"), None);
-        let (lines, _) = render_entry(&warn_entry, 80, DisplayMode::Preview, false, &mut sc);
+        let (lines, _) = render_entry(&warn_entry, 80, DisplayMode::Preview, false, &mut sc, None);
         let level_span = &lines[0].spans[2];
         assert_eq!(level_span.style.fg, Some(Color::Yellow));
 
         let info_entry = make_entry("raw", "api", Some("info"), Some("i"), None);
-        let (lines, _) = render_entry(&info_entry, 80, DisplayMode::Preview, false, &mut sc);
+        let (lines, _) = render_entry(&info_entry, 80, DisplayMode::Preview, false, &mut sc, None);
         let level_span = &lines[0].spans[2];
         assert_eq!(level_span.style.fg, Some(Color::Green));
 
         let debug_entry = make_entry("raw", "api", Some("debug"), Some("d"), None);
-        let (lines, _) = render_entry(&debug_entry, 80, DisplayMode::Preview, false, &mut sc);
+        let (lines, _) = render_entry(&debug_entry, 80, DisplayMode::Preview, false, &mut sc, None);
         let level_span = &lines[0].spans[2];
         assert_eq!(level_span.style.fg, Some(Color::DarkGray));
     }
@@ -403,7 +435,7 @@ mod tests {
     fn preview_truncated_no_level() {
         let entry = make_entry("raw", "api", None, Some("msg"), None);
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc);
+        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc, None);
         assert_eq!(height, 1);
         // Level span should show "---"
         let level_span = &lines[0].spans[2];
@@ -414,7 +446,7 @@ mod tests {
     fn preview_truncated_falls_back_to_raw() {
         let entry = make_entry("the raw text", "api", Some("info"), None, None);
         let mut sc = SourceColors::new();
-        let (lines, _) = render_entry(&entry, 100, DisplayMode::Preview, false, &mut sc);
+        let (lines, _) = render_entry(&entry, 100, DisplayMode::Preview, false, &mut sc, None);
         // Message span (index 6: after ts, gap, level, gap, source, gap) should contain raw text
         let msg_span = &lines[0].spans[6];
         assert!(msg_span.content.contains("the raw text"));
@@ -426,7 +458,7 @@ mod tests {
     fn preview_wrapped_short_message() {
         let entry = make_entry("raw", "api", Some("info"), Some("short"), None);
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, true, &mut sc);
+        let (lines, height) = render_entry(&entry, 80, DisplayMode::Preview, true, &mut sc, None);
         assert_eq!(height, 1, "short message should fit on one line");
         assert_eq!(lines.len(), 1);
     }
@@ -438,7 +470,7 @@ mod tests {
         let msg = "a".repeat(40);
         let entry = make_entry("raw", "api", Some("info"), Some(&msg), None);
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 50, DisplayMode::Preview, true, &mut sc);
+        let (lines, height) = render_entry(&entry, 50, DisplayMode::Preview, true, &mut sc, None);
         assert!(height > 1, "long message should wrap to multiple lines");
         assert_eq!(lines.len(), height);
         // First line has prefix spans; continuation lines are indented
@@ -460,7 +492,7 @@ mod tests {
             None,
         );
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 80, DisplayMode::Raw, false, &mut sc);
+        let (lines, height) = render_entry(&entry, 80, DisplayMode::Raw, false, &mut sc, None);
         assert_eq!(height, 1);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0]
@@ -476,7 +508,7 @@ mod tests {
         let raw = "x".repeat(100);
         let entry = make_entry(&raw, "api", None, None, None);
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 50, DisplayMode::Raw, false, &mut sc);
+        let (lines, height) = render_entry(&entry, 50, DisplayMode::Raw, false, &mut sc, None);
         assert_eq!(height, 1);
         let text: String = lines[0]
             .spans
@@ -493,7 +525,7 @@ mod tests {
         let raw = "a".repeat(100);
         let entry = make_entry(&raw, "api", None, None, None);
         let mut sc = SourceColors::new();
-        let (lines, height) = render_entry(&entry, 40, DisplayMode::Raw, true, &mut sc);
+        let (lines, height) = render_entry(&entry, 40, DisplayMode::Raw, true, &mut sc, None);
         assert_eq!(height, 3, "100 chars at width 40 should be 3 lines");
         assert_eq!(lines.len(), 3);
     }
@@ -503,7 +535,7 @@ mod tests {
         let raw = "line1\nline2\nline3";
         let entry = make_entry(raw, "api", None, None, None);
         let mut sc = SourceColors::new();
-        let (_lines, height) = render_entry(&entry, 80, DisplayMode::Raw, true, &mut sc);
+        let (_lines, height) = render_entry(&entry, 80, DisplayMode::Raw, true, &mut sc, None);
         assert_eq!(height, 3);
     }
 
