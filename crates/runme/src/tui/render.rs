@@ -42,8 +42,21 @@ pub fn render_entry(
     source_colors: &mut SourceColors,
     field_stats: Option<&FieldStats>,
 ) -> (Vec<Line<'static>>, usize) {
+    render_entry_opts(entry, width, mode, wrap, source_colors, field_stats, true)
+}
+
+/// Render a single log entry with explicit control over field display.
+pub fn render_entry_opts(
+    entry: &LogEntry,
+    width: u16,
+    mode: DisplayMode,
+    wrap: bool,
+    source_colors: &mut SourceColors,
+    field_stats: Option<&FieldStats>,
+    show_fields: bool,
+) -> (Vec<Line<'static>>, usize) {
     match mode {
-        DisplayMode::Preview => render_preview(entry, width, wrap, source_colors, field_stats),
+        DisplayMode::Preview => render_preview(entry, width, wrap, source_colors, field_stats, show_fields),
         DisplayMode::Raw => render_raw(entry, width, wrap),
     }
 }
@@ -55,6 +68,7 @@ fn render_preview(
     wrap: bool,
     source_colors: &mut SourceColors,
     field_stats: Option<&FieldStats>,
+    show_fields: bool,
 ) -> (Vec<Line<'static>>, usize) {
     let width = width as usize;
 
@@ -96,7 +110,7 @@ fn render_preview(
 
         // Append structured fields in dim color using remaining space
         let fields_width = msg_width.saturating_sub(msg_len + 1);
-        let fields_span = if !entry.fields.is_empty() && fields_width > 3 {
+        let fields_span = if show_fields && !entry.fields.is_empty() && fields_width > 3 {
             let scores = field_stats
                 .map(|fs| fs.field_scores(&entry.source))
                 .unwrap_or_default();
@@ -187,7 +201,7 @@ fn render_preview(
 
         // Structured fields: render on their own continuation line(s), dimmed,
         // wrapped to fit within the message column.
-        if !entry.fields.is_empty() {
+        if show_fields && !entry.fields.is_empty() {
             let scores = field_stats
                 .map(|fs| fs.field_scores(&entry.source))
                 .unwrap_or_default();

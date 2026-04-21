@@ -556,6 +556,7 @@ fn handle_mouse(
                         state.wrap,
                         &mut state.source_colors,
                         Some(&state.field_stats),
+                        state.show_fields,
                     );
 
                     // Find which entry was clicked

@@ -195,6 +195,11 @@ pub(super) fn handle_log_viewer_key(
             state.wrap = !state.wrap;
         }
 
+        // d: toggle field details
+        KeyCode::Char('d') => {
+            state.show_fields = !state.show_fields;
+        }
+
         // \: toggle sidebar visibility
         KeyCode::Char('\\') => {
             state.sidebar_visible = !state.sidebar_visible;

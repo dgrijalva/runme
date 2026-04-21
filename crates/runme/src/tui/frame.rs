@@ -139,6 +139,7 @@ pub fn render_frame(
                 state.wrap,
                 &mut state.source_colors,
                 Some(&state.field_stats),
+                state.show_fields,
             );
 
             // Build a line buffer for the entire viewport, initialized to empty
@@ -361,6 +362,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         Line::from(vec![
             Span::raw("  w      "),
             Span::styled("Toggle wrap/truncate", desc),
+        ]),
+        Line::from(vec![
+            Span::raw("  d      "),
+            Span::styled("Toggle field details", desc),
         ]),
         Line::from(vec![
             Span::raw("  \\      "),

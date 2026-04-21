@@ -6,7 +6,7 @@
 use crate::log::LogEntry;
 use crate::log::field_stats::FieldStats;
 
-use super::render::{DisplayMode, SourceColors, render_entry};
+use super::render::{DisplayMode, SourceColors, render_entry, render_entry_opts};
 
 /// Scroll margin: the cursor never gets closer than this many rows
 /// to the top or bottom of the viewport.
@@ -58,6 +58,7 @@ pub fn layout(
     wrap: bool,
     source_colors: &mut SourceColors,
     field_stats: Option<&FieldStats>,
+    show_fields: bool,
 ) -> ViewportLayout {
     if entries.is_empty() || viewport_height == 0 {
         return ViewportLayout {
@@ -96,7 +97,7 @@ pub fn layout(
 
     while y < viewport_height && idx < entries.len() {
         let (lines, height) =
-            render_entry(&entries[idx], width, mode, wrap, source_colors, field_stats);
+            render_entry_opts(&entries[idx], width, mode, wrap, source_colors, field_stats, show_fields);
         result.push(ViewportEntry {
             entry_index: idx,
             y,
@@ -490,6 +491,7 @@ mod tests {
             false,
             &mut sc,
             None,
+            true,
         );
         assert!(result.entries.is_empty());
     }
@@ -507,6 +509,7 @@ mod tests {
             false,
             &mut sc,
             None,
+            true,
         );
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].is_cursor);
@@ -525,6 +528,7 @@ mod tests {
             false,
             &mut sc,
             None,
+            true,
         );
         // Should show ~10 entries (last ones)
         assert!(result.entries.len() <= 10);
@@ -661,6 +665,7 @@ mod tests {
             false,
             &mut sc,
             None,
+            true,
         );
         // Entry 3 should be the cursor
         let cursor_entry = result.entries.iter().find(|e| e.entry_index == 3).unwrap();

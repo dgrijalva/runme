@@ -133,6 +133,8 @@ pub struct AppState {
     pub registry: Option<Arc<Registry>>,
     /// Per-source field importance statistics for inline display filtering.
     pub field_stats: FieldStats,
+    /// Whether to show structured fields inline in log entries.
+    pub show_fields: bool,
 }
 
 impl Default for AppState {
@@ -182,6 +184,7 @@ impl AppState {
             tui_output: None,
             registry: None,
             field_stats: FieldStats::new(),
+            show_fields: true,
         }
     }
 
