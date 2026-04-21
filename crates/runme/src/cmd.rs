@@ -118,6 +118,19 @@ impl Cmd {
         self
     }
 
+    /// Conditionally apply a builder transformation.
+    ///
+    /// Keeps the chain intact when you need to toggle settings based on a flag:
+    /// ```ignore
+    /// Cmd::shell("cargo run")
+    ///     .env("PORT", "3000")
+    ///     .when(cfg.dev_mode, |c| c.env("DEBUG", "1"))
+    ///     .label("server")
+    /// ```
+    pub fn when(self, condition: bool, f: impl FnOnce(Self) -> Self) -> Self {
+        if condition { f(self) } else { self }
+    }
+
     /// Set a human-readable label for this command.
     ///
     /// The label is used as the source name in the log viewer and sidebar,

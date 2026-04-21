@@ -807,6 +807,11 @@ impl SpawnBuilder {
         self
     }
 
+    /// Conditionally apply a builder transformation.
+    pub fn when(self, condition: bool, f: impl FnOnce(Self) -> Self) -> Self {
+        if condition { f(self) } else { self }
+    }
+
     /// Spawn the process and wait for it to exit, returning the result.
     ///
     /// This is the "exec" path — equivalent to `spawn().await?.complete().await`.
