@@ -63,6 +63,10 @@ Every RUNME.rs file must define `const __RUNME_GROUP: &str = "...";` — this is
 
 Task functions are `async fn(ctx: &TaskContext) -> TaskResult`. The prelude re-exports tracing macros (`info!`, `error!`, etc.) for structured logging from task code.
 
+## Project Status
+
+This is pre-release, unshipped software. There are no external users. Do not worry about backward compatibility — APIs can change freely.
+
 ## Rust Edition
 
 This project uses Rust **edition 2024**. This means `use` imports within `impl` blocks, `unsafe_op_in_unsafe_fn` lint, and other 2024 edition changes apply. The nightly toolchain may be required.

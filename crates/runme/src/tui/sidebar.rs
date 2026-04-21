@@ -375,10 +375,19 @@ fn task_status_display(status: &TaskStatus) -> (String, Color) {
 
 /// Get display tag and color for a ProcessStatus.
 fn process_status_display(status: &ProcessStatus) -> (String, Color) {
+    use crate::process::Termination;
     match status {
         ProcessStatus::Running => ("RUN".to_string(), THEME.status_running),
         ProcessStatus::Done => ("DONE".to_string(), THEME.status_done),
-        ProcessStatus::Failed(code) => (format!("FAIL:{}", code), THEME.status_failed),
+        ProcessStatus::Failed(Termination::Exited(code)) => {
+            (format!("FAIL:{}", code), THEME.status_failed)
+        }
+        ProcessStatus::Failed(Termination::Signaled(sig)) => {
+            (format!("SIG:{}", sig), THEME.status_failed)
+        }
+        ProcessStatus::Failed(Termination::TimedOut) => {
+            ("TIMEOUT".to_string(), THEME.status_failed)
+        }
         ProcessStatus::Stopped => ("STOP".to_string(), THEME.status_stopped),
     }
 }
@@ -485,7 +494,8 @@ mod tests {
             process_status_display(&ProcessStatus::Done),
             ("DONE".to_string(), Color::DarkGray)
         );
-        let (tag, color) = process_status_display(&ProcessStatus::Failed(1));
+        let (tag, color) =
+            process_status_display(&ProcessStatus::Failed(crate::process::Termination::Exited(1)));
         assert_eq!(tag, "FAIL:1");
         assert_eq!(color, Color::Red);
         assert_eq!(

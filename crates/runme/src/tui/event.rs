@@ -720,7 +720,7 @@ fn check_for_crashes(state: &mut AppState, prev_statuses: &mut Vec<(String, Proc
 
         // Check for new failures
         for (i, (name, status)) in current.iter().enumerate() {
-            if let ProcessStatus::Failed(code) = status {
+            if let ProcessStatus::Failed(termination) = status {
                 // Check if this was previously running
                 let was_running = if i < prev_statuses.len() {
                     matches!(prev_statuses[i].1, ProcessStatus::Running)
@@ -734,7 +734,7 @@ fn check_for_crashes(state: &mut AppState, prev_statuses: &mut Vec<(String, Proc
                     let not_tailing = !matches!(state.scroll, viewport::ScrollState::Tail);
                     if is_filtered || not_tailing {
                         state.notifications.push((
-                            format!("{} exited with code {}", name, code),
+                            format!("{} {}", name, termination),
                             std::time::Instant::now(),
                         ));
                         state.dirty = true;
@@ -894,7 +894,8 @@ mod tests {
             buffer: Arc::new(Mutex::new(OutputBuffer::new(100))),
             pgid: None,
             pid: None,
-            status: ProcessStatus::Failed(1),
+            status: ProcessStatus::Failed(crate::process::Termination::Exited(1)),
+            ready: true,
         }]));
         state.processes = Some(procs);
 

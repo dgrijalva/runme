@@ -203,17 +203,26 @@ async fn test_cross_task_error_propagation() {
 // ============================================================
 
 /// Run the spawn_echo fixture which calls ctx.exec("echo hello from spawn_echo").
-/// Verify the output appears in the buffer.
+/// Verify the output appears in the LogStore (exec now goes through spawn, so
+/// output flows via SpawnEvent → monitor_spawns → LogStore).
 #[tokio::test]
 async fn test_output_capture_from_exec() {
-    let reg = Registry::from_inventory();
-    let task = reg.get("spawn_echo").unwrap();
-    let ctx = TaskContext::new(task.name);
-    let result = task.func.call(&ctx, &[]).await;
-    assert!(result.is_ok(), "spawn_echo should succeed");
+    use runme::execution::{LaunchConfig, TaskExecution};
 
-    let found = common::output_contains(&ctx, "hello from spawn_echo").await;
-    assert!(found, "output should contain 'hello from spawn_echo'");
+    let reg = Arc::new(Registry::from_inventory());
+    let task = reg.get("spawn_echo").unwrap();
+    let mut exec = TaskExecution::new();
+    exec.set_registry(reg);
+    exec.launch(task, vec![], LaunchConfig::default());
+    exec.wait().await;
+
+    // Give the monitor_spawns forwarder a moment to process
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let store = exec.log_store().lock().await;
+    let entries = store.compose_owned();
+    let found = entries.iter().any(|e| e.raw.contains("hello from spawn_echo"));
+    assert!(found, "LogStore should contain 'hello from spawn_echo'");
 }
 
 // ============================================================

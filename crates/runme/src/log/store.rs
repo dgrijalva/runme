@@ -229,6 +229,75 @@ impl LogStore {
             }
         }
     }
+
+    /// Create an `Output` handle backed by a snapshot of all entries, with
+    /// live forwarding of new entries.
+    ///
+    /// The returned `Output` contains all current entries and will receive
+    /// new entries as they are pushed into this LogStore.
+    pub fn output(&self) -> crate::process::Output {
+        let total = self.len();
+        let mut buffer = super::buffer::OutputBuffer::new(total.max(1024));
+        for entry in self.compose() {
+            buffer.push(entry.clone());
+        }
+
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(buffer));
+
+        // Forward new entries from the LogStore to the buffer
+        let mut rx = self.subscribe();
+        let buf = buffer.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(entry) => {
+                        buf.lock().await.push(entry);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+
+        crate::process::Output(buffer)
+    }
+
+    /// Create an `Output` handle filtered to entries from a single source.
+    ///
+    /// The returned `Output` contains existing entries from the named source
+    /// and will receive new entries for that source as they arrive.
+    pub fn output_for(&self, source: &str) -> crate::process::Output {
+        let source_entries = self.source_entries(source);
+        let count = source_entries.map_or(0, |e| e.len());
+        let mut buffer = super::buffer::OutputBuffer::new(count.max(1024));
+        if let Some(entries) = source_entries {
+            for entry in entries {
+                buffer.push(entry.clone());
+            }
+        }
+
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(buffer));
+
+        // Forward new entries matching the source
+        let mut rx = self.subscribe();
+        let buf = buffer.clone();
+        let source_name = source.to_string();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(entry) => {
+                        if entry.source == source_name {
+                            buf.lock().await.push(entry);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+
+        crate::process::Output(buffer)
+    }
 }
 
 impl Default for LogStore {

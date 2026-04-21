@@ -59,8 +59,8 @@ pub enum ProcessStatus {
     Running,
     /// Process exited successfully (exit code 0).
     Done,
-    /// Process exited with a non-zero exit code or was killed by a signal.
-    Failed(i32),
+    /// Process exited with a non-zero exit code, was killed by a signal, or timed out.
+    Failed(crate::process::Termination),
     /// Process was stopped by the user.
     Stopped,
 }
@@ -76,6 +76,8 @@ pub struct ProcessInfo {
     pub pgid: Option<i32>,
     pub pid: Option<u32>,
     pub status: ProcessStatus,
+    /// Whether the process's readiness probe has succeeded.
+    pub ready: bool,
 }
 
 impl ProcessInfo {
@@ -290,6 +292,7 @@ impl TaskExecution {
         // Create the TaskContext and wire everything up.
         let mut ctx = TaskContext::new(task.name);
         ctx.set_spawn_notifier(spawn_tx);
+        ctx.set_task_status(self.task_status.clone());
         if let Some(ref registry) = self.registry {
             ctx.set_registry(registry.clone());
         }
@@ -443,6 +446,10 @@ impl TaskExecution {
         while let Some(event) = spawn_rx.recv().await {
             let buffer = event.buffer.clone();
 
+            // Determine initial readiness
+            let has_readiness_condition = event.readiness_rx.is_some();
+            let ready = !has_readiness_condition; // Ready by default if no condition
+
             let process_info = ProcessInfo {
                 task_name: event.task_name.clone(),
                 command_label: event.command_label.clone(),
@@ -450,9 +457,26 @@ impl TaskExecution {
                 pgid: event.pgid,
                 pid: event.pid,
                 status: ProcessStatus::Running,
+                ready,
             };
 
-            processes.lock().await.push(process_info);
+            let process_index = {
+                let mut procs = processes.lock().await;
+                let idx = procs.len();
+                procs.push(process_info);
+                idx
+            };
+
+            // Watch for readiness changes if a condition was configured
+            if let Some(mut readiness_rx) = event.readiness_rx {
+                let processes = processes.clone();
+                tokio::spawn(async move {
+                    let _ = readiness_rx.wait_for(|&ready| ready).await;
+                    if let Some(proc) = processes.lock().await.get_mut(process_index) {
+                        proc.ready = true;
+                    }
+                });
+            }
 
             // Subscribe to the process's output buffer and forward to LogStore.
             let store = log_store.clone();

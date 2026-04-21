@@ -12,7 +12,7 @@ use crate::cmd::Cmd;
 use crate::error::{TaskError, TaskResult};
 use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
-use crate::process::{self, Output, ProcessError, ProcessHandle, ProcessResult};
+use crate::process::{self, Output, ProcessError, ProcessResult};
 use crate::tui::output::{TuiOutput, TuiOutputHandle};
 use crate::watch::{self, Watch, WatchInfo, WatchKind};
 
@@ -116,7 +116,7 @@ pub struct TaskContext {
     tracing_output: Option<Arc<Mutex<OutputBuffer>>>,
     /// Process group IDs of all processes spawned through this context.
     /// Used by `stop_all()` to signal every spawned process group.
-    spawned_pgids: Mutex<Vec<i32>>,
+    spawned_pgids: Arc<Mutex<Vec<i32>>>,
     /// Optional channel to notify an observer (e.g., the TUI runner) when a
     /// process is spawned. The receiver gets the `ProcessHandle`'s output buffer
     /// and task name so it can register the process for display.
@@ -136,6 +136,9 @@ pub struct TaskContext {
     /// Injected by the runtime when tasks are launched through `Registry::run_with_registry()`.
     /// `None` when running outside the full runtime (e.g., standalone tests).
     registry: Option<Arc<Registry>>,
+    /// Shared task status, injected by `TaskExecution::launch()`.
+    /// Used by `bind_ready()` and `mark_ready()` to set `TaskStatus::Ready`.
+    task_status: Option<Arc<Mutex<crate::execution::TaskStatus>>>,
 }
 
 /// Event emitted when a process is spawned through a TaskContext.
@@ -152,6 +155,8 @@ pub struct SpawnEvent {
     pub pid: Option<u32>,
     /// Human-readable label for the command (e.g., "echo hello", "npm run dev").
     pub command_label: String,
+    /// Readiness state receiver, if a readiness condition was configured.
+    pub readiness_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl TaskContext {
@@ -161,13 +166,14 @@ impl TaskContext {
             name: name.into(),
             output: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             tracing_output: None,
-            spawned_pgids: Mutex::new(Vec::new()),
+            spawned_pgids: Arc::new(Mutex::new(Vec::new())),
             spawn_tx: None,
             tui_wait: Arc::new(AtomicBool::new(true)),
             tui_output: Arc::new(Mutex::new(TuiOutput::new())),
             watches: Arc::new(std::sync::Mutex::new(Vec::new())),
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             registry: None,
+            task_status: None,
         }
     }
 
@@ -177,13 +183,14 @@ impl TaskContext {
             name: name.into(),
             output: Arc::new(Mutex::new(OutputBuffer::new(capacity))),
             tracing_output: None,
-            spawned_pgids: Mutex::new(Vec::new()),
+            spawned_pgids: Arc::new(Mutex::new(Vec::new())),
             spawn_tx: None,
             tui_wait: Arc::new(AtomicBool::new(true)),
             tui_output: Arc::new(Mutex::new(TuiOutput::new())),
             watches: Arc::new(std::sync::Mutex::new(Vec::new())),
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             registry: None,
+            task_status: None,
         }
     }
 
@@ -298,48 +305,69 @@ impl TaskContext {
 
     /// Run a command and wait for it to complete. Captures output.
     ///
+    /// Sugar for `self.spawn(command).complete().await`. Every exec'd process
+    /// gets its own output buffer, appears in the TUI sidebar, and emits a
+    /// `SpawnEvent` — same as `spawn()`.
+    ///
     /// Returns a `ProcessResult` for any exit code. Use `.ok()?` to propagate
     /// non-zero exit codes as errors, or inspect `.success()` and `.exit_code()`.
     ///
     /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
     pub async fn exec(&self, command: impl Into<Cmd>) -> Result<ProcessResult, ProcessError> {
-        let mut buffer = self.output.lock().await;
-        process::exec(command, &self.name, &mut buffer).await
+        self.spawn(command).complete().await
     }
 
-    /// Spawn a long-running command. Returns a handle for monitoring/control.
+    /// Spawn a long-running command. Returns a builder that resolves to a `ProcessHandle`.
     ///
     /// The process group ID is tracked internally so that `stop_all()` can
     /// shut down every process spawned through this context.
     ///
     /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
-    pub async fn spawn(&self, command: impl Into<Cmd>) -> Result<ProcessHandle, ProcessError> {
+    ///
+    /// Use `.await` to spawn and get a handle, or `.complete().await` to spawn
+    /// and wait for exit (like `exec()`).
+    pub fn spawn(&self, command: impl Into<Cmd>) -> process::SpawnBuilder {
         let cmd: Cmd = command.into();
         let command_label = cmd.display_label();
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(10_000)));
+
+        // Capture what the on_spawn callback needs
+        let spawned_pgids = self.spawned_pgids.clone();
+        let spawn_tx = self.spawn_tx.clone();
+
         // Use the command label as the source name so each process gets a
         // distinct source in the log viewer (rather than all sharing the task name).
-        let handle = process::spawn(cmd, &command_label, buffer).await?;
+        process::SpawnBuilder::new(cmd, command_label.clone(), buffer).on_spawn(move |handle| {
+            // Track the process group so stop_all() can signal it.
+            // Use try_lock since we're in a sync callback — the lock is
+            // uncontended in practice (only this callback and stop_all touch it).
+            if let Some(pgid) = handle.pgid() {
+                if let Ok(mut pgids) = spawned_pgids.try_lock() {
+                    pgids.push(pgid);
+                }
+            } else if let Some(pid) = handle.pid() {
+                if let Ok(mut pgids) = spawned_pgids.try_lock() {
+                    pgids.push(pid as i32);
+                }
+            }
 
-        // Track the process group so stop_all() can signal it
-        if let Some(pgid) = handle.pgid() {
-            self.spawned_pgids.lock().await.push(pgid);
-        } else if let Some(pid) = handle.pid() {
-            self.spawned_pgids.lock().await.push(pid as i32);
-        }
-
-        // Notify the TUI runner (if connected) about the new process
-        if let Some(tx) = &self.spawn_tx {
-            let _ = tx.send(SpawnEvent {
-                buffer: handle.output().0.clone(),
-                task_name: handle.task_name().to_string(),
-                pgid: handle.pgid(),
-                pid: handle.pid(),
-                command_label,
-            });
-        }
-
-        Ok(handle)
+            // Notify the TUI runner (if connected) about the new process
+            if let Some(tx) = &spawn_tx {
+                let readiness_rx = if handle.is_ready() {
+                    None // No readiness condition — already ready
+                } else {
+                    Some(handle.readiness_rx())
+                };
+                let _ = tx.send(SpawnEvent {
+                    buffer: handle.output().0.clone(),
+                    task_name: handle.task_name().to_string(),
+                    pgid: handle.pgid(),
+                    pid: handle.pid(),
+                    command_label,
+                    readiness_rx,
+                });
+            }
+        })
     }
 
     /// Get the tracked process group IDs (for testing/inspection).
@@ -499,6 +527,45 @@ impl TaskContext {
     /// Once set, `ctx.run()` and `ctx.tasks()` become available.
     pub fn set_registry(&mut self, registry: Arc<Registry>) {
         self.registry = Some(registry);
+    }
+
+    /// Inject the shared task status (called by TaskExecution::launch).
+    pub fn set_task_status(&mut self, status: Arc<Mutex<crate::execution::TaskStatus>>) {
+        self.task_status = Some(status);
+    }
+
+    /// Bind this task's readiness to a process handle's readiness.
+    ///
+    /// When the process's readiness probe succeeds, this task's status
+    /// transitions to `TaskStatus::Ready`. Spawns a background task to
+    /// watch the process's readiness state.
+    pub fn bind_ready(&self, handle: &process::ProcessHandle) {
+        if let Some(task_status) = &self.task_status {
+            let mut rx = handle.readiness_rx();
+            let task_status = task_status.clone();
+            tokio::spawn(async move {
+                let _ = rx.wait_for(|&ready| ready).await;
+                let mut status = task_status.lock().await;
+                if matches!(*status, crate::execution::TaskStatus::Setup) {
+                    *status = crate::execution::TaskStatus::Ready;
+                }
+            });
+        }
+    }
+
+    /// Manually mark this task as ready.
+    ///
+    /// Sets the task status to `TaskStatus::Ready` if the task is still
+    /// in the `Setup` phase.
+    pub fn mark_ready(&self) {
+        if let Some(task_status) = &self.task_status {
+            // Use try_lock since this may be called from sync context
+            if let Ok(mut status) = task_status.try_lock() {
+                if matches!(*status, crate::execution::TaskStatus::Setup) {
+                    *status = crate::execution::TaskStatus::Ready;
+                }
+            }
+        }
     }
 
     /// Invoke a task by name with string arguments.

@@ -110,9 +110,10 @@ impl From<crate::process::ProcessError> for TaskError {
 impl From<crate::process::ProcessResult> for TaskError {
     fn from(result: crate::process::ProcessResult) -> Self {
         let code = result.exit_code();
+        let message = format!("process {}", result.termination());
         TaskError {
             output: serde_json::json!({
-                "message": format!("process exited with code {}", code),
+                "message": message,
                 "exit_code": code,
             }),
             hint: ExitHint::Code(code),

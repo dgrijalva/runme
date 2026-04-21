@@ -8,7 +8,10 @@ pub use crate::log::parse::{
     RecordParser, RustPanicParser,
 };
 pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawRecord, Stream};
-pub use crate::process::{Output, ProcessError, ProcessHandle, ProcessResult};
+pub use crate::process::{
+    Output, ProcessError, ProcessHandle, ProcessResult, ReadinessCondition, SpawnBuilder,
+    Termination,
+};
 pub use crate::signal::SignalHandler;
 pub use crate::task::{
     ArgMetadataFn, DynamicTaskFn, Registry, SpawnEvent, StepGuard, TaskContext, TaskDef, TaskFn,

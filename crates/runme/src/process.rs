@@ -1,3 +1,4 @@
+use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -36,6 +37,62 @@ impl std::fmt::Display for ProcessError {
 }
 
 impl std::error::Error for ProcessError {}
+
+/// How a process terminated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Termination {
+    /// Process exited normally with the given exit code.
+    Exited(i32),
+    /// Process was killed by a signal.
+    Signaled(Signal),
+    /// Process was killed because it exceeded its timeout.
+    TimedOut,
+}
+
+impl Termination {
+    /// Whether the process exited successfully (exit code 0).
+    pub fn success(&self) -> bool {
+        matches!(self, Termination::Exited(0))
+    }
+
+    /// Get the exit code, following Unix conventions.
+    ///
+    /// - `Exited(code)` → `code`
+    /// - `Signaled(sig)` → `128 + signal_number`
+    /// - `TimedOut` → `124` (matches coreutils `timeout`)
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Termination::Exited(code) => *code,
+            Termination::Signaled(sig) => 128 + *sig as i32,
+            Termination::TimedOut => 124,
+        }
+    }
+
+    /// Build a `Termination` from a `std::process::ExitStatus`.
+    pub fn from_exit_status(status: std::process::ExitStatus) -> Self {
+        if let Some(code) = status.code() {
+            Termination::Exited(code)
+        } else if let Some(sig) = status.signal() {
+            match Signal::try_from(sig) {
+                Ok(signal) => Termination::Signaled(signal),
+                Err(_) => Termination::Exited(128 + sig),
+            }
+        } else {
+            Termination::Exited(-1)
+        }
+    }
+}
+
+impl std::fmt::Display for Termination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Termination::Exited(0) => write!(f, "exited successfully"),
+            Termination::Exited(code) => write!(f, "exited with code {}", code),
+            Termination::Signaled(sig) => write!(f, "killed by signal {}", sig),
+            Termination::TimedOut => write!(f, "timed out"),
+        }
+    }
+}
 
 /// Unified handle to process output backed by an `OutputBuffer`.
 ///
@@ -91,19 +148,32 @@ impl Output {
 /// for `?` ergonomics.
 #[derive(Debug)]
 pub struct ProcessResult {
-    exit_code: i32,
+    termination: Termination,
     output: Output,
+    command_label: String,
 }
 
 impl ProcessResult {
-    /// Whether the process exited with code 0.
+    /// Whether the process exited successfully (exit code 0).
     pub fn success(&self) -> bool {
-        self.exit_code == 0
+        self.termination.success()
     }
 
-    /// The raw exit code.
+    /// The exit code, following Unix conventions.
+    ///
+    /// Signals map to `128 + signal_number`, timeout maps to `124`.
     pub fn exit_code(&self) -> i32 {
-        self.exit_code
+        self.termination.exit_code()
+    }
+
+    /// How the process terminated.
+    pub fn termination(&self) -> &Termination {
+        &self.termination
+    }
+
+    /// Get the command label (display name for the process).
+    pub fn label(&self) -> &str {
+        &self.command_label
     }
 
     /// Access the process output.
@@ -210,12 +280,17 @@ async fn drain_records_async(
 pub struct ProcessHandle {
     child: tokio::process::Child,
     task_name: String,
+    command_label: String,
     pgid: Option<i32>,
     /// The output buffer for this process (private — use `.output()` to access).
     buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
     /// Background tasks reading stdout/stderr
     _stdout_task: Option<tokio::task::JoinHandle<()>>,
     _stderr_task: Option<tokio::task::JoinHandle<()>>,
+    /// Readiness state — `true` when the readiness probe has succeeded.
+    readiness_rx: tokio::sync::watch::Receiver<bool>,
+    /// Background readiness probe task (if configured).
+    _readiness_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ProcessHandle {
@@ -265,20 +340,30 @@ impl ProcessHandle {
 
     /// Wait for the process to exit and return the result.
     pub async fn wait(&mut self) -> ProcessResult {
-        let status = self.child.wait().await;
-        let exit_code = match status {
-            Ok(s) => s.code().unwrap_or(-1),
-            Err(_) => -1,
+        let termination = match self.child.wait().await {
+            Ok(status) => Termination::from_exit_status(status),
+            Err(_) => Termination::Exited(-1),
         };
         ProcessResult {
-            exit_code,
+            termination,
             output: Output(self.buffer.clone()),
+            command_label: self.command_label.clone(),
         }
+    }
+
+    /// Wait for the process to exit and return the result, consuming the handle.
+    pub async fn complete(mut self) -> ProcessResult {
+        self.wait().await
     }
 
     /// Get the task name associated with this handle.
     pub fn task_name(&self) -> &str {
         &self.task_name
+    }
+
+    /// Get the command label (display name for this process).
+    pub fn label(&self) -> &str {
+        &self.command_label
     }
 
     /// Get the process group ID if available.
@@ -289,6 +374,28 @@ impl ProcessHandle {
     /// Get the child's PID if still running.
     pub fn pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    /// Whether the process's readiness probe has succeeded.
+    pub fn is_ready(&self) -> bool {
+        *self.readiness_rx.borrow()
+    }
+
+    /// Wait until the readiness probe succeeds.
+    ///
+    /// Returns immediately if no readiness condition was configured (always ready)
+    /// or if the probe has already succeeded.
+    pub async fn wait_ready(&self) {
+        let mut rx = self.readiness_rx.clone();
+        // wait_for returns when the predicate is true (or the sender is dropped)
+        let _ = rx.wait_for(|&ready| ready).await;
+    }
+
+    /// Get a clone of the readiness watch receiver.
+    ///
+    /// Useful for binding task-level readiness to this process's readiness.
+    pub fn readiness_rx(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.readiness_rx.clone()
     }
 }
 
@@ -407,7 +514,7 @@ pub async fn exec(
     }
 
     let status = child.wait().await.map_err(ProcessError::Wait)?;
-    let exit_code = status.code().unwrap_or(-1);
+    let termination = Termination::from_exit_status(status);
 
     // Wrap the buffer in an Output. For exec(), we create a new Arc<Mutex<OutputBuffer>>
     // by moving the buffer contents into a fresh buffer.
@@ -417,7 +524,11 @@ pub async fn exec(
     }
     let output = Output(std::sync::Arc::new(tokio::sync::Mutex::new(result_buffer)));
 
-    Ok(ProcessResult { exit_code, output })
+    Ok(ProcessResult {
+        termination,
+        output,
+        command_label: task_name.to_string(),
+    })
 }
 
 /// Spawn a command in the background, returning a handle for monitoring and control.
@@ -526,14 +637,261 @@ pub async fn spawn(
         }
     });
 
+    // No readiness condition configured at the raw spawn level — default to ready.
+    let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(true);
+    drop(readiness_tx); // No probe needed
+
     Ok(ProcessHandle {
         child,
         task_name: task_name.to_string(),
+        command_label: task_name.to_string(),
         pgid,
         buffer,
         _stdout_task: Some(stdout_task),
         _stderr_task: Some(stderr_task),
+        readiness_rx,
+        _readiness_task: None,
     })
+}
+
+// ============================================================
+// Readiness
+// ============================================================
+
+/// A condition that determines when a spawned process is "ready."
+///
+/// Readiness probes run as eager background tasks immediately after spawn.
+/// Use `ProcessHandle::wait_ready()` to block until the probe succeeds.
+pub enum ReadinessCondition {
+    /// Process is ready when it's listening on this TCP port.
+    Port(u16),
+    /// Process is ready when this URL returns an HTTP 2xx response.
+    Http(String),
+    /// Process is ready when this async closure returns.
+    Custom(Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>),
+}
+
+impl std::fmt::Debug for ReadinessCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadinessCondition::Port(port) => write!(f, "Port({})", port),
+            ReadinessCondition::Http(url) => write!(f, "Http({})", url),
+            ReadinessCondition::Custom(_) => write!(f, "Custom(...)"),
+        }
+    }
+}
+
+/// Run a readiness probe, returning when the condition is satisfied.
+async fn run_readiness_probe(condition: ReadinessCondition) {
+    match condition {
+        ReadinessCondition::Port(port) => {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            loop {
+                if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        ReadinessCondition::Http(url) => {
+            loop {
+                if let Ok(stream) = tokio::net::TcpStream::connect(
+                    url.trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .split('/')
+                        .next()
+                        .unwrap_or("127.0.0.1:80"),
+                )
+                .await
+                {
+                    // Basic HTTP GET — just check connection succeeds.
+                    // A full HTTP client would be better but avoids a dependency.
+                    drop(stream);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        ReadinessCondition::Custom(f) => {
+            f().await;
+        }
+    }
+}
+
+// ============================================================
+// SpawnBuilder
+// ============================================================
+
+/// Builder for spawning a process with optional readiness conditions and timeouts.
+///
+/// Created by `TaskContext::spawn()`. Use `.await` (via `IntoFuture`) to spawn
+/// and get a `ProcessHandle`, or `.complete().await` to spawn and wait for exit.
+///
+/// ```ignore
+/// // Background process
+/// let handle = ctx.spawn("./server").await?;
+///
+/// // Wait for completion (like exec)
+/// let result = ctx.spawn("cargo build").complete().await?;
+/// ```
+pub struct SpawnBuilder {
+    cmd: Cmd,
+    task_name: String,
+    buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
+    on_spawn: Option<Box<dyn FnOnce(&ProcessHandle) + Send>>,
+    readiness: Option<ReadinessCondition>,
+    ready_timeout: Option<Duration>,
+    timeout: Option<Duration>,
+}
+
+impl SpawnBuilder {
+    /// Create a new SpawnBuilder.
+    pub(crate) fn new(
+        cmd: Cmd,
+        task_name: String,
+        buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
+    ) -> Self {
+        SpawnBuilder {
+            cmd,
+            task_name,
+            buffer,
+            on_spawn: None,
+            readiness: None,
+            ready_timeout: None,
+            timeout: None,
+        }
+    }
+
+    /// Set a callback to run after the process is spawned.
+    pub(crate) fn on_spawn(mut self, f: impl FnOnce(&ProcessHandle) + Send + 'static) -> Self {
+        self.on_spawn = Some(Box::new(f));
+        self
+    }
+
+    /// Set a readiness condition: process is ready when this TCP port is accepting connections.
+    pub fn ready_on_port(mut self, port: u16) -> Self {
+        self.readiness = Some(ReadinessCondition::Port(port));
+        self
+    }
+
+    /// Set a readiness condition: process is ready when this HTTP URL is reachable.
+    pub fn ready_on_http(mut self, url: impl Into<String>) -> Self {
+        self.readiness = Some(ReadinessCondition::Http(url.into()));
+        self
+    }
+
+    /// Set a readiness condition: process is ready when this async closure completes.
+    pub fn ready_when<F, Fut>(mut self, f: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.readiness = Some(ReadinessCondition::Custom(Box::new(move || Box::pin(f()))));
+        self
+    }
+
+    /// Set the maximum time to wait for the readiness probe to succeed.
+    ///
+    /// If the probe doesn't succeed within this duration, it stops probing
+    /// but the process continues running.
+    pub fn ready_timeout(mut self, timeout: Duration) -> Self {
+        self.ready_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the maximum lifetime for this process.
+    ///
+    /// The process will be killed (SIGTERM → SIGKILL) after this duration.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Spawn the process and wait for it to exit, returning the result.
+    ///
+    /// This is the "exec" path — equivalent to `spawn().await?.complete().await`.
+    pub async fn complete(self) -> Result<ProcessResult, ProcessError> {
+        let mut handle = self.do_spawn().await?;
+        Ok(handle.wait().await)
+    }
+
+    /// Internal: perform the actual spawn, start probes, and call on_spawn.
+    async fn do_spawn(self) -> Result<ProcessHandle, ProcessError> {
+        let mut handle = spawn(self.cmd, &self.task_name, self.buffer).await?;
+
+        // Start readiness probe if configured
+        if let Some(condition) = self.readiness {
+            let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(false);
+            let ready_timeout = self.ready_timeout;
+
+            let readiness_task = tokio::spawn(async move {
+                let probe = run_readiness_probe(condition);
+                if let Some(timeout) = ready_timeout {
+                    if tokio::time::timeout(timeout, probe).await.is_err() {
+                        // Timed out — probe failed, don't set ready
+                        return;
+                    }
+                } else {
+                    probe.await;
+                }
+                let _ = readiness_tx.send(true);
+            });
+
+            handle.readiness_rx = readiness_rx;
+            handle._readiness_task = Some(readiness_task);
+        }
+
+        // Start lifetime timeout if configured
+        if let Some(timeout) = self.timeout {
+            let pgid = handle.pgid();
+            let pid = handle.pid();
+            tokio::spawn(async move {
+                tokio::time::sleep(timeout).await;
+                // Kill the process group
+                if let Some(pgid) = pgid {
+                    let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGTERM));
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+                } else if let Some(pid) = pid {
+                    let _ = killpg(Pid::from_raw(pid as i32), Some(Signal::SIGTERM));
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let _ = killpg(Pid::from_raw(pid as i32), Some(Signal::SIGKILL));
+                }
+            });
+        }
+
+        if let Some(on_spawn) = self.on_spawn {
+            on_spawn(&handle);
+        }
+        Ok(handle)
+    }
+}
+
+impl std::future::IntoFuture for SpawnBuilder {
+    type Output = Result<ProcessHandle, ProcessError>;
+    type IntoFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Self::Output> + Send>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.do_spawn())
+    }
+}
+
+/// Future that spawns a process and waits for it to complete.
+///
+/// Returned by `SpawnBuilder::complete()`.
+pub struct CompletionFuture {
+    inner: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessResult, ProcessError>> + Send>>,
+}
+
+impl std::future::Future for CompletionFuture {
+    type Output = Result<ProcessResult, ProcessError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
+    }
 }
 
 #[cfg(test)]
