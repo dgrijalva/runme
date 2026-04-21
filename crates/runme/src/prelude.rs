@@ -30,6 +30,7 @@ pub use tracing::{debug, error, info, trace, warn};
 pub use crate::tracing_layer::LogEntryLayer;
 
 // Re-export libs
+pub use clap;
 pub use futures;
 pub use itertools::{self, Itertools};
 pub use tokio;
