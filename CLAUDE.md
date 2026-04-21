@@ -29,10 +29,12 @@ The generated runner crate calls `__runme_link()` on each lib crate to ensure `i
 Tasks are registered via `inventory` at compile time, or dynamically at init time. The `#[runme::task]` macro generates a `TaskDef` with name, description (from doc comments or `desc` attr), group, and a wrapped function.
 
 - **`TaskDef`** — Task metadata. The `func` field is `TaskFnKind`: either `Static(TaskFn)` (function pointer from `#[runme::task]`, const-constructible for `inventory::submit!`) or `Dynamic(Arc<dyn Fn>)` (closure with captured state, from `InitContext::register_task()`).
-- **`TaskContext`** — Runtime context passed to task functions. Provides `exec()` (run-and-wait) and `spawn()` (background process with handle). All child processes are spawned in their own process group for clean signal delivery.
+- **`TaskContext`** — Runtime context passed to task functions. `spawn()` returns a `SpawnBuilder` (via `IntoFuture`, so `.await` works unchanged) with optional readiness conditions (`.ready_on_port()`, `.ready_on_http()`, `.ready_when()`), timeouts (`.timeout()`, `.ready_timeout()`), and `.complete()` for wait-for-exit. `exec()` is sugar for `spawn().complete()`. `bind_ready(&handle)` / `mark_ready()` wire process readiness to `TaskStatus::Ready`. All child processes are spawned in their own process group for clean signal delivery.
 - **`Registry`** — Collects `TaskDef`s from inventory + dynamic registration, provides lookup and execution.
 - **`InitContext`** — Passed to `#[runme::init]` hooks. Can set group display name and register dynamic tasks via `register_task()`. Dynamic tasks have their strings leaked to `&'static str` (process-lifetime, bounded count).
-- **`Cmd`** — Value type describing a command. Two modes: structured (`Cmd::new("cargo").args(["build"])`) or shell (`Cmd::shell("echo hi")`). `&str` auto-converts to shell mode. The `cmd!` macro provides shell-like syntax that compiles to structured args: `cmd!(curl -X POST {&url} -H "Content-Type: application/json")`. Whitespace separates args, `{expr}` interpolates, `"..."` is a single literal arg. No shell involved.
+- **`Cmd`** — Pure value type describing a command. Two modes: structured (`Cmd::new("cargo").args(["build"])`) or shell (`Cmd::shell("echo hi")`). `&str` auto-converts to shell mode. The `cmd!` macro provides shell-like syntax that compiles to structured args: `cmd!(curl -X POST {&url} -H "Content-Type: application/json")`. Whitespace separates args, `{expr}` interpolates, `"..."` is a single literal arg. No shell involved. Runtime behavior (timeout, readiness) lives on `SpawnBuilder`, not on `Cmd`.
+- **`SpawnBuilder`** — Returned by `ctx.spawn()`. Supports `.ready_on_port()`, `.ready_on_http()`, `.ready_when()` for declarative readiness, `.timeout()` for process lifetime, `.ready_timeout()` for probe lifetime. `.await` (via `IntoFuture`) returns `ProcessHandle`; `.complete().await` returns `ProcessResult`.
+- **`Termination`** — Enum on `ProcessResult`: `Exited(i32)`, `Signaled(Signal)`, `TimedOut`. Replaces bare exit codes with richer termination semantics.
 
 ### Log Engine
 
@@ -43,7 +45,7 @@ Key modules in `crates/runme/src/log/`:
 - `parse/` — Record parsers (json, logfmt, cargo_diag, rust_panic, plain)
 - `extract.rs` — Field extraction from parsed records (timestamp, level, message)
 - `buffer.rs` — Ring buffer (`OutputBuffer`) with `tokio::broadcast` subscriber support
-- `store.rs` — `LogStore` aggregates entries from multiple sources
+- `store.rs` — `LogStore` aggregates entries from multiple sources. `output()` and `output_for(source)` produce `Output` handles with snapshot + live forwarding.
 - `filter.rs` / `search.rs` / `stream.rs` — Filtering, search, and streaming APIs
 
 ### TUI

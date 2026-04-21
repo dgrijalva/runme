@@ -85,16 +85,15 @@ The execution layer is the system. UI modes (CLI, TUI, Agent) are thin consumers
 
 The core abstraction is `TaskExecution` — a single task execution from launch to cleanup. It owns:
 
-- **TaskContext** — the runtime object passed to task functions. Provides `exec()`, `spawn()`, `run()`, file watching, etc.
-- **LogStore** — aggregated output from all sources. All output flows here.
-- **Process tracking** — pid, pgid, status, and output buffer for each spawned process.
-- **Task status** — lifecycle state (Setup → Done/Failed).
+- **TaskContext** — the runtime object passed to task functions. Provides `exec()`, `spawn()`, `run()`, file watching, readiness binding, etc.
+- **LogStore** — aggregated output from all sources. All output flows here. Produces `Output` handles via `output()` (unified) or `output_for(source)` (filtered) for external consumption.
+- **Process tracking** — pid, pgid, status, readiness state, and output buffer for each spawned process.
+- **Task status** — lifecycle state (Setup → Ready → Done/Failed). `Ready` is set via `ctx.bind_ready()` or `ctx.mark_ready()`.
 - **Cleanup** — `shutdown()` sends SIGTERM/SIGKILL to all spawned process groups.
 
-**Output flow:** Every output source converges on the LogStore through the same pipeline:
+**Output flow:** All processes go through `spawn()`. `exec()` is sugar for `spawn().complete()`. Every process emits a `SpawnEvent`, gets its own `OutputBuffer`, and appears in the TUI sidebar:
 
-- `ctx.exec()` → process stdout/stderr → `OutputBuffer` → `LogStore`
-- `ctx.spawn()` → `SpawnEvent` → subscribe to process buffer → `LogStore`
+- `ctx.exec()` / `ctx.spawn()` → `SpawnEvent` → subscribe to process buffer → `LogStore`
 - `info!()` / `error!()` in task code → `LogEntryLayer` (tracing) → `OutputBuffer` → `LogStore`
 
 The UI subscribes to the LogStore's broadcast channel and renders entries. CLI writes them to stdio. TUI feeds them to the log viewer. Agent ignores them.
@@ -505,11 +504,11 @@ For tasks that want teardown-on-return behavior, the task function can explicitl
 A task progresses through these states:
 
 - **Setup** — the task function is executing (spawning processes, doing initialization)
-- **Ready** — the task function has returned; spawned processes continue running
+- **Ready** — the task has signaled readiness via `ctx.bind_ready(&handle)` or `ctx.mark_ready()`. Spawned processes continue running.
 - **Done** — the task function returned and had no long-running processes (or all have since exited)
 - **Failed** — the task function returned an error or panicked
 
-The transition from Setup to Ready is meaningful information — it tells the user (or agent) that initialization is complete.
+The transition from Setup to Ready is explicitly controlled by task code. `ctx.bind_ready(&handle)` ties task readiness to a process handle's readiness probe (e.g., port open, HTTP healthy). `ctx.mark_ready()` sets readiness directly for complex cases. A parent task can `handle.wait_ready().await` to block until a spawned process's readiness probe succeeds.
 
 ### Task Tree
 
@@ -774,17 +773,19 @@ impl Output {
 }
 ```
 
-Both `ProcessResult` (from `exec`) and `ProcessHandle` (from `spawn`) expose `.output() -> Output`. There is no separate `ExecOutput` type — the same `Output` backed by `OutputBuffer` serves all access patterns.
+Both `ProcessResult` (from `exec`/`complete`) and `ProcessHandle` (from `spawn`) expose `.output() -> Output` and `.label() -> &str`. `ProcessResult` additionally carries a `Termination` enum (`Exited(i32)`, `Signaled(Signal)`, `TimedOut`). `ProcessHandle` adds readiness methods: `wait_ready()`, `is_ready()`, `readiness_rx()`. There is no separate output type — the same `Output` backed by `OutputBuffer` serves all access patterns.
 
 ### Execution Results
 
-`ctx.exec()` returns `Result<ProcessResult, ProcessError>`. The outer `Result` covers spawn failures (binary not found, timeout, etc.). The `ProcessResult` covers all exit codes — success and failure alike. Output is always accessible regardless of exit status.
+`ctx.exec()` returns `Result<ProcessResult, ProcessError>`. The outer `Result` covers spawn failures (binary not found, etc.). The `ProcessResult` covers all termination reasons — normal exit, signal, and timeout alike. Output is always accessible regardless of how the process ended.
 
 ```rust
 let result = ctx.exec("cargo build").await?;  // ? handles spawn failure
 result.output().entries();   // always works
-result.success();            // true/false
-result.exit_code();          // i32
+result.success();            // true only for Exited(0)
+result.exit_code();          // i32 (signals → 128+sig, timeout → 124)
+result.termination();        // &Termination — Exited(i32) | Signaled(Signal) | TimedOut
+result.label();              // command display label
 ```
 
 For `?` ergonomics, `ProcessResult::ok()` converts to a `Result`:
@@ -803,7 +804,7 @@ result.ok()?;
 
 ### Design Decisions
 
-**`Cmd` is a pure value — no runtime behavior.** `Cmd` owns program, args, env, and cwd. Timeout, readiness checks, output expectations, and retry/restart policy live on the execution side (task definition or execution call), not on the command itself. This keeps `Cmd` simple and composable.
+**`Cmd` is a pure value — no runtime behavior.** `Cmd` owns program, args, env, and cwd. Runtime behavior lives on the `SpawnBuilder` returned by `ctx.spawn()`: `.timeout()` for process lifetime, `.ready_on_port()` / `.ready_on_http()` / `.ready_when()` for declarative readiness probes, `.ready_timeout()` for probe lifetime. This keeps `Cmd` simple and composable while placing runtime concerns at the execution site.
 
 **Working directory** is relative to the RUNME.rs file's location, since that's where the code lives.
 
