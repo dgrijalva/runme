@@ -106,7 +106,14 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
         }
     };
 
-    let ui = resolve_ui_mode(args.ui, task.ui_hint, has_terminal);
+    // Force CLI mode when task args request help — clap's help output
+    // should go straight to the terminal, not into the TUI.
+    let task_wants_help = task_args.iter().any(|a| a == "-h" || a == "--help");
+    let ui = if task_wants_help {
+        UiMode::Cli
+    } else {
+        resolve_ui_mode(args.ui, task.ui_hint, has_terminal)
+    };
 
     match ui {
         UiMode::Tui => {
