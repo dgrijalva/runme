@@ -1,0 +1,14 @@
+[package]
+name = "rnme-macros"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+zyn = "0.5.4"

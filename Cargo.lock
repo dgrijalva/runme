@@ -1097,7 +1097,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
-name = "runme"
+name = "rnme"
 version = "0.1.0"
 dependencies = [
  "base64",
@@ -1105,19 +1105,23 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "exec",
  "futures",
  "fuzzy-matcher",
  "globset",
+ "ignore",
  "inventory",
  "itertools 0.14.0",
  "nix",
  "notify",
  "ratatui",
  "regex",
- "runme-macros",
- "runme-test-tasks",
+ "rnme-macros",
+ "rnme-test-tasks",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -1126,20 +1130,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "runme-cli"
-version = "0.1.0"
-dependencies = [
- "clap",
- "exec",
- "ignore",
- "runme",
- "serde_json",
- "sha2",
- "tempfile",
-]
-
-[[package]]
-name = "runme-macros"
+name = "rnme-macros"
 version = "0.1.0"
 dependencies = [
  "proc-macro2",
@@ -1149,10 +1140,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "runme-test-tasks"
+name = "rnme-test-tasks"
 version = "0.1.0"
 dependencies = [
- "runme",
+ "rnme",
 ]
 
 [[package]]

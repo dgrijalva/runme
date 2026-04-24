@@ -1,21 +1,19 @@
-# runme
+# rnme
 
-A task runner where tasks are real code. Define tasks in `RUNME.rs` files — plain Rust with a shebang — and run them from anywhere in your directory tree.
+A task runner where tasks are real code. Define tasks in `RUNME.rs` files — plain Rust — and run them from anywhere in your directory tree.
 
 ```rust
-#!/usr/bin/env runme
-
-use runme::prelude::*;
+use rnme::prelude::*;
 
 /// Build the project
-#[runme::task]
+#[rnme::task]
 async fn build(ctx: &TaskContext) -> TaskResult {
     ctx.exec("cargo build --release").await?;
     Ok(())
 }
 
 /// Start the dev server
-#[runme::task]
+#[rnme::task]
 async fn start(ctx: &TaskContext) -> TaskResult {
     info!("Starting dev server");
     let handle = ctx.spawn("cargo run --bin server").await?;
@@ -29,13 +27,13 @@ No YAML. No DSLs. No config files. Just Rust.
 
 - **Code, not config.** Conditional logic, dependency graphs, error handling — use a real language instead of pretending YAML can do it.
 - **Executable documentation.** The RUNME.rs file _is_ the documentation. It runs.
-- **AI-friendly.** Stable command surface (`runme build`, `runme test`) means AI agents get consistent interfaces, structured output, and lower permission friction.
+- **AI-friendly.** Stable command surface (`rnme build`, `rnme test`) means AI agents get consistent interfaces, structured output, and lower permission friction.
 - **Works where you work.** RUNME.rs files live anywhere in your directory tree — inside projects, above projects, across repos. The tool assembles them automatically.
 
 ## Install
 
 ```bash
-cargo install --path crates/runme-cli
+cargo install rnme
 ```
 
 ## Usage
@@ -43,56 +41,45 @@ cargo install --path crates/runme-cli
 ### Run a task
 
 ```bash
-runme build
-runme deploy --env staging
+rnme build
+rnme deploy --env staging
 ```
 
 ### List available tasks
 
 ```bash
-runme list
+rnme list
 ```
 
 ### TUI mode
 
 ```bash
-runme          # launches task picker, then TUI
-runme build    # runs task directly in TUI
+rnme          # launches task picker, then TUI
+rnme build    # runs task directly in TUI
 ```
 
-When launched with no arguments, `runme` opens a **task picker** showing all tasks grouped by their source RUNME.rs file. Type to fuzzy-filter across task names, descriptions, and group names. Press Enter to launch the selected task and transition to the log viewer.
-
-### Direct execution
-
-RUNME.rs files are directly executable:
-
-```bash
-chmod +x RUNME.rs
-./RUNME.rs build
-```
+When launched with no arguments, `rnme` opens a **task picker** showing all tasks grouped by their source RUNME.rs file. Type to fuzzy-filter across task names, descriptions, and group names. Press Enter to launch the selected task and transition to the log viewer.
 
 ## How It Works
 
-`runme` discovers all RUNME.rs files in your directory tree, compiles them into a single binary, and runs it. The compilation pipeline:
+`rnme` discovers all RUNME.rs files in your directory tree, compiles them into a single binary, and runs it. The compilation pipeline:
 
 1. **Discover** — Walk up from `cwd` to find the nearest RUNME.rs, then walk down to find children. `.gitignore` is respected.
 2. **Generate** — Create a Cargo workspace in a cache directory. Each RUNME.rs becomes a library crate. A runner binary crate ties them together.
 3. **Build** — `cargo build` with incremental compilation. The cache directory is stable per project, so rebuilds are fast.
-4. **Exec** — Replace the `runme` process with the compiled binary.
+4. **Exec** — Replace the `rnme` process with the compiled binary.
 
 Everything runs in-process: the TUI, log engine, process management, and all your tasks — no cross-process serialization.
 
 ## Writing Tasks
 
-Tasks are async functions annotated with `#[runme::task]`:
+Tasks are async functions annotated with `#[rnme::task]`:
 
 ```rust
-#!/usr/bin/env runme
-
-use runme::prelude::*;
+use rnme::prelude::*;
 
 /// Run database migrations
-#[runme::task]
+#[rnme::task]
 async fn migrate(ctx: &TaskContext) -> TaskResult {
     ctx.exec("cargo run --bin migrate").await?;
     Ok(())
@@ -101,11 +88,11 @@ async fn migrate(ctx: &TaskContext) -> TaskResult {
 
 ### Task descriptions
 
-Doc comments become task descriptions, visible in `runme list` and the TUI:
+Doc comments become task descriptions, visible in `rnme list` and the TUI:
 
 ```rust
 /// Deploy to the specified environment
-#[runme::task]
+#[rnme::task]
 async fn deploy(ctx: &TaskContext) -> TaskResult { ... }
 ```
 
@@ -115,9 +102,9 @@ Tasks support progressive argument complexity:
 
 ```rust
 // Simple args — extra params become CLI flags
-#[runme::task]
+#[rnme::task]
 async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
-    // runme deploy --env staging --port 8080 --verbose
+    // rnme deploy --env staging --port 8080 --verbose
     ...
 }
 
@@ -130,7 +117,7 @@ struct DeployArgs {
     port: u16,
 }
 
-#[runme::task]
+#[rnme::task]
 async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult { ... }
 ```
 
@@ -159,10 +146,10 @@ let mut handle = ctx.spawn("npm run dev").await?;
 
 ### Per-file initialization
 
-Override the default group name or perform setup with `#[runme::init]`:
+Override the default group name or perform setup with `#[rnme::init]`:
 
 ```rust
-#[runme::init]
+#[rnme::init]
 fn setup(ctx: &mut InitContext) {
     ctx.set_group_name("Auth Service");
 }
@@ -193,7 +180,7 @@ RUNME.rs files form a hierarchy:
     RUNME.rs            ← frontend tasks
 ```
 
-Running `runme` from any directory discovers the full tree and makes all tasks available. Tasks are grouped by their source file.
+Running `rnme` from any directory discovers the full tree and makes all tasks available. Tasks are grouped by their source file.
 
 ## Log Engine
 

@@ -4,34 +4,9 @@
 
 **Resolved:** `ctx.exec()` is now sugar for `ctx.spawn(cmd).complete().await`. Every exec'd process goes through the `SpawnBuilder`, emits a `SpawnEvent`, and appears in the TUI sidebar while running. Commit `f7660db`.
 
-## Crate naming — `runme` is taken on crates.io
+## ~~Crate naming — `runme` is taken on crates.io~~ (RESOLVED)
 
-Constraints: short (CLI used frequently), obvious purpose, not taken on crates.io. Project name doesn't have to match the CLI binary name.
-
-### Available candidates
-
-| Crate name | CLI name | Angle | Notes |
-|------------|----------|-------|-------|
-| `rnme` | `rnme` | compressed "runme" | 4 chars, preserves brand |
-| `taskr` | `taskr` | "task runner" | 5 chars, immediately obvious |
-| `helm` | `helm` | nautical — steering the ship | 4 chars, but collides with k8s Helm |
-| `yawl` | `yw` | nautical — two-masted sailboat | great CLI shorthand |
-| `boatswain` | `bo`/`bosn` | nautical — the officer who runs the deck crew | strongest thematic fit, long crate name |
-| `mast` | `mast` | nautical — everything hangs from it | 4 chars |
-| `spar` | `spar` | nautical — structural beam | 4 chars |
-| `yaw` | `yaw` | nautical — rotation/movement | 3 chars |
-| `furl` | `furl` | nautical — rolling up sails | 4 chars |
-
-### Taken but possibly reclaimable
-
-| Name | Status | Notes |
-|------|--------|-------|
-| `tak` | last updated 2016, ~19k downloads | board game impl, dormant 10 years |
-| `doit` | last updated 2022, ~1.6k downloads | terminal task manager |
-
-### Explored and taken
-
-Most 2-letter names, `rn`, `mk`, `rr`, `xx`, `tsk`, `werk`, `doit`, `rune`, `forge`, `anvil`, `knot`, `hoist`, `haul`, and many others.
+**Resolved:** Renamed to `rnme`. Library and CLI binary are a single merged crate — `cargo install rnme` gives you the binary, `use rnme::prelude::*` gives you the library. RUNME.rs filename convention kept as-is for readability.
 
 ## Carriage return (`\r`) progress output corrupts log display
 
