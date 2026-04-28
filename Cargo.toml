@@ -12,7 +12,7 @@ resolver = "3"
 members = ["macros", "testing/test-tasks"]
 
 [[bin]]
-name = "rnme"
+name = "runme"
 path = "src/bin/rnme/main.rs"
 
 [dependencies]

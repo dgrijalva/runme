@@ -802,7 +802,7 @@ pub(super) fn export_visible_log(state: &mut AppState) {
     }
 
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let filename = format!("rnme-export-{}.log", timestamp);
+    let filename = format!("runme-export-{}.log", timestamp);
 
     let mut content = String::new();
     let count = visible.len();

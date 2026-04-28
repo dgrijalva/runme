@@ -87,7 +87,7 @@ pub fn compile_workspace(discovery: &DiscoveryResult) -> Result<CompileResult, C
     // Generate the workspace
     generate_workspace(&cache_dir, &entries, &rnme_lib_path)?;
 
-    eprintln!("rnme: compiling...");
+    eprintln!("runme: compiling...");
 
     // Run cargo build
     let target_dir = cache_dir.join("target");

@@ -44,7 +44,7 @@ pub enum OutputFormat {
 /// name and any task-specific arguments that are forwarded to the task's own
 /// parser.
 #[derive(Parser)]
-#[command(name = "rnme")]
+#[command(name = "runme")]
 pub struct RnmeArgs {
     /// UI mode (defaults to tui when a terminal is available, or the task's default_ui)
     #[arg(long)]

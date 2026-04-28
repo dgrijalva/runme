@@ -13,13 +13,13 @@ fn main() {
 
     // Discovery mode: walk up from cwd to find the nearest RUNME.rs
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
-        eprintln!("rnme: could not determine current directory: {}", e);
+        eprintln!("runme: could not determine current directory: {}", e);
         std::process::exit(1);
     });
 
     let discovery_result = discover(&cwd);
     if discovery_result.nearest.is_none() {
-        eprintln!("rnme: no RUNME.rs found (searched from {})", cwd.display());
+        eprintln!("runme: no RUNME.rs found (searched from {})", cwd.display());
         std::process::exit(1);
     }
 
@@ -29,7 +29,7 @@ fn main() {
     let compiled = match compile_workspace(&discovery_result) {
         Ok(result) => result,
         Err(e) => {
-            eprintln!("rnme: compilation failed: {}", e);
+            eprintln!("runme: compilation failed: {}", e);
             std::process::exit(1);
         }
     };
@@ -47,7 +47,7 @@ fn main() {
 
     let err = exec::execvp(&compiled.binary_path, &argv);
     eprintln!(
-        "rnme: failed to exec {}: {}",
+        "runme: failed to exec {}: {}",
         compiled.binary_path.display(),
         err
     );

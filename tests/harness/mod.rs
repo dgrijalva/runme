@@ -106,10 +106,10 @@ impl CliOutput {
 
 /// Run the `rnme` binary with the given arguments, using `dir` as the working directory.
 ///
-/// Uses `CARGO_BIN_EXE_rnme` to find the binary (automatically set by cargo
+/// Uses `CARGO_BIN_EXE_runme` to find the binary (automatically set by cargo
 /// when running integration tests for a crate that defines a `[[bin]]`).
 pub fn run_rnme(dir: &Path, args: &[&str]) -> CliOutput {
-    let bin = env!("CARGO_BIN_EXE_rnme");
+    let bin = env!("CARGO_BIN_EXE_runme");
     let output = Command::new(bin)
         .args(args)
         .current_dir(dir)

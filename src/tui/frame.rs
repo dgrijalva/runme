@@ -214,7 +214,7 @@ pub fn render_frame(
 
             // Build status line with task info
             let mut spans = vec![
-                Span::styled(" rnme ", Style::default().fg(Color::Black).bg(THEME.accent)),
+                Span::styled(" runme ", Style::default().fg(Color::Black).bg(THEME.accent)),
                 Span::raw(" "),
                 Span::styled(
                     format!(" {} ", focus_text),
