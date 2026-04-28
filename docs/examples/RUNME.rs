@@ -1,14 +1,12 @@
-#!/usr/bin/env runme
+use rnme::prelude::*;
 
-use runme::prelude::*;
-
-#[runme::init]
+#[rnme::init]
 fn setup(ctx: &mut InitContext) {
     ctx.set_group_name("test");
 }
 
 /// Spawn a long-running process that ticks every second
-#[runme::task]
+#[rnme::task]
 async fn ticker(ctx: &TaskContext) -> TaskResult {
     info!("starting ticker");
     ctx.spawn("bash -c 'i=0; while true; do echo \"tick $i\"; i=$((i+1)); sleep 1; done'").await?;
@@ -16,7 +14,7 @@ async fn ticker(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Spawn multiple processes with interleaved output
-#[runme::task]
+#[rnme::task]
 async fn multi(ctx: &TaskContext) -> TaskResult {
     info!("spawning 3 processes");
     ctx.spawn(Cmd::from("bash -c 'while true; do echo \"[fast] $(date +%T)\"; sleep 0.5; done'").label("fast")).await?;
@@ -27,14 +25,14 @@ async fn multi(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Emit structured JSON logs
-#[runme::task]
+#[rnme::task]
 async fn json_logs(ctx: &TaskContext) -> TaskResult {
     ctx.spawn(r#"bash -c 'while true; do echo "{\"level\":\"info\",\"msg\":\"heartbeat\",\"service\":\"api\",\"latency_ms\":$((RANDOM % 500))}"; sleep 1; done'"#).await?;
     Ok(())
 }
 
 /// Task that fails
-#[runme::task]
+#[rnme::task]
 async fn fail(ctx: &TaskContext) -> TaskResult {
     info!("about to fail");
     ctx.exec("bash -c 'echo \"something went wrong\" >&2; exit 1'").await?;
@@ -42,7 +40,7 @@ async fn fail(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Produce a burst of output then exit
-#[runme::task]
+#[rnme::task]
 async fn burst(ctx: &TaskContext) -> TaskResult {
     ctx.exec("bash -c 'for i in $(seq 1 500); do echo \"line $i: $(head -c 80 /dev/urandom | base64)\"; done'").await?;
     info!("burst complete");
@@ -50,7 +48,7 @@ async fn burst(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Transient task: closes TUI on success, outputs task logs to stderr
-#[runme::task]
+#[rnme::task]
 async fn transient(ctx: &TaskContext) -> TaskResult {
     ctx.tui_wait(false);
     ctx.tui_output().stderr().subscribe(&ctx.task_output()).await;
@@ -62,7 +60,7 @@ async fn transient(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Build and rebuild on source changes
-#[runme::task]
+#[rnme::task]
 async fn watch_build(ctx: &TaskContext) -> TaskResult {
     let mut w = ctx.watch("*.rs").label("rust sources");
     loop {
@@ -78,7 +76,7 @@ async fn watch_build(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Watch with custom filter: separate handling for source vs config changes
-#[runme::task]
+#[rnme::task]
 async fn watch_filtered(ctx: &TaskContext) -> TaskResult {
     let mut w = ctx.watch_with("../../crates/**/*", |changed| {
         let rs = glob_filter("**/*.rs", changed);
@@ -98,7 +96,7 @@ async fn watch_filtered(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Watch and restart: kill the server, rebuild, relaunch on file change
-#[runme::task]
+#[rnme::task]
 async fn watch_restart(ctx: &TaskContext) -> TaskResult {
     let mut w = ctx.watch("src/**/*.rs").label("server sources");
     loop {
@@ -111,7 +109,7 @@ async fn watch_restart(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Custom watch channel: poll an external condition
-#[runme::task]
+#[rnme::task]
 async fn watch_channel_demo(ctx: &TaskContext) -> TaskResult {
     let (tx, w) = ctx.watch_channel::<String>();
     let mut w = w.label("health check");
@@ -131,18 +129,18 @@ async fn watch_channel_demo(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Use Cmd builder with env and cwd
-#[runme::task]
+#[rnme::task]
 async fn env_demo(ctx: &TaskContext) -> TaskResult {
     let cmd = cmd!(env)
-        .env("RUNME_DEMO", "hello")
-        .env("RUNME_MODE", "testing");
+        .env("RNME_DEMO", "hello")
+        .env("RNME_MODE", "testing");
     ctx.exec(cmd).await?;
     info!("env printed");
     Ok(())
 }
 
 /// Exercise tracing at multiple levels
-#[runme::task]
+#[rnme::task]
 fn log_levels(_ctx: &TaskContext) -> TaskResult {
     trace!("this is trace");
     debug!("this is debug");
@@ -153,7 +151,7 @@ fn log_levels(_ctx: &TaskContext) -> TaskResult {
 }
 
 /// Run burst then log_levels sequentially
-#[runme::task]
+#[rnme::task]
 async fn sequential(ctx: &TaskContext) -> TaskResult {
     info!("running burst");
     burst(ctx).await?;
@@ -164,7 +162,7 @@ async fn sequential(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Run ticker and json_logs concurrently
-#[runme::task]
+#[rnme::task]
 async fn concurrent(ctx: &TaskContext) -> TaskResult {
     info!("launching concurrent tasks");
     let (a, b) = tokio::join!(ticker(ctx), json_logs(ctx));
@@ -181,8 +179,8 @@ async fn concurrent(ctx: &TaskContext) -> TaskResult {
 /// Deploy to an environment — demonstrates simple typed parameters.
 ///
 /// Each parameter becomes a CLI flag:
-///   runme deploy --env staging --port 8080 --verbose
-#[runme::task(desc = "Deploy to an environment")]
+///   rnme deploy --env staging --port 8080 --verbose
+#[rnme::task(desc = "Deploy to an environment")]
 async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
     info!("Deploying to {} on port {} (verbose: {})", env, port, verbose);
     if verbose {
@@ -194,8 +192,8 @@ async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> Tas
 
 /// Greet args — demonstrates a clap::Parser struct for full control.
 ///
-/// `use runme::clap;` brings clap into scope so derive macros resolve correctly.
-use runme::clap;
+/// `use rnme::clap;` brings clap into scope so derive macros resolve correctly.
+use rnme::clap;
 
 #[derive(clap::Parser)]
 struct GreetArgs {
@@ -210,8 +208,8 @@ struct GreetArgs {
 /// Greet someone — demonstrates clap::Parser struct for full CLI control.
 ///
 /// Usage:
-///   runme greet --name world --count 3
-#[runme::task(desc = "Greet someone by name")]
+///   rnme greet --name world --count 3
+#[rnme::task(desc = "Greet someone by name")]
 async fn greet(ctx: &TaskContext, args: GreetArgs) -> TaskResult {
     for i in 0..args.count {
         ctx.println(format!("[{}/{}] Hello, {}!", i + 1, args.count, args.name)).await;
@@ -223,7 +221,7 @@ async fn greet(ctx: &TaskContext, args: GreetArgs) -> TaskResult {
 ///
 /// Uses `ctx.tasks()` to discover tasks matching a glob pattern, then
 /// `ctx.run()` to invoke each one.
-#[runme::task(desc = "Run all test tasks")]
+#[rnme::task(desc = "Run all test tasks")]
 async fn test_all(ctx: &TaskContext) -> TaskResult {
     if let Some(query) = ctx.tasks() {
         let test_tasks = query.matching("*:test");
@@ -245,7 +243,7 @@ async fn test_all(ctx: &TaskContext) -> TaskResult {
 ///
 /// Each step is an RAII guard: when the guard is dropped the step is recorded
 /// as complete (or failed, if `step.fail()` was called).
-#[runme::task(desc = "Run a multi-phase pipeline")]
+#[rnme::task(desc = "Run a multi-phase pipeline")]
 async fn pipeline(ctx: &TaskContext) -> TaskResult {
     {
         let _step = ctx.begin_step("compile");
