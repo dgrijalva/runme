@@ -22,8 +22,19 @@ The shift unlocks:
 
 The runtime has two layers:
 
-1. **Engine** (`src/execution/`): the multi-task task graph, control protocol, observation API. Frontend-agnostic.
-2. **Frontends** (`src/tui/`, future `src/mcp/`, the headless `src/bin/rnme/`): consumers that translate user input into engine control messages and render engine state.
+1. **Engine** (`src/execution/`): the multi-task task graph, control protocol, exposed state. Frontend-agnostic.
+2. **Frontends** (`src/tui/`, future `src/mcp/`, the headless `src/bin/rnme/`): consumers that translate user input into engine control messages and read engine state.
+
+### Design philosophy
+
+The engine/frontend separation **isn't about supporting "any UI."** The frontends are a known, finite set, all in this crate, all known at compile time:
+
+- **CLI / headless** — trigger one task, signal propagation, exit when done.
+- **MCP** — trigger tasks, query state, support compound operations like "start this with a timeout, return output filtered by X."
+- **TUI** — high-framerate observer of everything; the most demanding consumer. Likely an immediate-mode model: watch the graph (via `tokio::watch` or similar), rebuild the rendered view on change.
+- **Direct library API** — theoretical future use case (someone embedding the engine in their own program). Worth not painting ourselves into a corner over, but no specific design pass until it actually comes up.
+
+The point of separating engine from UI **is to avoid baking reusable engine capabilities into a single UI layer** — not to design infinite polymorphism upfront. We won't build generic abstractions for "any observation surface"; we'll expose engine state straightforwardly, and each UI builds whatever consumption pattern fits its needs. New UI-specific surfaces get added when a UI needs them, not preemptively.
 
 ```
         ┌──────────────────────────┐  ┌──────────────────────┐  ┌──────────────────┐
@@ -38,7 +49,7 @@ The runtime has two layers:
         │  • Synthetic root task                                                   │
         │  • Recursive task graph (task → tasks/processes)                         │
         │  • Control channel (SpawnTask, KillTask, Quit, ...)                      │
-        │  • Observation API (graph reader, log subscriber, status events)         │
+        │  • Exposed state (task graph, log store) — UIs read directly             │
         └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -77,21 +88,41 @@ The frontend holds a `Sender<Control>`. The engine constructs this when the runt
 
 Receiver-dropped is by definition the shutdown path — the root task exits, the channel closes, the frontend is on its way out.
 
-### Observation API
+### Exposed state
 
-Frontends need three reads from the engine:
+The engine exposes its state directly — no abstracted observation API designed up-front. Frontends read what they need, however suits them:
 
-1. **Task graph.** A read handle to the running tree (root → children → grandchildren / processes). Probably an `Arc<RwLock<...>>` or an immutable snapshot returned from a method.
-2. **Log subscription.** Today's `LogStore::subscribe()` (broadcast) — moves to the engine.
-3. **Status events.** A subscription that fires when tasks are spawned, transition status, or end. Lets the TUI repaint without polling; lets MCP push events to clients.
+- **Task graph.** The running tree (root → children → grandchildren / processes), exposed as Rust types. Likely shape: `Arc<RwLock<Graph>>` or `tokio::watch` for cheap change-detection. The TUI's preferred consumption is probably "watch the graph, rebuild the rendered view on change" — immediate-mode style.
+- **Log store.** `LogStore::subscribe()` (broadcast) already exists as a primitive — it moves to the engine and stays as-is. Not a status surface; just the log stream.
 
-Whether (3) is a separate channel or derived from (1) by diffing is an implementation detail.
+That's the surface. We'll add UI-specific affordances when a UI actually needs one we haven't built. For example, MCP wanting "filter completed task output by regex" is an MCP feature that may live closest to MCP's tool implementation, not a generic "filtered observation" engine API.
 
-### `TaskContext::spawn_task()`
+The minimum that has to be true at the engine level: the data is there, accessibly typed, and changes are detectable cheaply enough for a 60fps TUI redraw to feel free.
 
-The new primitive that lets the root spawn children and lets RUNME.rs authors compose tasks. Mirrors `spawn(cmd)` for processes.
+### `TaskContext::run()` becomes graph-aware
 
-Shape and lifecycle TBD — see "Open design questions."
+The composition primitive already exists: `ctx.run(name, args)` resolves through the registry, creates a fresh `TaskContext` carrying the same registry, and runs the task body. `tasks()` provides the query side.
+
+What changes: every `run()` invocation **materializes as a node in the engine's task graph**. Today `Registry::run_with_registry` just calls `task.func.call(&ctx, args).await` directly — no `TaskExecution` wrapper, no observable "child task started" event. For the multi-task runtime, each call creates a `TaskExecution`-shaped child of the parent's task, with its own status, log source, child-process list, and graph identity.
+
+`run()` returns a `TaskHandle` (mirrors `SpawnBuilder`/`ProcessHandle` for processes — same pattern). The handle is the lifetime token:
+
+- `IntoFuture` on the handle: `.await` resolves to `TaskResult`. The common case stays one-line: `ctx.run("foo", &[]).await?`.
+- **Drop without awaiting = cancel.** The task receives a cancellation signal and unwinds. Same RAII pattern as `ProcessHandle`.
+- **Detachment is explicit and uses async machinery the developer already knows:** `tokio::spawn(async move { ctx.run("worker", &[]).await })` puts the handle inside the spawned tokio task. The original caller can't reach it; the spawned task awaits it; the child lives as long as the spawned task does. The developer is opting into "I don't need the output, set it free."
+
+Why this shape:
+
+- **No new API verbs.** No `spawn_task` / `run_detached` / `.detach()`. Lifecycle is signaled by ownership, the way Rust developers already think about it.
+- **Symmetry with process spawning.** `ctx.spawn(cmd)` already works this way; `ctx.run(name)` mirrors it.
+- **The graph keeps causality regardless.** Decision 3 (completed tasks stay) means a completed parent with a still-running child isn't pathological — the graph remembers who spawned whom even after the parent is done.
+- **Engine-side cancellation (via `Control::KillTask`) uses the same mechanism.** Each `TaskExecution` carries a cancellation token; the handle's Drop signals it; the engine can also signal it directly when a `KillTask` message arrives. The developer-facing and engine-facing paths converge.
+
+Consequences:
+
+- The root task's body, on receiving `Control::SpawnTask`, calls `tokio::spawn(async move { ctx.run(name, args).await })` (or equivalent) — no special-case spawn primitive. Children of the root naturally outlive any individual picker action because the root holds nothing structurally; the spawned tokio tasks own their handles.
+- User RUNME.rs authors get composition for free: tasks calling `ctx.run("subtask").await` show up in the sidebar as nested children, observable just like picker-launched tasks.
+- "Set and forget" works exactly as the developer expects from async Rust. Holding the handle = task running. Letting it go = task cancelled (or already done).
 
 ### What moves where
 
@@ -181,11 +212,8 @@ Stub — `runme <task>` becomes a degenerate consumer: start the runtime, send `
 
 ## Open design questions
 
-Things we'll need positions on before or during implementation:
+Things we'll need positions on but can defer to implementation or first encounter:
 
-- **`TaskContext::spawn_task()` API surface.** What it takes (name? `&'static TaskDef`? args?), what it returns (handle? join future?), how it interacts with readiness/timeout. Mirrors process `spawn` but tasks have different lifecycle primitives. Includes the sub-question of whether `TaskContext` gets a registry handle.
-- **Child task lifecycle ownership.** When a parent task ends, what happens to its in-flight child tasks — cancelled, detached, or per-spawn flag? Matters for both the root and for user-task composition.
-- **Status events: separate channel vs. derived from graph reads.** Whether the engine pushes graph-mutation events or frontends diff snapshots. Affects observation API shape.
 - **Sidebar redesign scope.** Multi-task tree, completed section, source colors. Deferred until we can use a working multi-task implementation, but will need its own pass.
 - **Source identity model.** Whether to namespace sources by task ID at the log store level (clean, slightly invasive), or only at the display layer (cheap, leaves potential for filter ambiguity). Decide once we hit a real collision.
 - **Picker → argument form.** Eventual split layout for tasks that take arguments. Out of scope for the first pass but the picker overlay should be designed to accommodate it.
@@ -215,7 +243,7 @@ Each step should land as a working slice. Steps within a phase are listed in rou
 ### Phase 1: Engine
 
 1. **Synthetic root task.** Define the library-provided root `TaskDef`. Its body waits on a shutdown signal and returns. Build it as a real task using existing task infrastructure.
-2. **`TaskContext::spawn_task()`.** Add child-task spawning as a runtime primitive. Mirror of process `spawn()` where it makes sense; lifecycle differs. Includes giving `TaskContext` access to the registry.
+2. **Make `ctx.run()` graph-aware.** Each invocation creates a `TaskExecution`-shaped child node in the engine's task graph (status, log source, child processes, graph identity). Today `run_with_registry` just calls the task function directly; this becomes the new path. Public API stays the same.
 3. **Recursive task graph.** Make the existing per-task tracking (status, processes, log store) compose recursively so the synthetic root's children are first-class observable nodes. Move log store ownership to the engine.
 4. **Control protocol.** Define `Control` message type and wire the root's body into a select loop on the control channel. `SpawnTask`, `KillTask`, `Quit`.
 5. **Observation API.** Public engine handles for graph reads, log subscription, and status events.
