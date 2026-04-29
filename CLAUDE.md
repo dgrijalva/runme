@@ -70,7 +70,7 @@ Task functions are `async fn(ctx: &TaskContext) -> TaskResult`. The prelude re-e
 
 ## Project Status
 
-This is pre-release, unshipped software. There are no external users. Do not worry about backward compatibility — APIs can change freely.
+This is unreleased software. It's still being designed. I am the only user. We don't care about backwards compatibility, API breakage, any of it. We are still designing this software.
 
 ## Rust Edition
 

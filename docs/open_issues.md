@@ -45,7 +45,32 @@
 - *Concern:* Resource use grows linearly with task count. No protection today against a user spawning 50 long-running tasks. Probably fine for now (user-driven, foot-gun is acceptable) but worth a backstop later
 - *Concern:* Readiness conditions (`ready_on_port`, etc.) are per-process, not per-task-runner. Multi-task should "just work" but worth verifying that two tasks watching different ports don't interfere
 - *Concern:* TUI hooks (`tui_wait`, `tui_output`) are shared across all executions in the runner today. With multi-task, "should the TUI stay open after this task ends?" is a per-task question, not a runner-wide one. Probably resolves to: TUI stays open as long as **any** task is running, otherwise opens the menu (per the auto-open behavior)
-- *UX note:* Pairs naturally with the keybinding redesign — `n` for new task / `t` for terminate this task / `Ctrl-q` to quit runme are all reasonable, but the whole layout deserves to be designed coherently rather than piecemeal
+
+### Design decisions (exploration pass)
+
+1. **Picker = large overlay**, not a full-screen mode. Covers most of the screen, sidebar/logs visible behind it. Designed to be enhanced later with a split layout for an argument-input form when launching a task.
+2. **Sidebar focus drives log filtering.** Top of sidebar gets an "All tasks" entry which is the default selection and shows the unfiltered merged log. Navigating to a task filters to that task + its children (processes). The full sidebar redesign is deferred — needs to be tried in use before locking down — but the filtering rule is settled.
+   - *Open exploration:* model the runme invocation itself as a "root task" with arguments. Could simplify the hierarchy (everything is a task) or could leak runme-specific concerns into the task abstraction. Worth prototyping.
+3. **Completed tasks stay around** with their logs intact — being able to scroll back into a finished task's output is too valuable to drop. Memory pressure is a future problem. Presentation TBD: a separate "Completed" section, an inline marker with show/hide toggle, or something else — try a few and see what feels right.
+4. **Kill submenu under `k`** (mirrors `c` copy menu pattern). Initial bindings:
+   - `k` — normal terminate focused task (so `kk` is the natural "kill this")
+   - `9` — SIGKILL focused task
+   - `a` — normal terminate all tasks
+   - More as needed; will be revisited in the keybinding redesign.
+5. **Duplicate source disambiguation by color first, numbering as fallback.** When two sessions share a source string (e.g. two `cargo build`), distinguish them visually via the existing source-color system; only fall back to numbered prefixes when colors run out. Part of the sidebar redesign work.
+6. **Ship multi-task before keybinding redesign.** Don't worry about churn — pre-release, single user. Multi-task plumbing first, then a coherent keybinding pass on top of the new shape.
+
+### Implementation order (rough)
+
+Engine/state work first, UX layering on top:
+1. Drop AppState singletons (`task_status`, `task_name`, `processes`, `tui_wait`, `tui_output`); read per-session state from `runner.sessions`. Remove the first-session backward-compat fields on `TaskRunner` (runner.rs:114-118).
+2. Per-session shutdown exposed through the runner (wraps existing `TaskExecution::shutdown`).
+3. Picker overlay mode — re-entrant from Normal; `n` opens it.
+4. Sidebar restructure: "All tasks" entry at top, N task entries each with their nested processes. Focus drives log filter.
+5. Kill submenu (`k`) wired to per-session shutdown.
+6. Auto-open picker when last running session ends (completed sessions remain visible).
+7. Quit-vs-terminate split (`Ctrl-q` quits runme; `k a` terminates all and stays in TUI).
+8. Source disambiguation (color-first, numbered fallback).
 
 ## Carriage return (`\r`) progress output corrupts log display
 
