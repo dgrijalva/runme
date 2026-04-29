@@ -8,6 +8,8 @@ Turn runme from a single-task launcher into a multi-task runtime: a task graph i
 
 This document is the working design. Open questions live inline; they get resolved as we build and use the thing.
 
+> **Implementation in progress.** Architecture decisions made during the implementation pass live in `docs/plans/notes/architecture.md` (current source of truth for type definitions, cancellation model, builder shapes, etc.). This document will be updated comprehensively once implementation settles.
+
 ## Motivation
 
 `runme` already has the rough shape of multi-task plumbing — `TaskRunner.sessions`, shared `LogStore`, per-execution shutdown — but it lives in the TUI layer (`src/tui/runner.rs`) and the rest of the system assumes a single top-level task. To support multi-task properly (and to not paint ourselves into a corner around future MCP/headless modes), the multi-task model needs to live in the **engine**, with frontends as consumers.
