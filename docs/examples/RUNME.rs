@@ -239,6 +239,25 @@ async fn test_all(ctx: &TaskContext) -> TaskResult {
     Ok(())
 }
 
+/// Spawn a background server with a readiness probe and lifetime cap.
+///
+/// `ready_on_port` blocks the spawn until the server is actually listening,
+/// `ready_timeout` bounds how long to wait for that probe, and `timeout`
+/// hard-kills the process if it overstays its welcome.
+#[rnme::task(desc = "Demo: readiness probe and process timeout")]
+async fn server_ready(ctx: &TaskContext) -> TaskResult {
+    use std::time::Duration;
+    info!("starting server; waiting for port 8765");
+    let _server = ctx.spawn("python3 -m http.server 8765")
+        .ready_on_port(8765)
+        .ready_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .await?;
+    info!("server ready, hitting it");
+    ctx.exec("curl -s http://127.0.0.1:8765/").await?.ok()?;
+    Ok(())
+}
+
 /// Multi-phase pipeline — demonstrates `ctx.begin_step()` for labeled phases.
 ///
 /// Each step is an RAII guard: when the guard is dropped the step is recorded

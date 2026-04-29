@@ -1,6 +1,8 @@
-# rnme
+# runme
 
 A task runner where tasks are real code. Define tasks in `RUNME.rs` files — plain Rust — and run them from anywhere in your directory tree.
+
+The crate is published as `rnme`; the installed binary is `runme`.
 
 ```rust,ignore
 use rnme::prelude::*;
@@ -27,7 +29,7 @@ No YAML. No DSLs. No config files. Just Rust.
 
 - **Code, not config.** Conditional logic, dependency graphs, error handling — use a real language instead of pretending YAML can do it.
 - **Executable documentation.** The RUNME.rs file _is_ the documentation. It runs.
-- **AI-friendly.** Stable command surface (`rnme build`, `rnme test`) means AI agents get consistent interfaces, structured output, and lower permission friction.
+- **AI-friendly.** Stable command surface (`runme build`, `runme test`) means AI agents get consistent interfaces, structured output, and lower permission friction.
 - **Works where you work.** RUNME.rs files live anywhere in your directory tree — inside projects, above projects, across repos. The tool assembles them automatically.
 
 ## Install
@@ -41,35 +43,39 @@ cargo install rnme
 ### Run a task
 
 ```bash
-rnme build
-rnme deploy --env staging
+runme build
+runme deploy --env staging
 ```
 
 ### List available tasks
 
 ```bash
-rnme list
+runme list
 ```
 
 ### TUI mode
 
 ```bash
-rnme          # launches task picker, then TUI
-rnme build    # runs task directly in TUI
+runme          # launches task picker, then TUI
+runme build    # runs task directly in TUI
 ```
 
-When launched with no arguments, `rnme` opens a **task picker** showing all tasks grouped by their source RUNME.rs file. Type to fuzzy-filter across task names, descriptions, and group names. Press Enter to launch the selected task and transition to the log viewer.
+When launched with no arguments, `runme` opens a **task picker** showing all tasks grouped by their source RUNME.rs file. Type to fuzzy-filter across task names, descriptions, and group names. Press Enter to launch the selected task and transition to the log viewer.
 
 ## How It Works
 
-`rnme` discovers all RUNME.rs files in your directory tree, compiles them into a single binary, and runs it. The compilation pipeline:
+`runme` discovers all RUNME.rs files in your directory tree, compiles them into a single binary, and runs it. The compilation pipeline:
 
 1. **Discover** — Walk up from `cwd` to find the nearest RUNME.rs, then walk down to find children. `.gitignore` is respected.
 2. **Generate** — Create a Cargo workspace in a cache directory. Each RUNME.rs becomes a library crate. A runner binary crate ties them together.
 3. **Build** — `cargo build` with incremental compilation. The cache directory is stable per project, so rebuilds are fast.
-4. **Exec** — Replace the `rnme` process with the compiled binary.
+4. **Exec** — Replace the `runme` process with the compiled binary.
 
 Everything runs in-process: the TUI, log engine, process management, and all your tasks — no cross-process serialization.
+
+## Examples
+
+[`docs/examples/RUNME.rs`](docs/examples/RUNME.rs) is a runnable RUNME.rs file that exercises every feature shown below — watches, the `cmd!` macro, readiness probes, cross-task invocation, structured logging, task arguments, and more. It's the fastest way to see the API in one place.
 
 ## Writing Tasks
 
@@ -88,7 +94,7 @@ async fn migrate(ctx: &TaskContext) -> TaskResult {
 
 ### Task descriptions
 
-Doc comments become task descriptions, visible in `rnme list` and the TUI:
+Doc comments become task descriptions, visible in `runme list` and the TUI:
 
 ```rust,ignore
 /// Deploy to the specified environment
@@ -104,7 +110,7 @@ Tasks support progressive argument complexity:
 // Simple args — extra params become CLI flags
 #[rnme::task]
 async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
-    // rnme deploy --env staging --port 8080 --verbose
+    // runme deploy --env staging --port 8080 --verbose
     ...
 }
 
@@ -123,26 +129,88 @@ async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult { ... }
 
 ### Commands
 
-Two ways to run commands:
+Three ways to describe a command:
 
 ```rust,ignore
-// Shell string (pipes, globs, redirects)
+// Shell string (pipes, globs, redirects).
 ctx.exec("cargo build && cargo test").await?;
 
-// Structured command (no shell, no escaping issues)
+// Structured builder (no shell, no escaping issues).
 let cmd = Cmd::new("cargo")
     .args(["build", "--release"])
     .env("RUSTFLAGS", "-C target-cpu=native")
     .cwd("./crates/server");
 ctx.exec(cmd).await?;
+
+// cmd! macro — structured args with Rust-expression interpolation.
+let url = format!("http://localhost:{port}/deploy");
+ctx.exec(cmd!(curl -X POST {&url} -H "Content-Type: application/json")).await?;
 ```
 
-`exec()` runs and waits. `spawn()` starts a background process and returns a handle:
+In the `cmd!` macro, whitespace separates arguments, `{expr}` interpolates a single argument, and `"..."` literals stay as one argument. No shell is invoked.
+
+### Background processes
+
+`exec()` runs and waits. `spawn()` returns a handle for processes that should outlive the call. Add readiness probes and timeouts on the builder:
 
 ```rust,ignore
-let mut handle = ctx.spawn("npm run dev").await?;
-// handle.stop(), handle.is_running(), handle.wait()
+use std::time::Duration;
+
+// Wait until the server is actually listening before continuing.
+let server = ctx.spawn("./bin/api")
+    .ready_on_port(8080)
+    .ready_timeout(Duration::from_secs(30))
+    .await?;
+
+// Or probe via HTTP, or with a custom async closure.
+let worker = ctx.spawn("./bin/worker")
+    .ready_on_http("http://127.0.0.1:9000/healthz")
+    .timeout(Duration::from_secs(60 * 60))   // hard kill after 1h
+    .await?;
+
+// handle.stop(timeout), handle.is_running(), handle.wait().await,
+// handle.signal(sig), handle.wait_ready().await
 ```
+
+When a task spawns dependent services, `ctx.bind_ready(&handle)` ties the task's own readiness to the process's probe — useful for orchestration tasks that other tasks depend on.
+
+### Watching files
+
+`ctx.watch()` returns a debounced stream of changed paths. The classic pattern is "do work, wait for changes, repeat":
+
+```rust,ignore
+/// Rebuild on every Rust source change.
+#[rnme::task]
+async fn dev(ctx: &TaskContext) -> TaskResult {
+    let mut w = ctx.watch("src/**/*.rs").label("rust sources");
+    loop {
+        let result = ctx.exec("cargo build").await?;
+        if !result.success() {
+            error!("build failed (exit {})", result.exit_code());
+        }
+        w.next().await;   // blocks until something changes
+    }
+}
+```
+
+For more control, `ctx.watch_with()` takes a filter/map closure that runs on each batch, and `ctx.watch_channel()` returns a manual sender for non-filesystem triggers (timers, health checks, external events).
+
+### Calling other tasks
+
+Tasks can invoke other tasks through `ctx.run()`. Names resolve like the CLI: bare names match a single task (with root-group winning ambiguity), `group:name` is the qualified form, and `:name` finds a built-in.
+
+```rust,ignore
+/// Full release: build, test, deploy.
+#[rnme::task]
+async fn release(ctx: &TaskContext) -> TaskResult {
+    ctx.run("build", &[]).await?;
+    ctx.run("test", &[]).await?;
+    ctx.run("services/auth:deploy", &["--env", "prod"]).await?;
+    Ok(())
+}
+```
+
+`ctx.tasks()` returns a query handle for discovery — `.all()` lists every registered task, `.matching("services/*:deploy")` filters by glob.
 
 ### Per-file initialization
 
@@ -180,7 +248,7 @@ RUNME.rs files form a hierarchy:
     RUNME.rs            ← frontend tasks
 ```
 
-Running `rnme` from any directory discovers the full tree and makes all tasks available. Tasks are grouped by their source file.
+Running `runme` from any directory discovers the full tree and makes all tasks available. Tasks are grouped by their source file.
 
 ## Log Engine
 
