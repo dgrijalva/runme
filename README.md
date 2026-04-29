@@ -2,7 +2,7 @@
 
 A task runner where tasks are real code. Define tasks in `RUNME.rs` files — plain Rust — and run them from anywhere in your directory tree.
 
-```rust
+```rust,ignore
 use rnme::prelude::*;
 
 /// Build the project
@@ -75,7 +75,7 @@ Everything runs in-process: the TUI, log engine, process management, and all you
 
 Tasks are async functions annotated with `#[rnme::task]`:
 
-```rust
+```rust,ignore
 use rnme::prelude::*;
 
 /// Run database migrations
@@ -90,7 +90,7 @@ async fn migrate(ctx: &TaskContext) -> TaskResult {
 
 Doc comments become task descriptions, visible in `rnme list` and the TUI:
 
-```rust
+```rust,ignore
 /// Deploy to the specified environment
 #[rnme::task]
 async fn deploy(ctx: &TaskContext) -> TaskResult { ... }
@@ -100,7 +100,7 @@ async fn deploy(ctx: &TaskContext) -> TaskResult { ... }
 
 Tasks support progressive argument complexity:
 
-```rust
+```rust,ignore
 // Simple args — extra params become CLI flags
 #[rnme::task]
 async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
@@ -125,7 +125,7 @@ async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult { ... }
 
 Two ways to run commands:
 
-```rust
+```rust,ignore
 // Shell string (pipes, globs, redirects)
 ctx.exec("cargo build && cargo test").await?;
 
@@ -139,7 +139,7 @@ ctx.exec(cmd).await?;
 
 `exec()` runs and waits. `spawn()` starts a background process and returns a handle:
 
-```rust
+```rust,ignore
 let mut handle = ctx.spawn("npm run dev").await?;
 // handle.stop(), handle.is_running(), handle.wait()
 ```
@@ -148,7 +148,7 @@ let mut handle = ctx.spawn("npm run dev").await?;
 
 Override the default group name or perform setup with `#[rnme::init]`:
 
-```rust
+```rust,ignore
 #[rnme::init]
 fn setup(ctx: &mut InitContext) {
     ctx.set_group_name("Auth Service");
@@ -159,7 +159,7 @@ fn setup(ctx: &mut InitContext) {
 
 Declare additional crate dependencies in frontmatter comments:
 
-```rust
+```rust,ignore
 //! [dependencies]
 //! reqwest = "0.12"
 //! serde = { version = "1", features = ["derive"] }
@@ -169,7 +169,7 @@ Declare additional crate dependencies in frontmatter comments:
 
 RUNME.rs files form a hierarchy:
 
-```
+```text
 ~/Code/
   RUNME.rs              ← cross-repo orchestration
   services/
@@ -188,7 +188,7 @@ Process output is automatically parsed into structured log entries. JSON logs, l
 
 Task code uses `tracing` macros for structured logging:
 
-```rust
+```rust,ignore
 info!("deployment started");
 error!(service = "auth", "connection failed");
 ```

@@ -84,7 +84,7 @@ impl FieldStats {
     /// Compute interestingness scores for all fields of a source.
     ///
     /// Returns a map of field name to score in `0.0..=1.0`.
-    /// Returns an empty map if insufficient data (< [`MIN_SAMPLE`] entries).
+    /// Returns an empty map if insufficient data (fewer than `MIN_SAMPLE` entries).
     pub fn field_scores(&self, source: &str) -> HashMap<&str, f64> {
         let Some(stats) = self.sources.get(source) else {
             return HashMap::new();

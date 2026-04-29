@@ -1,3 +1,35 @@
+//! Command values: a description of what to run.
+//!
+//! [`Cmd`] is a *value*. It carries a program (or shell string), arguments,
+//! environment overlays, working directory, and an optional label — but it
+//! does **not** describe runtime behavior like timeouts or readiness probes.
+//! Those live on [`SpawnBuilder`](crate::process::SpawnBuilder), returned by
+//! [`TaskContext::spawn`](crate::task::TaskContext::spawn).
+//!
+//! # Two flavors
+//!
+//! ```rust,ignore
+//! // Structured — args go straight to the OS, no shell, no escaping bugs.
+//! Cmd::new("cargo").args(["build", "--release"])
+//!
+//! // Shell — wrapped in `sh -c`, supports pipes, globs, redirects.
+//! Cmd::shell("cargo build && cargo test")
+//! ```
+//!
+//! `&str` and `String` convert to [`Cmd::shell`], so anywhere a `Cmd` is
+//! expected you can pass a string literal:
+//!
+//! ```rust,ignore
+//! ctx.exec("echo hello").await?;
+//! ```
+//!
+//! For structured commands with interpolation, use the [`cmd!`](crate::cmd!) macro:
+//!
+//! ```rust,ignore
+//! let url = "http://example.com";
+//! ctx.exec(cmd!(curl -X POST {&url} -H "Content-Type: application/json")).await?;
+//! ```
+
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};

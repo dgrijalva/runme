@@ -1,3 +1,45 @@
+//! Process spawning, lifecycle management, and output capture.
+//!
+//! Tasks rarely call into this module directly — they use
+//! [`TaskContext::spawn`](crate::task::TaskContext::spawn) and
+//! [`TaskContext::exec`](crate::task::TaskContext::exec), which return the
+//! types defined here.
+//!
+//! # Spawning
+//!
+//! `TaskContext::spawn` returns a [`SpawnBuilder`]. You can configure
+//! readiness probes and timeouts on it, then `.await` it to get a
+//! [`ProcessHandle`], or call `.complete().await` to wait for the process
+//! to exit:
+//!
+//! ```rust,ignore
+//! // Background process with a readiness probe.
+//! let server = ctx.spawn("./bin/api")
+//!     .ready_on_port(8080)
+//!     .ready_timeout(Duration::from_secs(30))
+//!     .await?;
+//! ctx.bind_ready(&server);
+//!
+//! // Run-to-completion (sugar: `ctx.exec(...)` does the same).
+//! let result = ctx.spawn("cargo build").complete().await?;
+//! result.ok()?; // bubble up non-zero exits as a TaskError
+//! ```
+//!
+//! # Output and termination
+//!
+//! Output flows through the [`Output`] handle: snapshot via
+//! [`Output::entries`], live broadcast via [`Output::subscribe`], or
+//! convenience accessors [`Output::stdout`] / [`Output::stderr`] for raw lines.
+//! [`ProcessResult::termination`] returns a [`Termination`] enum
+//! (`Exited(code)` / `Signaled(sig)` / `TimedOut`) — richer than a plain exit
+//! code.
+//!
+//! # Process groups
+//!
+//! Every spawned process is placed in its own process group, and `stop()`
+//! signals the entire group. This means shell commands that fork
+//! background children get cleaned up with their parent.
+
 use std::os::unix::process::ExitStatusExt;
 use std::process::Stdio;
 use std::time::Duration;

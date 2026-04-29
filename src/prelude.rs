@@ -1,3 +1,26 @@
+//! Common imports for `RUNME.rs` files.
+//!
+//! Glob-import this module at the top of every `RUNME.rs`:
+//!
+//! ```rust,ignore
+//! use rnme::prelude::*;
+//! ```
+//!
+//! It re-exports the types and macros most tasks need:
+//!
+//! - [`TaskContext`] — runtime context (`exec`, `spawn`, `watch`, `run`, …)
+//! - [`Cmd`], [`cmd!`] — describe commands to run
+//! - [`TaskResult`], [`TaskError`], [`ResultExt`], [`ExitHint`] — task error type and helpers
+//! - [`InitContext`], [`init`] — per-file setup hook
+//! - [`SpawnBuilder`], [`ProcessHandle`], [`ProcessResult`], [`Output`],
+//!   [`Termination`], [`ProcessError`], [`ReadinessCondition`] — process control
+//! - [`Watch`], [`glob_filter`] — file-system watching
+//! - The [`tracing`] macros `info!`, `error!`, `warn!`, `debug!`, `trace!`
+//! - The [`macro@task`] attribute macro
+//!
+//! Plus a handful of helper crates ([`tokio`], [`clap`], [`futures`], [`itertools`])
+//! for common use cases without needing to declare them as extra dependencies.
+
 pub use crate::cmd::Cmd;
 pub use crate::error::{ExitHint, ResultExt, TaskError, TaskResult};
 pub use crate::init::{GroupDef, InitContext, InitDef};

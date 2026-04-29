@@ -1,5 +1,43 @@
+//! Task error type and conversions.
+//!
+//! Tasks return [`TaskResult`] (alias for `Result<(), TaskError>`). A
+//! [`TaskError`] carries:
+//!
+//! - **Structured output** as `serde_json::Value`. Objects/arrays pass through;
+//!   scalars get wrapped as `{"message": value}`. The output is what `rnme`
+//!   prints, logs, and uses to derive an exit code.
+//! - **An [`ExitHint`]** that suggests how `rnme` should handle the failure
+//!   (specific exit code, restart, abort, or default).
+//!
+//! # Constructing errors
+//!
+//! Anything that implements [`Serialize`] (including `&str`, `String`,
+//! `serde_json::Value`, your own structs) converts via [`From`]:
+//!
+//! ```rust,ignore
+//! return Err("connection refused".into());
+//! return Err(serde_json::json!({"step": "compile", "code": 1}).into());
+//! ```
+//!
+//! For arbitrary errors that don't implement `Serialize` (`io::Error`,
+//! `reqwest::Error`, …), use [`ResultExt::task_err`]:
+//!
+//! ```rust,ignore
+//! let body = std::fs::read_to_string("config.toml").task_err()?;
+//! ```
+//!
+//! Add an exit hint with [`TaskError::with_hint`] or [`TaskError::with_code`]:
+//!
+//! ```rust,ignore
+//! return Err(TaskError::from("unrecoverable").with_hint(ExitHint::Abort));
+//! return Err(TaskError::from("not found").with_code(127));
+//! ```
+
 use serde::Serialize;
 
+/// Result type returned by `#[rnme::task]` functions.
+///
+/// Alias for `Result<(), TaskError>`.
 pub type TaskResult = Result<(), TaskError>;
 
 /// Hint to rnme about how to handle a task error.

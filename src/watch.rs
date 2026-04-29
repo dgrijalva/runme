@@ -1,3 +1,32 @@
+//! File-system (and arbitrary-channel) watches for long-running tasks.
+//!
+//! A watch is a stream of debounced events you `.next().await` in a loop.
+//! Tasks build watches through [`TaskContext`](crate::task::TaskContext):
+//!
+//! ```rust,ignore
+//! /// Rebuild whenever Rust sources change.
+//! #[rnme::task]
+//! async fn dev(ctx: &TaskContext) -> TaskResult {
+//!     let mut w = ctx.watch("src/**/*.rs").label("rust sources");
+//!     loop {
+//!         ctx.exec("cargo build").await?.ok()?;
+//!         w.next().await; // blocks until a file changes
+//!     }
+//! }
+//! ```
+//!
+//! Three variants:
+//!
+//! - [`TaskContext::watch`](crate::task::TaskContext::watch) — glob pattern,
+//!   yields `Vec<PathBuf>`
+//! - [`TaskContext::watch_with`](crate::task::TaskContext::watch_with) — custom
+//!   filter/map function over changed paths
+//! - [`TaskContext::watch_channel`](crate::task::TaskContext::watch_channel) —
+//!   manual sender for non-filesystem triggers (timers, health checks, etc.)
+//!
+//! The helper [`glob_filter`] is handy inside `watch_with` closures to slice a
+//! batch of paths into multiple categories.
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

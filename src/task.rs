@@ -1,3 +1,42 @@
+//! Task definitions, registry, and the runtime [`TaskContext`].
+//!
+//! # Writing a task
+//!
+//! Annotate an async function with [`#[rnme::task]`](macro@crate::task) and
+//! let the macro register it via [`inventory`]:
+//!
+//! ```rust,ignore
+//! use rnme::prelude::*;
+//!
+//! /// Build the project in release mode.
+//! #[rnme::task]
+//! async fn build(ctx: &TaskContext) -> TaskResult {
+//!     ctx.exec("cargo build --release").await?.ok()?;
+//!     Ok(())
+//! }
+//! ```
+//!
+//! The doc comment becomes the task description shown by `rnme list` and
+//! the TUI. Arguments after `ctx` are exposed as CLI flags — see the
+//! [crate-level docs](crate#task-arguments) for the progressive form.
+//!
+//! # The runtime context
+//!
+//! [`TaskContext`] is the gateway to everything a task does at runtime:
+//!
+//! - [`exec`](TaskContext::exec) / [`spawn`](TaskContext::spawn) — run subprocesses
+//! - [`run`](TaskContext::run) / [`tasks`](TaskContext::tasks) — invoke other tasks
+//! - [`watch`](TaskContext::watch) / [`watch_with`](TaskContext::watch_with) /
+//!   [`watch_channel`](TaskContext::watch_channel) — react to filesystem (or arbitrary) events
+//! - [`println`](TaskContext::println) — write raw text to the task's output stream
+//! - [`tui_wait`](TaskContext::tui_wait) / [`tui_output`](TaskContext::tui_output) —
+//!   control TUI behavior at task completion
+//! - [`stop_all`](TaskContext::stop_all) — gracefully terminate every spawned process
+//!
+//! Use the [`tracing`] macros (`info!`, `error!`, …, re-exported by
+//! [`crate::prelude`]) for structured logging — they flow through the same
+//! pipeline as subprocess output.
+
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -307,25 +346,59 @@ impl TaskContext {
     ///
     /// Sugar for `self.spawn(command).complete().await`. Every exec'd process
     /// gets its own output buffer, appears in the TUI sidebar, and emits a
-    /// `SpawnEvent` — same as `spawn()`.
+    /// [`SpawnEvent`] — same as [`spawn`](Self::spawn).
     ///
-    /// Returns a `ProcessResult` for any exit code. Use `.ok()?` to propagate
-    /// non-zero exit codes as errors, or inspect `.success()` and `.exit_code()`.
+    /// Returns a [`crate::process::ProcessResult`] for *any* exit code,
+    /// including zero. Use `.ok()?` to propagate non-zero exits as a
+    /// [`TaskError`], or inspect `.success()` / `.exit_code()` to handle them
+    /// inline.
     ///
-    /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
+    /// Accepts a [`Cmd`], `&str`, or `String`. Bare strings become
+    /// [`Cmd::shell`](crate::cmd::Cmd::shell) (so pipes/globs/redirects work);
+    /// build a `Cmd` directly when you need argument-level control.
+    ///
+    /// ```rust,ignore
+    /// // Shell — quick.
+    /// ctx.exec("cargo build && cargo test").await?.ok()?;
+    ///
+    /// // Structured — no shell, env overlay, custom cwd.
+    /// let cmd = Cmd::new("cargo")
+    ///     .args(["build", "--release"])
+    ///     .env("RUSTFLAGS", "-C target-cpu=native")
+    ///     .cwd("./crates/server");
+    /// ctx.exec(cmd).await?.ok()?;
+    /// ```
     pub async fn exec(&self, command: impl Into<Cmd>) -> Result<ProcessResult, ProcessError> {
         self.spawn(command).complete().await
     }
 
-    /// Spawn a long-running command. Returns a builder that resolves to a `ProcessHandle`.
+    /// Spawn a long-running command. Returns a [`SpawnBuilder`](crate::process::SpawnBuilder)
+    /// that resolves to a [`ProcessHandle`](crate::process::ProcessHandle).
     ///
-    /// The process group ID is tracked internally so that `stop_all()` can
-    /// shut down every process spawned through this context.
+    /// The process group is tracked internally so [`stop_all`](Self::stop_all)
+    /// can shut down every process spawned through this context.
     ///
-    /// Accepts a `Cmd`, `&str`, or `String`. Strings are treated as shell commands.
+    /// Accepts a [`Cmd`], `&str`, or `String`. Strings become
+    /// [`Cmd::shell`](crate::cmd::Cmd::shell) commands.
     ///
-    /// Use `.await` to spawn and get a handle, or `.complete().await` to spawn
-    /// and wait for exit (like `exec()`).
+    /// `SpawnBuilder` supports configuring readiness probes
+    /// ([`ready_on_port`](crate::process::SpawnBuilder::ready_on_port),
+    /// [`ready_on_http`](crate::process::SpawnBuilder::ready_on_http),
+    /// [`ready_when`](crate::process::SpawnBuilder::ready_when)) and timeouts
+    /// ([`timeout`](crate::process::SpawnBuilder::timeout),
+    /// [`ready_timeout`](crate::process::SpawnBuilder::ready_timeout)). Then:
+    ///
+    /// - `.await` — spawn and return a handle (long-running)
+    /// - `.complete().await` — spawn, wait for exit, return a [`crate::process::ProcessResult`]
+    ///
+    /// ```rust,ignore
+    /// // Background server with HTTP readiness gate.
+    /// let server = ctx.spawn("./bin/api")
+    ///     .ready_on_http("http://127.0.0.1:8080/health")
+    ///     .ready_timeout(Duration::from_secs(30))
+    ///     .await?;
+    /// ctx.bind_ready(&server);
+    /// ```
     pub fn spawn(&self, command: impl Into<Cmd>) -> process::SpawnBuilder {
         let cmd: Cmd = command.into();
         let command_label = cmd.display_label();

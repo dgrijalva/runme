@@ -1,3 +1,35 @@
+//! Per-file initialization hook.
+//!
+//! Each `RUNME.rs` may define one `#[rnme::init]` function that runs
+//! before any task in that file. Use it to:
+//!
+//! - Override the display name for the file's task group
+//! - Register dynamic tasks discovered at runtime (e.g., one task per
+//!   workspace member)
+//!
+//! ```rust,ignore
+//! use rnme::prelude::*;
+//!
+//! #[rnme::init]
+//! fn setup(ctx: &mut InitContext) {
+//!     ctx.set_group_name("Auth Service");
+//!
+//!     for sub in ["build", "test", "clippy"] {
+//!         let sub = sub.to_string();
+//!         ctx.register_task(&sub, Some(&format!("cargo {sub}")), move |ctx, _args| {
+//!             let sub = sub.clone();
+//!             Box::pin(async move {
+//!                 ctx.exec(format!("cargo {sub}")).await?.ok()?;
+//!                 Ok(())
+//!             })
+//!         });
+//!     }
+//! }
+//! ```
+//!
+//! Init runs once per process at startup — there is no async runtime
+//! available inside it. For async setup, do the work in a task instead.
+
 /// GroupDef — registered via inventory, one per RUNME.rs file.
 ///
 /// Each RUNME.rs file produces a `GroupDef` that maps the file's group key
