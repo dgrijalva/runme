@@ -27,7 +27,13 @@ async fn multi(ctx: &TaskContext) -> TaskResult {
 /// Emit structured JSON logs
 #[rnme::task]
 async fn json_logs(ctx: &TaskContext) -> TaskResult {
-    ctx.spawn(r#"bash -c 'while true; do echo "{\"level\":\"info\",\"msg\":\"heartbeat\",\"service\":\"api\",\"latency_ms\":$((RANDOM % 500))}"; sleep 1; done'"#).await?;
+    let script = r#"
+        while true; do
+            printf '{"level":"info","msg":"heartbeat","service":"api","latency_ms":%d}\n' $((RANDOM % 500))
+            sleep 1
+        done
+    "#;
+    ctx.spawn(cmd!(bash -c {script})).await?;
     Ok(())
 }
 
