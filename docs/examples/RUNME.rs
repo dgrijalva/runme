@@ -54,11 +54,12 @@ async fn burst(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Transient task: closes TUI on success, outputs task logs to stderr
+///
+/// NOTE: tui_wait / tui_output were removed in slice 2 of the multi-task
+/// runtime (per design decision 7). This task is kept for the example
+/// surface area; engine-driven completion semantics return in slices 3/4.
 #[rnme::task]
 async fn transient(ctx: &TaskContext) -> TaskResult {
-    ctx.tui_wait(false);
-    ctx.tui_output().stderr().subscribe(&ctx.task_output()).await;
-
     info!("starting work");
     ctx.exec("sleep 1").await?.ok()?;
     info!("done!");

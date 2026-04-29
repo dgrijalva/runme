@@ -1,5 +1,4 @@
 use std::io;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crossterm::event::{
@@ -193,18 +192,9 @@ pub async fn run_event_loop(
                 // Refresh process statuses and rebuild sidebar entries
                 refresh_sidebar_state(state).await;
 
-                // Check tui_wait: auto-exit when task is complete and tui_wait is false
-                if let Some(ref tui_wait) = state.tui_wait
-                    && !tui_wait.load(Ordering::Relaxed)
-                        && let Some(ref task_status) = state.task_status {
-                            let status = task_status.lock().await;
-                            match &*status {
-                                TaskStatus::Done | TaskStatus::Failed(_) => {
-                                    state.running = false;
-                                }
-                                _ => {}
-                            }
-                        }
+                // tui_wait auto-exit was removed in slice 2 of the multi-task
+                // runtime (per design decision 7). Slices 3/4 reintroduce
+                // engine-driven completion semantics.
 
                 // Crash surfacing: detect newly failed processes
                 check_for_crashes(state, &mut prev_process_statuses);

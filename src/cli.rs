@@ -142,9 +142,14 @@ async fn run_cli(
     registry: &Arc<Registry>,
     format: &OutputFormat,
 ) {
-    use crate::execution::{LaunchConfig, TaskExecution};
+    use crate::execution::{TaskExecution, TaskId};
+    use crate::log::store::LogStore;
+    use tokio::sync::Mutex;
 
-    let mut exec = TaskExecution::new();
+    // Slice 2: callers own the LogStore. Slice 4 will hoist this into the
+    // engine; for now the CLI is the de-facto owner.
+    let log_store = Arc::new(Mutex::new(LogStore::new()));
+    let mut exec = TaskExecution::with_log_store(TaskId::next(), log_store);
     exec.set_registry(registry.clone());
 
     // Subscribe to LogStore → stdio BEFORE launching the task.
@@ -153,7 +158,7 @@ async fn run_cli(
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tokio::spawn(forward_output_to_stdio(rx, use_raw, use_color));
 
-    exec.launch(task, args.to_vec(), LaunchConfig::default());
+    exec.launch(task, args.to_vec());
 
     // Wait for the task function to complete, or Ctrl-C.
     let ctrl_c = tokio::signal::ctrl_c();
@@ -244,12 +249,15 @@ async fn run_agent(
     registry: &Arc<Registry>,
     format: &OutputFormat,
 ) {
-    use crate::execution::{LaunchConfig, TaskExecution, TaskStatus};
+    use crate::execution::{TaskExecution, TaskId, TaskStatus};
+    use crate::log::store::LogStore;
+    use tokio::sync::Mutex;
 
-    let mut exec = TaskExecution::new();
+    let log_store = Arc::new(Mutex::new(LogStore::new()));
+    let mut exec = TaskExecution::with_log_store(TaskId::next(), log_store);
     exec.set_registry(registry.clone());
 
-    exec.launch(task, args.to_vec(), LaunchConfig::default());
+    exec.launch(task, args.to_vec());
     exec.wait().await;
     exec.shutdown(std::time::Duration::from_secs(5)).await;
 

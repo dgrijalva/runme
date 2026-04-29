@@ -1,20 +1,22 @@
 //! TUI task runner — thin wrapper over the shared execution layer.
 //!
 //! `TaskRunner` manages one or more `TaskExecution`s for the TUI,
-//! providing session tracking for the sidebar and shared TUI hooks
-//! (tui_wait, tui_output).
+//! providing session tracking for the sidebar.
+//!
+//! Slice 2 of the multi-task runtime: `tui_wait` / `tui_output` plumbing
+//! is gone (per design decision 7). The runner now hands a single
+//! `Arc<Mutex<LogStore>>` to each `TaskExecution`. Slice 4 will hoist
+//! ownership into the `Engine`; until then this is the de-facto owner.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use tokio::sync::Mutex;
 
-use crate::execution::{LaunchConfig, TaskExecution};
+use crate::execution::{TaskExecution, TaskId};
 use crate::log::LogEntry;
 use crate::log::store::LogStore;
 use crate::task::{Registry, TaskDef};
-
-use super::output::TuiOutput;
 
 // Re-export execution types so existing TUI imports (sidebar, event, etc.) keep working.
 pub use crate::execution::{ProcessInfo, ProcessStatus, TaskStatus};
@@ -35,7 +37,7 @@ pub struct TaskSession {
 }
 
 /// The TUI task runner. Wraps the shared execution layer with TUI-specific
-/// session management and hooks.
+/// session management.
 pub struct TaskRunner {
     /// Shared LogStore across all executions.
     pub log_store: Arc<Mutex<LogStore>>,
@@ -43,10 +45,6 @@ pub struct TaskRunner {
     pub status: Arc<Mutex<TaskStatus>>,
     /// Information about spawned processes (first session, for backward compatibility).
     pub processes: Arc<Mutex<Vec<ProcessInfo>>>,
-    /// Whether the TUI should stay open after the task completes.
-    pub tui_wait: Arc<AtomicBool>,
-    /// Post-TUI output buffer.
-    pub tui_output: Arc<Mutex<TuiOutput>>,
     /// All task sessions, in launch order.
     pub sessions: Vec<TaskSession>,
     /// The underlying executions.
@@ -66,8 +64,6 @@ impl TaskRunner {
             log_store: Arc::new(Mutex::new(LogStore::new())),
             status: Arc::new(Mutex::new(TaskStatus::Setup)),
             processes: Arc::new(Mutex::new(Vec::new())),
-            tui_wait: Arc::new(AtomicBool::new(true)),
-            tui_output: Arc::new(Mutex::new(TuiOutput::new())),
             sessions: Vec::new(),
             executions: Vec::new(),
             next_session_id: 0,
@@ -81,7 +77,7 @@ impl TaskRunner {
         self.registry = Some(registry);
     }
 
-    /// Launch a task. Creates a `TaskExecution`, wires up TUI hooks,
+    /// Launch a task. Creates a `TaskExecution`, wires up shared state,
     /// and tracks it as a session.
     ///
     /// Returns the session ID.
@@ -90,18 +86,13 @@ impl TaskRunner {
         self.next_session_id += 1;
 
         // Create a TaskExecution sharing this runner's LogStore.
-        let mut exec = TaskExecution::with_log_store(self.log_store.clone());
+        let mut exec = TaskExecution::with_log_store(TaskId::next(), self.log_store.clone());
         if let Some(ref registry) = self.registry {
             exec.set_registry(registry.clone());
         }
         exec.set_tracing_installed(self.tracing_installed.clone());
 
-        // Launch with TUI hooks.
-        let config = LaunchConfig {
-            tui_wait: Some(self.tui_wait.clone()),
-            tui_output: Some(self.tui_output.clone()),
-        };
-        exec.launch(task, task_args, config);
+        exec.launch(task, task_args);
 
         // Create a session that points to this execution's state.
         let session = TaskSession {
@@ -146,7 +137,6 @@ impl Default for TaskRunner {
 mod tests {
     use super::*;
     use crate::error::TaskError;
-    use crate::execution::start_tracing_forwarder;
     use crate::task::{TaskContext, TaskDef, TaskFnKind};
     use std::future::Future;
     use std::pin::Pin;

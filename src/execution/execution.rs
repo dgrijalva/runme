@@ -1,30 +1,44 @@
 //! Shared execution layer for task lifecycle management.
 //!
-//! `TaskExecution` is the unit of task execution. It owns the `TaskContext`,
-//! `LogStore`, process tracking, and cleanup. All output (exec, spawn, tracing)
-//! flows through the `LogStore`. UI modes (CLI, TUI, Agent) are thin consumers
-//! that subscribe to the LogStore and render output in their own way.
+//! `TaskExecution` is the unit of task execution. Slice 2 reshapes it into
+//! the recursive node described in `docs/plans/notes/architecture.md` §2:
+//! it now carries an identity (`id`, `parent`, `children`), an independent
+//! `CancellationToken`, and a `JoinHandle<TaskResult>` slot so the awaited
+//! handle (slice 3) can return the body's result without a side channel.
+//!
+//! The `LogStore` is no longer constructed here — slice 2 makes it caller-
+//! provided so the eventual `Engine` (slice 4) can own a single store
+//! shared across the whole graph.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::sys::signal;
 use nix::unistd::Pid;
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::{AbortHandle, JoinHandle};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 
+use crate::error::TaskResult;
 use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
 use crate::log::store::LogStore;
 use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef};
 use crate::tracing_layer::LogEntryLayer;
-use crate::tui::output::TuiOutput;
+
+use super::task_id::TaskId;
 
 // ============================================================
 // Task and process lifecycle types
 // ============================================================
 
 /// Status of a running task.
+///
+/// `Cancelled` and `Timeout` are siblings of `Done`/`Failed` — the engine
+/// writes them after the cancel ladder (slice 4) finishes. They land in
+/// slice 2 alongside the rest of the status reshape so consumers (TUI
+/// rendering, status transitions) only need to be updated once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskStatus {
     /// Task function is still executing (spawning processes, doing setup).
@@ -35,6 +49,12 @@ pub enum TaskStatus {
     Done,
     /// Task function returned an error or panicked.
     Failed(TaskFailure),
+    /// Task was cancelled by an explicit user/engine action (e.g. KillTask,
+    /// TaskHandle::Drop). Wired by the cancel ladder in slice 4.
+    Cancelled,
+    /// Per-task timeout watchdog fired. Wired by the timeout watchdog in
+    /// slice 4.
+    Timeout,
 }
 
 /// Details of a task failure.
@@ -151,91 +171,85 @@ pub(crate) fn start_tracing_forwarder(
 }
 
 // ============================================================
-// Launch configuration
-// ============================================================
-
-/// Optional hooks passed to `TaskExecution::launch()`.
-///
-/// TUI-specific features (tui_wait, tui_output) are injected here.
-/// CLI and Agent modes use `LaunchConfig::default()` which sets both to None.
-pub struct LaunchConfig {
-    /// Whether the TUI should stay open after the task completes.
-    pub tui_wait: Option<Arc<AtomicBool>>,
-    /// Post-TUI output staging buffer.
-    pub tui_output: Option<Arc<Mutex<TuiOutput>>>,
-}
-
-impl Default for LaunchConfig {
-    fn default() -> Self {
-        Self {
-            tui_wait: None,
-            tui_output: None,
-        }
-    }
-}
-
-// ============================================================
 // TaskExecution
 // ============================================================
 
 /// A single task execution. Owns the full lifecycle from launch to cleanup.
 ///
-/// All output (exec, spawn, tracing) flows into the `LogStore`.
-/// UI modes subscribe to the LogStore and render in their own way.
+/// In the multi-task runtime this is a node in the engine's task graph: it
+/// has an identity (`id`, `parent`), a list of `children`, and an
+/// independent `CancellationToken`. Parent-child propagation is performed
+/// by the engine walking the graph (slice 4) — tokens are NOT linked via
+/// `child_token()`. See "Cancellation model" in `architecture.md`.
 pub struct TaskExecution {
+    // ── Identity ───────────────────────────────────────────────────
+    /// Unique id for this execution, allocated from `TaskId::next`.
+    pub id: TaskId,
     /// Name of the task being executed.
     pub task_name: String,
-    /// Aggregated log store for all output.
-    log_store: Arc<Mutex<LogStore>>,
-    /// Current task status.
+    /// Parent's id. `None` only for the synthetic root.
+    pub parent: Option<TaskId>,
+
+    // ── Graph ──────────────────────────────────────────────────────
+    /// Direct children of this execution. Slice 3 populates this when
+    /// `ctx.run` materialises a child node; slice 2 leaves it empty so
+    /// the single-task path keeps working unchanged.
+    pub children: Arc<Mutex<Vec<Arc<TaskExecution>>>>,
+
+    // ── Lifecycle ──────────────────────────────────────────────────
+    /// Cooperative cancellation signal. **Independent — NOT a child token
+    /// of the parent's.** Constructed via `CancellationToken::new()`. The
+    /// engine propagates cancellation by walking `children` explicitly
+    /// (slice 4).
+    pub cancellation: CancellationToken,
+    /// Current task status, shared with the running `TaskContext` so
+    /// `bind_ready` / `mark_ready` updates land here. The engine writes
+    /// `Cancelled` / `Timeout` after running its respective ladders.
     task_status: Arc<Mutex<TaskStatus>>,
+    /// `JoinHandle` for the spawned task body. Populated by `launch`,
+    /// taken (consumed) when the handle's future is awaited (slice 3) or
+    /// when the cancel ladder reclaims it (slice 4).
+    pub task_handle: Mutex<Option<JoinHandle<TaskResult>>>,
+    /// Cheap clone of the task body's `AbortHandle`. Used by the cancel
+    /// ladder's step 4 (slice 4) without needing to lock the JoinHandle
+    /// slot.
+    pub abort_handle: Option<AbortHandle>,
+    /// Abort handle for the per-task timeout watchdog tokio task. `None`
+    /// when no timeout is configured. Aborted by the cancel ladder
+    /// (slice 4) to prevent Cancel→Timeout races.
+    pub watchdog_abort: Mutex<Option<AbortHandle>>,
+
+    // ── Process tracking ───────────────────────────────────────────
     /// Spawned processes tracked by this execution.
     processes: Arc<Mutex<Vec<ProcessInfo>>>,
-    /// JoinHandle for the spawned task function.
-    task_handle: Option<tokio::task::JoinHandle<()>>,
-    /// The task's tracing output buffer (info!/error!/etc from the task function).
-    tracing_buffer: Arc<Mutex<OutputBuffer>>,
     /// Sender for spawn events (given to the TaskContext).
     spawn_tx: mpsc::UnboundedSender<SpawnEvent>,
-    /// Whether the global tracing subscriber has been installed.
-    /// Shared across executions so `set_global_default` only succeeds once.
+
+    // ── Logging ────────────────────────────────────────────────────
+    /// Aggregated log store for all output. Engine-owned in the multi-
+    /// task runtime — callers always supply this.
+    log_store: Arc<Mutex<LogStore>>,
+    /// The task's tracing output buffer (info!/error!/etc from the task
+    /// function).
+    tracing_buffer: Arc<Mutex<OutputBuffer>>,
+    /// Whether the global tracing subscriber has been installed. Hoisted
+    /// to the engine in slice 4; held here as an `Arc<AtomicBool>` so
+    /// callers can share a single flag across multiple executions today.
     tracing_installed: Arc<AtomicBool>,
+
+    // ── Registry ───────────────────────────────────────────────────
     /// Optional shared registry for task discovery and cross-invocation.
     registry: Option<Arc<Registry>>,
 }
 
 impl TaskExecution {
-    /// Create a new TaskExecution with its own LogStore.
-    pub fn new() -> Self {
-        let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
-        let log_store = Arc::new(Mutex::new(LogStore::new()));
-        let processes = Arc::new(Mutex::new(Vec::new()));
-
-        // Start the spawn monitor loop.
-        let monitor_log_store = log_store.clone();
-        let monitor_processes = processes.clone();
-        tokio::spawn(async move {
-            Self::monitor_spawns(spawn_rx, monitor_log_store, monitor_processes).await;
-        });
-
-        Self {
-            task_name: String::new(),
-            log_store,
-            task_status: Arc::new(Mutex::new(TaskStatus::Setup)),
-            processes,
-            task_handle: None,
-            tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
-            spawn_tx,
-            tracing_installed: Arc::new(AtomicBool::new(false)),
-            registry: None,
-        }
-    }
-
-    /// Create a new TaskExecution that shares an existing LogStore.
+    /// Create a new `TaskExecution` that shares an existing `LogStore`.
     ///
-    /// Used by the TUI when launching multiple tasks that should appear
-    /// in the same log view.
-    pub fn with_log_store(log_store: Arc<Mutex<LogStore>>) -> Self {
+    /// `id` is the caller's responsibility — for fresh top-level tasks
+    /// pass `TaskId::next()`. The execution starts with `parent: None`
+    /// and an empty `children` list; slice 3 wires those up when child
+    /// invocations materialise as graph nodes.
+    pub fn with_log_store(id: TaskId, log_store: Arc<Mutex<LogStore>>) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         let processes = Arc::new(Mutex::new(Vec::new()));
 
@@ -246,13 +260,19 @@ impl TaskExecution {
         });
 
         Self {
+            id,
             task_name: String::new(),
-            log_store,
+            parent: None,
+            children: Arc::new(Mutex::new(Vec::new())),
+            cancellation: CancellationToken::new(),
             task_status: Arc::new(Mutex::new(TaskStatus::Setup)),
+            task_handle: Mutex::new(None),
+            abort_handle: None,
+            watchdog_abort: Mutex::new(None),
             processes,
-            task_handle: None,
-            tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             spawn_tx,
+            log_store,
+            tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             tracing_installed: Arc::new(AtomicBool::new(false)),
             registry: None,
         }
@@ -263,21 +283,37 @@ impl TaskExecution {
         self.registry = Some(registry);
     }
 
-    /// Share a tracing_installed flag across multiple executions.
+    /// Share a `tracing_installed` flag across multiple executions.
     ///
-    /// `set_global_default` can only succeed once per process. When launching
-    /// multiple executions (e.g. TUI picker), they should share this flag.
+    /// `set_global_default` can only succeed once per process. When
+    /// launching multiple executions (e.g. TUI picker), they should
+    /// share this flag. Slice 4 hoists this to the engine.
     pub fn set_tracing_installed(&mut self, flag: Arc<AtomicBool>) {
         self.tracing_installed = flag;
     }
 
-    /// Launch a task. Creates the TaskContext, installs tracing, subscribes
-    /// to all output buffers, and spawns the task function.
-    pub fn launch(
+    /// Launch a task. Creates the `TaskContext`, installs tracing,
+    /// subscribes to all output buffers, and spawns the task function.
+    ///
+    /// The `JoinHandle<TaskResult>` is stored in `task_handle`. Slice 3's
+    /// `TaskHandle::IntoFuture` takes it to recover the body's result;
+    /// slice 4's cancel ladder uses the cached `abort_handle` to abort
+    /// without re-locking the slot.
+    pub fn launch(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
+        self.launch_with_self_weak(Weak::new(), task, task_args);
+    }
+
+    /// Launch with a `Weak<TaskExecution>` reference to this very node.
+    ///
+    /// Slice 3 wires the weak ref into the `TaskContext` so that
+    /// `ctx.run` can attach children to the parent's `children` list.
+    /// Pass `Weak::new()` (or call `launch`) when no self-reference is
+    /// needed — e.g. top-level test launches with no graph parent.
+    pub fn launch_with_self_weak(
         &mut self,
+        self_weak: Weak<TaskExecution>,
         task: &'static TaskDef,
         task_args: Vec<String>,
-        config: LaunchConfig,
     ) {
         self.task_name = task.name.to_string();
 
@@ -296,13 +332,13 @@ impl TaskExecution {
         if let Some(ref registry) = self.registry {
             ctx.set_registry(registry.clone());
         }
-        if let Some(tui_wait) = config.tui_wait {
-            ctx.set_tui_wait(tui_wait);
-        }
-        if let Some(tui_output) = config.tui_output {
-            ctx.set_tui_output(tui_output);
-        }
         ctx.set_tracing_output(tracing_buffer.clone());
+
+        // Slice 3: wire identity + cancellation + self-weak so `ctx.run`
+        // can attach children to this node's `children` list and
+        // expose `ctx.cancelled()` / `ctx.cancellation()` to the body.
+        ctx.set_task_identity(self.id, self.cancellation.clone(), self_weak);
+        ctx.set_log_store(self.log_store.clone());
 
         // Forward exec() output to LogStore.
         start_buffer_forwarder(ctx.output_buffer(), log_store.clone());
@@ -323,13 +359,16 @@ impl TaskExecution {
             let _ = tracing::dispatcher::set_global_default(dispatch);
         }
 
-        // Spawn the task function.
+        // Spawn the task function. The JoinHandle now carries the body's
+        // `TaskResult` so the awaited TaskHandle (slice 3) can return it.
+        // Status writes are still done here against the shared Arc so
+        // observers see the in-flight transition.
         let task_status = self.task_status.clone();
-        let handle = tokio::spawn(async move {
+        let handle: JoinHandle<TaskResult> = tokio::spawn(async move {
             let result = task.func.call(&ctx, &task_args).await;
 
             let mut s = task_status.lock().await;
-            match result {
+            match &result {
                 Ok(()) => {
                     *s = TaskStatus::Done;
                 }
@@ -343,17 +382,33 @@ impl TaskExecution {
                     *s = TaskStatus::Failed(failure);
                 }
             }
+
+            result
         });
 
-        self.task_handle = Some(handle);
+        self.abort_handle = Some(handle.abort_handle());
+        *self
+            .task_handle
+            .try_lock()
+            .expect("task_handle slot uncontended at launch") = Some(handle);
     }
 
     /// Wait for the task function to complete.
     ///
     /// Does not stop spawned processes — call `shutdown()` for that.
-    pub async fn wait(&mut self) {
-        if let Some(handle) = self.task_handle.take() {
-            let _ = handle.await;
+    /// Returns the body's `TaskResult` if the slot was still populated;
+    /// `None` if it was already taken (e.g. by an awaited `TaskHandle`).
+    pub async fn wait(&self) -> Option<TaskResult> {
+        let handle = {
+            let mut slot = self.task_handle.lock().await;
+            slot.take()
+        };
+        match handle {
+            Some(h) => match h.await {
+                Ok(res) => Some(res),
+                Err(_) => None, // panic / abort — status was already set
+            },
+            None => None,
         }
     }
 
@@ -367,12 +422,11 @@ impl TaskExecution {
         {
             let procs = self.processes.lock().await;
             for proc in procs.iter() {
-                if proc.status == ProcessStatus::Running {
-                    if let Some(pgid) = proc.pgid {
-                        if !pgids.contains(&pgid) {
-                            pgids.push(pgid);
-                        }
-                    }
+                if proc.status == ProcessStatus::Running
+                    && let Some(pgid) = proc.pgid
+                    && !pgids.contains(&pgid)
+                {
+                    pgids.push(pgid);
                 }
             }
         }
@@ -499,11 +553,5 @@ impl TaskExecution {
                 }
             });
         }
-    }
-}
-
-impl Default for TaskExecution {
-    fn default() -> Self {
-        Self::new()
     }
 }

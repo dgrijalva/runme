@@ -207,13 +207,17 @@ async fn test_cross_task_error_propagation() {
 /// output flows via SpawnEvent → monitor_spawns → LogStore).
 #[tokio::test]
 async fn test_output_capture_from_exec() {
-    use rnme::execution::{LaunchConfig, TaskExecution};
+    use rnme::execution::{TaskExecution, TaskId};
+    use rnme::log::store::LogStore;
+    use std::sync::Arc as StdArc;
+    use tokio::sync::Mutex as TokioMutex;
 
     let reg = Arc::new(Registry::from_inventory());
     let task = reg.get("spawn_echo").unwrap();
-    let mut exec = TaskExecution::new();
+    let log_store = StdArc::new(TokioMutex::new(LogStore::new()));
+    let mut exec = TaskExecution::with_log_store(TaskId::next(), log_store);
     exec.set_registry(reg);
-    exec.launch(task, vec![], LaunchConfig::default());
+    exec.launch(task, vec![]);
     exec.wait().await;
 
     // Give the monitor_spawns forwarder a moment to process

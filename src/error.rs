@@ -124,6 +124,26 @@ impl TaskError {
             ExitHint::Abort => 2,
         }
     }
+
+    /// Construct a `TaskError` for a cancelled task.
+    ///
+    /// Used by `TaskHandle::IntoFuture` when the task was cancelled before
+    /// the handle could observe its `JoinHandle`. Slice 4's cancel ladder
+    /// will write the `Cancelled` status; slice 3 only signals via the
+    /// cancellation token, so this error is also produced when a dropped
+    /// handle's body is awaited later.
+    pub fn cancelled() -> Self {
+        TaskError::from_display("task cancelled").with_hint(ExitHint::Abort)
+    }
+
+    /// Construct a `TaskError` for a timed-out task.
+    ///
+    /// Wired in slice 4 alongside the per-task timeout watchdog. Slice 3
+    /// keeps the constructor next to `cancelled()` so consumers can match
+    /// both patterns symmetrically.
+    pub fn timeout() -> Self {
+        TaskError::from_display("task timed out").with_hint(ExitHint::Code(124))
+    }
 }
 
 impl From<crate::process::ProcessError> for TaskError {

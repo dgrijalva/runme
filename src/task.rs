@@ -29,8 +29,6 @@
 //! - [`watch`](TaskContext::watch) / [`watch_with`](TaskContext::watch_with) /
 //!   [`watch_channel`](TaskContext::watch_channel) — react to filesystem (or arbitrary) events
 //! - [`println`](TaskContext::println) — write raw text to the task's output stream
-//! - [`tui_wait`](TaskContext::tui_wait) / [`tui_output`](TaskContext::tui_output) —
-//!   control TUI behavior at task completion
 //! - [`stop_all`](TaskContext::stop_all) — gracefully terminate every spawned process
 //!
 //! Use the [`tracing`] macros (`info!`, `error!`, …, re-exported by
@@ -40,19 +38,22 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 use globset::GlobBuilder;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 use crate::cmd::Cmd;
-use crate::error::{TaskError, TaskResult};
+use crate::error::TaskError;
+use crate::execution::TaskId;
+use crate::execution::builder::TaskBuilder;
+use crate::execution::execution::TaskExecution;
 use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
+use crate::log::store::LogStore;
 use crate::process::{self, Output, ProcessError, ProcessResult};
-use crate::tui::output::{TuiOutput, TuiOutputHandle};
 use crate::watch::{self, Watch, WatchInfo, WatchKind};
 
 /// The type of static async task functions (from `#[rnme::task]` macro).
@@ -160,13 +161,6 @@ pub struct TaskContext {
     /// process is spawned. The receiver gets the `ProcessHandle`'s output buffer
     /// and task name so it can register the process for display.
     spawn_tx: Option<mpsc::UnboundedSender<SpawnEvent>>,
-    /// Whether the TUI should stay open after the task completes.
-    /// Default: true (TUI stays open). Set to false via `ctx.tui_wait(false)`
-    /// to auto-exit on task completion.
-    tui_wait: Arc<AtomicBool>,
-    /// Post-TUI output buffer. Entries staged here are flushed to real
-    /// stdout/stderr after the TUI closes.
-    tui_output: Arc<Mutex<TuiOutput>>,
     /// All watches registered through this context, for TUI visibility.
     watches: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<WatchInfo>>>>>,
     /// Working directory for file watches. Defaults to the current directory.
@@ -178,6 +172,49 @@ pub struct TaskContext {
     /// Shared task status, injected by `TaskExecution::launch()`.
     /// Used by `bind_ready()` and `mark_ready()` to set `TaskStatus::Ready`.
     task_status: Option<Arc<Mutex<crate::execution::TaskStatus>>>,
+    /// Identity of the running task (slice 3). `None` outside the engine
+    /// (e.g. tests using `TaskContext::new` directly).
+    task_id: Option<TaskId>,
+    /// Cancellation token of the running task (slice 3). Independent —
+    /// not a child token of any parent. Cloned into here from
+    /// `TaskExecution::cancellation` by `TaskExecution::launch`.
+    cancellation: Option<CancellationToken>,
+    /// Weak ref to the running task's `TaskExecution`. Slice 3 uses
+    /// this so `ctx.run` can attach the freshly-created child node to
+    /// `parent.children`. Slice 4 will replace this with a
+    /// `Weak<EngineInternals>` once the engine type exists.
+    task_exec: Option<Weak<TaskExecution>>,
+    /// Engine-owned `LogStore` (slice 3 inherits the parent's). Slice 4
+    /// will hoist this into `Weak<EngineInternals>::log_store`.
+    log_store: Option<Arc<Mutex<LogStore>>>,
+}
+
+/// Future returned by [`TaskContext::cancellation_signal`].
+///
+/// Resolves when the running task's cancellation token fires. When no
+/// token is wired (e.g. tests using [`TaskContext::new`] directly) the
+/// future never resolves — callers in those contexts can still use the
+/// same `tokio::select!` pattern without a separate branch.
+pub struct CancellationSignal<'a> {
+    inner: Option<WaitForCancellationFuture<'a>>,
+}
+
+impl<'a> Future for CancellationSignal<'a> {
+    type Output = ();
+
+    fn poll(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        // SAFETY: structural pinning of `inner`. `CancellationSignal`
+        // never moves the inner future out of the `Option` after
+        // construction; the only mutation here is polling it.
+        let this = unsafe { self.get_unchecked_mut() };
+        match this.inner.as_mut() {
+            Some(fut) => unsafe { Pin::new_unchecked(fut) }.poll(cx),
+            None => std::task::Poll::Pending,
+        }
+    }
 }
 
 /// Event emitted when a process is spawned through a TaskContext.
@@ -207,12 +244,14 @@ impl TaskContext {
             tracing_output: None,
             spawned_pgids: Arc::new(Mutex::new(Vec::new())),
             spawn_tx: None,
-            tui_wait: Arc::new(AtomicBool::new(true)),
-            tui_output: Arc::new(Mutex::new(TuiOutput::new())),
             watches: Arc::new(std::sync::Mutex::new(Vec::new())),
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             registry: None,
             task_status: None,
+            task_id: None,
+            cancellation: None,
+            task_exec: None,
+            log_store: None,
         }
     }
 
@@ -224,12 +263,14 @@ impl TaskContext {
             tracing_output: None,
             spawned_pgids: Arc::new(Mutex::new(Vec::new())),
             spawn_tx: None,
-            tui_wait: Arc::new(AtomicBool::new(true)),
-            tui_output: Arc::new(Mutex::new(TuiOutput::new())),
             watches: Arc::new(std::sync::Mutex::new(Vec::new())),
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             registry: None,
             task_status: None,
+            task_id: None,
+            cancellation: None,
+            task_exec: None,
+            log_store: None,
         }
     }
 
@@ -248,41 +289,10 @@ impl TaskContext {
         &self.output
     }
 
-    /// Control whether the TUI stays open after the task completes.
-    ///
-    /// By default, the TUI stays open (`true`). Set to `false` to auto-exit
-    /// when the task returns. This is mutable — the task can change its mind:
-    ///
-    /// ```ignore
-    /// ctx.tui_wait(false);
-    /// let result = ctx.exec("cargo install --path .").await?;
-    /// if !result.success() {
-    ///     ctx.tui_wait(true);  // stay open on failure
-    /// }
-    /// ```
-    pub fn tui_wait(&self, wait: bool) {
-        self.tui_wait.store(wait, Ordering::Relaxed);
-    }
-
-    /// Get a handle to the TUI output buffer for staging post-TUI output.
-    ///
-    /// The returned handle supports chaining:
-    /// ```ignore
-    /// ctx.tui_output().stderr().append(result.output()).await;
-    /// ctx.tui_output().stdout().write("done!\n").await;
-    /// ```
-    pub fn tui_output(&self) -> TuiOutputHandle {
-        TuiOutputHandle::new(self.tui_output.clone())
-    }
-
     /// Get an `Output` handle wrapping the task's tracing output buffer.
     ///
     /// This is the output from `info!()`, `error!()`, etc. called within
-    /// the task function. Useful for staging task tracing output to post-TUI:
-    ///
-    /// ```ignore
-    /// ctx.tui_output().stderr().subscribe(&ctx.task_output()).await;
-    /// ```
+    /// the task function.
     ///
     /// Falls back to the exec output buffer if no tracing buffer was injected
     /// (e.g., in tests or non-TUI mode).
@@ -312,28 +322,6 @@ impl TaskContext {
             .as_ref()
             .unwrap_or(&self.output);
         buffer.lock().await.push(entry);
-    }
-
-    /// Get the `tui_wait` flag as a shared Arc for external observation.
-    ///
-    /// The TUI event loop uses this to decide whether to auto-exit.
-    pub fn tui_wait_flag(&self) -> Arc<AtomicBool> {
-        self.tui_wait.clone()
-    }
-
-    /// Get the shared TUI output Arc for external use (e.g., flushing on shutdown).
-    pub fn tui_output_arc(&self) -> Arc<Mutex<TuiOutput>> {
-        self.tui_output.clone()
-    }
-
-    /// Set the tui_wait Arc (used by TaskRunner to inject a shared flag).
-    pub fn set_tui_wait(&mut self, flag: Arc<AtomicBool>) {
-        self.tui_wait = flag;
-    }
-
-    /// Set the tui_output Arc (used by TaskRunner to inject a shared buffer).
-    pub fn set_tui_output(&mut self, output: Arc<Mutex<TuiOutput>>) {
-        self.tui_output = output;
     }
 
     /// Set the tracing output buffer (used by TaskRunner to inject the
@@ -607,6 +595,73 @@ impl TaskContext {
         self.task_status = Some(status);
     }
 
+    /// Inject task identity + cancellation token + self-weak ref
+    /// (called by `TaskExecution::launch`). After this call the body
+    /// can use `ctx.cancelled()`, `ctx.cancellation()`, and the
+    /// `ctx.run` builder will attach children to this node's
+    /// `children` list.
+    pub fn set_task_identity(
+        &mut self,
+        task_id: TaskId,
+        cancellation: CancellationToken,
+        self_weak: Weak<TaskExecution>,
+    ) {
+        self.task_id = Some(task_id);
+        self.cancellation = Some(cancellation);
+        // Stash the weak ref unconditionally — callers that have no
+        // self-Arc (e.g. legacy `launch` from CLI) pass `Weak::new()`,
+        // whose `upgrade()` returns `None` so `ctx.run` simply skips
+        // the children-list push. Storing it here means tasks built
+        // via `Arc::new_cyclic` get a weak whose strong_count is 0
+        // *during* construction but becomes 1 once the Arc exists.
+        self.task_exec = Some(self_weak);
+    }
+
+    /// Inject the shared `LogStore` (called by `TaskExecution::launch`).
+    /// Slice 4 will route this through `Weak<EngineInternals>` instead.
+    pub fn set_log_store(&mut self, store: Arc<Mutex<LogStore>>) {
+        self.log_store = Some(store);
+    }
+
+    /// Identity of the running task (`None` outside the engine, e.g.
+    /// tests that build a `TaskContext` directly).
+    pub fn task_id(&self) -> Option<TaskId> {
+        self.task_id
+    }
+
+    /// Has this task been cancelled? Sugar over the cancellation token.
+    ///
+    /// Returns `false` when no cancellation token is wired (e.g. tests
+    /// using `TaskContext::new` directly without going through
+    /// `TaskExecution::launch`).
+    pub fn cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .is_some_and(|t| t.is_cancelled())
+    }
+
+    /// Future form for `tokio::select!` integration. Returns a future
+    /// that resolves when the task is cancelled.
+    ///
+    /// When no cancellation token is wired, returns a future that never
+    /// resolves — callers in test contexts can still use the same
+    /// `tokio::select!` pattern.
+    pub fn cancellation_signal(&self) -> CancellationSignal<'_> {
+        CancellationSignal {
+            inner: self.cancellation.as_ref().map(|t| t.cancelled()),
+        }
+    }
+
+    /// Clone of the running task's cancellation token.
+    ///
+    /// Returns a fresh standalone token when none is wired so callers
+    /// in test contexts don't need a special branch.
+    pub fn cancellation(&self) -> CancellationToken {
+        self.cancellation
+            .clone()
+            .unwrap_or_else(CancellationToken::new)
+    }
+
     /// Bind this task's readiness to a process handle's readiness.
     ///
     /// When the process's readiness probe succeeds, this task's status
@@ -643,26 +698,58 @@ impl TaskContext {
 
     /// Invoke a task by name with string arguments.
     ///
-    /// Resolves the task through the registry (supporting short names,
-    /// `group:task` qualified names, and `:builtin` aliases) and runs it.
-    /// The invoked task receives its own `TaskContext` with the same
-    /// registry, enabling transitive cross-file invocation.
+    /// Returns a [`TaskBuilder`] — lazy. Use:
     ///
-    /// Returns an error if no registry is available (e.g., standalone test
-    /// context) or if the task cannot be resolved.
+    /// - `.await` (via `IntoFuture`) — runs to completion, yields `TaskResult`
+    /// - `.spawn()` — registers + launches, returns a [`TaskHandle`]
+    /// - `.timeout(d)` — set a per-invocation timeout (slice 4 wires the
+    ///   watchdog; slice 3 stores the value)
+    ///
+    /// Resolves the task through the registry (short names,
+    /// `group:task` qualified names, and `:builtin` aliases). Resolution
+    /// errors surface synchronously: the builder remembers them and
+    /// returns the error from `.spawn()` / `.await`.
     ///
     /// ```ignore
     /// ctx.run("test", &["--verbose"]).await?;
-    /// ctx.run("services/auth:deploy", &["--env", "staging"]).await?;
-    /// ctx.run(":list", &[]).await?;
+    /// let handle = ctx.run(":list", &[]).spawn()?;  // detach pattern
+    /// tokio::spawn(async move { let _ = handle.await; });
     /// ```
-    pub async fn run(&self, name: &str, args: &[&str]) -> TaskResult {
-        let registry = self
-            .registry
-            .as_ref()
-            .ok_or_else(|| TaskError::from_display("no registry available"))?;
+    ///
+    /// [`TaskHandle`]: crate::execution::TaskHandle
+    pub fn run(&self, name: &str, args: &[&str]) -> TaskBuilder {
+        let registry = match self.registry.as_ref() {
+            Some(r) => r.clone(),
+            None => {
+                return TaskBuilder::failed(TaskError::from_display(
+                    "no registry available",
+                ));
+            }
+        };
+
+        let task_def = match registry.resolve(name) {
+            Ok(def) => def,
+            Err(e) => return TaskBuilder::failed(e),
+        };
+
+        // Prefer the parent's existing LogStore so child output flows
+        // into the same store. In test paths where no store was wired,
+        // mint a fresh one — the body still runs, output just doesn't
+        // share with anyone (mirrors the slice 2 single-task path).
+        let log_store = self
+            .log_store
+            .clone()
+            .unwrap_or_else(|| Arc::new(Mutex::new(LogStore::new())));
+
         let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        registry.run_with_registry(name, &string_args, registry).await
+        TaskBuilder::new(
+            self.task_id,
+            self.task_exec.clone(),
+            log_store,
+            registry,
+            task_def,
+            string_args,
+        )
     }
 
     /// Query the task registry for discovery and listing.
@@ -888,19 +975,26 @@ impl Registry {
 
     /// Resolve and run a task, injecting the registry into the TaskContext.
     ///
-    /// This is the primary entry point for cross-file invocation. The created
-    /// `TaskContext` receives the registry so that the invoked task can itself
-    /// call `ctx.run()` for transitive invocation.
+    /// Slice 3: backward-compatible shim. Funnels through the new
+    /// `TaskBuilder` path so the call still resolves task names through
+    /// `resolve` and produces identical results, but goes through the
+    /// engine seam. Slice 4 will fold this into
+    /// `EngineHandle::spawn_task` once the engine type exists.
     pub async fn run_with_registry(
         &self,
         name: &str,
         args: &[String],
         registry: &Arc<Registry>,
     ) -> Result<(), TaskError> {
-        let task = self.resolve(name)?;
-        let mut ctx = TaskContext::new(task.name);
+        // Build a synthetic parent context carrying the registry so the
+        // builder's resolve path matches what an in-task `ctx.run` would
+        // do. No `task_id` / `task_exec` is set, so the child's
+        // `parent_id` is `None` and it does not attach to any
+        // `children` list — equivalent to running at the root.
+        let mut ctx = TaskContext::new(name);
         ctx.set_registry(registry.clone());
-        task.func.call(&ctx, args).await
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        ctx.run(name, &arg_refs).await
     }
 
     /// Resolve a task name to a `TaskDef` using 3-tier resolution.
@@ -1193,39 +1287,9 @@ mod tests {
         assert!(results[0].is_err());
     }
 
-    #[tokio::test]
-    async fn test_tui_wait_default_is_true() {
-        let ctx = TaskContext::new("test");
-        let flag = ctx.tui_wait_flag();
-        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn test_tui_wait_set_and_read() {
-        let ctx = TaskContext::new("test");
-        let flag = ctx.tui_wait_flag();
-
-        ctx.tui_wait(false);
-        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
-
-        ctx.tui_wait(true);
-        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[tokio::test]
-    async fn test_tui_output_handle_is_shared() {
-        let ctx = TaskContext::new("test");
-        let handle1 = ctx.tui_output();
-        let handle2 = ctx.tui_output();
-
-        // Both handles point to the same underlying buffer
-        handle1.write_stdout("from handle1").await;
-        handle2.write_stderr("from handle2").await;
-
-        let (stdout, stderr) = handle1.flush().await;
-        assert_eq!(stdout, "from handle1\n");
-        assert_eq!(stderr, "from handle2\n");
-    }
+    // tui_wait/tui_output were removed in slice 2 of the multi-task runtime
+    // (per design decision 7). Tests for those APIs deleted along with the
+    // plumbing — see docs/plans/notes/architecture.md §2 migration table.
 
     #[tokio::test]
     async fn test_task_output_returns_output() {

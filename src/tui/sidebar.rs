@@ -370,6 +370,12 @@ fn task_status_display(status: &TaskStatus) -> (String, Color) {
         TaskStatus::Ready => ("READY".to_string(), THEME.status_running),
         TaskStatus::Done => ("DONE".to_string(), THEME.status_done),
         TaskStatus::Failed(_) => ("FAIL".to_string(), THEME.status_failed),
+        // Slice 2 (multi-task runtime): new sibling variants. Engine cancel
+        // ladder + timeout watchdog (slice 4) write these. Render as
+        // failure-colored for now; richer styling can land alongside the UX
+        // pass.
+        TaskStatus::Cancelled => ("CANCEL".to_string(), THEME.status_failed),
+        TaskStatus::Timeout => ("TIMEOUT".to_string(), THEME.status_failed),
     }
 }
 
