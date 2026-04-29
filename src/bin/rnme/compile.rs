@@ -16,6 +16,8 @@ use crate::transform::transform_source;
 pub struct CompileResult {
     /// Path to the compiled binary.
     pub binary_path: PathBuf,
+    /// Path to the generated workspace cache directory.
+    pub cache_dir: PathBuf,
 }
 
 /// Errors that can occur during compilation.
@@ -104,7 +106,10 @@ pub fn compile_workspace(discovery: &DiscoveryResult) -> Result<CompileResult, C
     }
 
     let binary_path = target_dir.join("debug").join("runner");
-    Ok(CompileResult { binary_path })
+    Ok(CompileResult {
+        binary_path,
+        cache_dir,
+    })
 }
 
 /// Process a single RUNME.rs file into a CrateEntry.

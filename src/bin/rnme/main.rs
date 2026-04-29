@@ -25,6 +25,13 @@ fn main() {
 
     let pass_through_args = args[1..].to_vec();
 
+    // Capture all RUNME.rs source paths for builtin tasks (fmt) before we move
+    // discovery_result into compile_workspace.
+    let runme_files: Vec<String> = std::iter::once(discovery_result.nearest.clone().unwrap())
+        .chain(discovery_result.children.iter().cloned())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
     // Compile the workspace
     let compiled = match compile_workspace(&discovery_result) {
         Ok(result) => result,
@@ -33,6 +40,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Pass workspace metadata to the runner via env vars so builtin tasks
+    // (fmt/check/clean) can find the source files and the generated workspace.
+    // Safe: main.rs is single-threaded at this point.
+    unsafe {
+        std::env::set_var("RNME_CACHE_DIR", &compiled.cache_dir);
+        std::env::set_var("RNME_RUNME_FILES", runme_files.join("\n"));
+    }
 
     // Exec the compiled binary, replacing this process.
     let mut argv: Vec<&str> = Vec::with_capacity(pass_through_args.len() + 1);
