@@ -1,7 +1,7 @@
 //! Shared execution layer for task lifecycle management.
 //!
 //! `TaskExecution` is the unit of task execution. Slice 2 reshapes it into
-//! the recursive node described in `docs/plans/notes/architecture.md` §2:
+//! the recursive node described in `docs/runtime_engine_design.md` § Types — `TaskExecution`:
 //! it now carries an identity (`id`, `parent`, `children`), an independent
 //! `CancellationToken`, and a `JoinHandle<TaskResult>` slot so the awaited
 //! handle (slice 3) can return the body's result without a side channel.

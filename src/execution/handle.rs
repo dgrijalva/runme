@@ -3,8 +3,8 @@
 //! Slice 3 lands the developer-API drop-cancels semantics: dropping a
 //! handle without awaiting it cancels the underlying task by signalling
 //! its `CancellationToken`. The full cancel ladder (process stop, body
-//! abort, status writes) lives on `EngineInternals` and lands in slice 4 —
-//! see `docs/plans/notes/architecture.md` §3 / §10 (slicing notes).
+//! abort, status writes) lives on `EngineInternals` —
+//! see `docs/runtime_engine_design.md` § Types — `TaskHandle` and § Cancellation model.
 //!
 //! The handle holds an `Arc<TaskExecution>`, never a strong engine
 //! reference. The engine owns its own `Arc` clone, so dropping the

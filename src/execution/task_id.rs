@@ -7,7 +7,7 @@
 //! ids can be minted from any code path that doesn't have an `Engine`
 //! reference (e.g. tests).
 //!
-//! See `docs/plans/notes/architecture.md` §1.
+//! See `docs/runtime_engine_design.md` § Types — `TaskId`.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};

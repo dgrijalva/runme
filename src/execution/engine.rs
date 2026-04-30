@@ -4,7 +4,7 @@
 //! `EngineSpawnBuilder`, `GraphSnapshot`, and the cancel ladder
 //! (`cancel_task`, `cancel_subtree`, `kill_all`, `timeout_task`).
 //!
-//! See `docs/plans/notes/architecture.md` §5–§11.
+//! See `docs/runtime_engine_design.md` for the canonical engine reference.
 
 use std::collections::HashMap;
 use std::future::IntoFuture;

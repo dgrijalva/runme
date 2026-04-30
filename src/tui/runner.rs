@@ -5,7 +5,6 @@
 //! `TaskRunner` (which used to manage all of that) is gone; what remains
 //! here is just type re-exports for the sidebar/event loop.
 //!
-//! See `docs/plans/notes/architecture.md` and the dual-path cleanup plan
-//! for the full picture.
+//! See `docs/runtime_engine_design.md` for the engine reference.
 
 pub use crate::execution::{ProcessInfo, ProcessStatus, TaskFailure, TaskStatus};

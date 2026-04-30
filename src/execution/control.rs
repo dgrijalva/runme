@@ -6,7 +6,7 @@
 //! `Control` `pub(crate)` lets the protocol evolve without breaking
 //! frontends.
 //!
-//! See `docs/plans/notes/architecture.md` §4.
+//! See `docs/runtime_engine_design.md` § Control protocol.
 
 use std::time::Duration;
 

@@ -4,7 +4,7 @@
 //! indicators. Entries are built from the engine's `GraphSnapshot` so the
 //! TUI never duplicates lifecycle bookkeeping.
 //!
-//! See `docs/plans/notes/architecture.md` §5/§9.
+//! See `docs/runtime_engine_design.md` § Graph snapshot & observation and § Logging.
 
 use std::collections::HashSet;
 

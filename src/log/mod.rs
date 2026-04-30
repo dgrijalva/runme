@@ -63,7 +63,7 @@ pub struct LogEntry {
     /// How the record was parsed.
     pub parsed: ParsedContent,
     /// Which task/command produced this entry. Tasks and processes share an
-    /// ID namespace — see `docs/plans/notes/architecture.md` §9.
+    /// ID namespace — see `docs/runtime_engine_design.md` § Logging.
     pub source: TaskId,
     /// Sequence number (monotonic within a source).
     pub seq: u64,

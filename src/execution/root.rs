@@ -14,7 +14,7 @@
 //! `Quit` exits the loop and the body returns; `cancel_subtree(ROOT)`
 //! is invoked on the way out.
 //!
-//! See `docs/plans/notes/architecture.md` §0, §6.
+//! See `docs/runtime_engine_design.md` § Module layout and § Synthetic root body.
 
 use std::future::Future;
 use std::pin::Pin;

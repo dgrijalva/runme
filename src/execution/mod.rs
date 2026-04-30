@@ -5,8 +5,7 @@
 //! future MCP frontends consume. The synthetic root, the cancel ladder,
 //! per-task timeouts, and the graph snapshot all live here.
 //!
-//! See `docs/03-multi-task-runtime.md` for the design and
-//! `docs/plans/notes/architecture.md` for the type-level spec.
+//! See `docs/runtime_engine_design.md` for the canonical engine reference.
 
 pub(crate) mod control;
 pub(crate) mod engine;

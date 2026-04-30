@@ -2,701 +2,348 @@
 
 ## Overview
 
-The TUI is the primary interface for the power-user persona. It needs to handle two distinct phases: **activation** (picking what to run) and **interaction** (monitoring, controlling, and exploring running tasks and their output). The log viewer is the centerpiece — most time is spent reading logs, so that experience must be excellent.
+The TUI is the primary interface for the power-user persona. It runs multiple tasks concurrently, observes them through the engine's graph snapshot and log store, and gives the user keyboard-driven control over what's running and what's visible. The log viewer is the centerpiece — most time is spent reading logs, so that experience must be excellent.
 
-## Existing Infrastructure
+The TUI is a thin frontend on top of the engine (`src/execution/`). It holds an `EngineHandle`, watches the graph for changes, subscribes to the log store, and emits control messages (spawn, kill, quit) when the user acts. It does not own task lifecycle bookkeeping; that all lives in the engine. The old `TaskRunner` type that used to wrap multi-task state has dissolved into a stub of re-exports (`src/tui/runner.rs`) — what's left of "TUI plumbing" is rendering and input handling.
 
-All discovered RUNME.rs files are compiled into a single binary via a generated Cargo workspace (see `build_system_design.md`). The TUI runs in-process with access to every task from every file via `Registry::from_inventory()`. Each task carries a `group` key identifying which RUNME.rs it came from; group display names are managed by `GroupDef` and overridable via `#[runme::init]`.
+For the engine model the TUI consumes — synthetic root, recursive graph, control protocol, cancellation — see `runtime_engine_design.md`.
 
-The TUI builds on top of these existing primitives:
+## Foundations
 
-- **`LogEntry`** — universal log record with `raw`, `parsed` (Json/Logfmt/PlainText), `source`, `seq`, extracted fields (`timestamp`, `level`, `message`), and arbitrary `fields: HashMap<String, Value>`
-- **`OutputBuffer`** — per-task ring buffer with `tokio::broadcast` for live subscription
-- **`LogStore`** — multi-source composition layer. Merges entries across sources by `seq`, supports filtered composition, grouping by source/level/arbitrary key, and filtered live subscriptions
-- **`FilterExpr`** — Lucene/Datadog-style filter DSL (`level:error AND source:auth`, negation, regex, wildcards, comparisons). Already has a parser (`winnow`-based) and evaluator
-- **`Search`** — full-text search with match highlighting (byte ranges), regex, case sensitivity, and context windows with group merging
-- **`ProcessHandle`** — spawn in process groups, signal (SIGTERM/SIGKILL/SIGHUP), graceful stop with escalation, `is_running()`, output buffer access
-- **`TaskDef` / `Registry`** — task metadata (name, description, watch patterns, dependencies), lookup, sequential and parallel execution
-- **`stream`** module — live tailing, filtered streaming, replay, export (raw text and JSON lines, sync and async)
+The TUI builds on these primitives, all engine-owned or shared:
+
+- **`EngineHandle`** — `graph: watch::Receiver<GraphSnapshot>` for change-detection, `log_store: Arc<Mutex<LogStore>>` for log subscriptions, `subscribe_logs()` for broadcast, `source_ids_for(task_id)` for filter computation, `spawn_task` / `kill_task` / `kill_all` / `kill_process` / `quit` for control.
+- **`GraphSnapshot`** — immutable map of `TaskId -> TaskNode { name, parent, children, status, processes }`. The TUI rebuilds its sidebar and source labels from this each frame.
+- **`LogEntry`** — universal log record: `raw`, `parsed`, `source: TaskId`, `seq`, extracted fields (`timestamp`, `level`, `message`), arbitrary `fields: HashMap`.
+- **`LogStore`** — multi-source aggregator with broadcast, source filtering, grouping. Engine-owned, frontend-shared.
+- **`FilterExpr`** — Lucene/Datadog-style filter DSL (`level:error AND source:auth`, negation, regex, wildcards, comparisons).
+- **`Search`** — full-text search with match highlighting, regex, case sensitivity, context windows.
 
 ## Execution Model
 
-### One Task at a Time
+The engine runs multiple tasks under a synthetic root. The TUI displays them all. There is no "current task" in the engine — `AppState::current_task` exists only so the `r` (restart) key knows what to relaunch and so single-task command invocations (`rnme build`) have something to wait on at startup.
 
-The TUI runs one task at a time. A task is an async Rust function that runs in-process via `tokio::spawn`. It may spawn zero or more child processes via `TaskContext`. The TUI observes all process creation through `ctx` — since all spawns go through the context, it has full visibility.
+Multiple tasks coexist freely. The picker overlay can be opened at any time to spawn another. Tasks may be cancelled individually (`k k`) or as a group (`k a`). When tasks finish, they stay in the sidebar with their logs accessible. The TUI shell stays open until explicit quit (`q`).
 
-### Task Lifecycle
-
-The task function acts as a **setup function**, not a main loop. When the task function returns, its spawned processes **continue running** (option A). This is the natural model for a task runner: `ctx.spawn("npm run dev")` means "this should be running," not "run this until my function exits."
-
-The task function returning is a meaningful state transition — it means setup is complete and the task is now in **monitoring** mode. The TUI surfaces this: the task status changes from `SETUP` to `READY` when the function returns.
-
-For tasks that want teardown-on-return behavior (option B), the task function can explicitly stop its processes before returning using individual `ProcessHandle::stop()` calls or `ctx.stop_all()` to terminate everything it spawned. `ctx.exec()` (synchronous, single-command) naturally provides this — it runs one thing, waits, and returns.
-
-### Task Logging via `tracing`
-
-The task function's own output (as opposed to child process stdout/stderr) is captured via the `tracing` crate. The prelude re-exports `tracing` macros (`info!`, `error!`, `warn!`, `debug!`, `trace!`) so task authors write idiomatic Rust:
-
-```rust
-#[runme::task]
-async fn deploy(ctx: &TaskContext) {
-    info!("starting deployment");
-    let handle = ctx.spawn("docker compose up -d").await?;
-    info!(service = "docker", "containers started");
-}
-```
-
-When the TUI launches a task, it installs a custom `tracing::Layer` that converts `tracing::Event`s into `LogEntry`s and pushes them into an `OutputBuffer`. This stream appears in the log viewer as source `"task"`, interleaved with child process output and distinguished by source color like any other stream. Structured fields from `tracing` (e.g., `info!(user = "foo", "connected")`) map directly to `LogEntry.fields`.
+A single global `tracing` subscriber is installed once, in the engine. It routes events into the right per-task buffer using a task-local `TASK_TRACING_CTX`. Task code's `info!`/`error!`/etc. interleave with subprocess output in the log viewer, distinguished by source label and color.
 
 ### Startup
 
-- `runme` (no arguments): opens the task picker
-- `runme <taskname>`: starts the named task and opens the log viewer directly
+- `rnme` (no arguments): TUI opens with the picker overlay over an empty shell. Same as `t` from any state.
+- `rnme <task>`: TUI opens with the task already spawning. Sidebar shows it; logs flow in; picker is closed.
 
 ### Shutdown
 
-On quit (`q`) or signal (SIGINT, SIGTERM):
-1. Stop all child processes (SIGTERM → grace period → SIGKILL)
-2. Restore terminal state
-3. Exit
-
-Terminal restoration also runs on panic via `std::panic::set_hook`, ensuring the terminal is usable even if a task function panics within the TUI process.
+`q` opens a confirmation modal if any task other than root is still in `Setup`/`Ready`; otherwise it quits immediately. Confirming runs `engine_handle.quit().await` — cancel the whole subtree under root, root body returns, `engine.shutdown()` joins. SIGINT (Ctrl-C) takes the same path. Terminal restoration is wired to `std::panic::set_hook` so a panic doesn't leave the user with a broken terminal.
 
 ## Layout
 
-### Primary View: Log Viewer + Process Sidebar
+### Primary View
 
 ```
-+--[ processes ]--------+--[ logs ]----------------------------------------------+
-|   start       [READY] | 12:01:03.410  INFO  task   Starting deployment...       |
-|                        | 12:01:03.412  INFO  api     Request handled GET /users  |
-| > api-server  [RUN]   | 12:01:03.415  DEBUG worker  Processing job 4821         |
-|   worker      [RUN]   | 12:01:03.418  ERROR api     Connection refused: db:5432 |
-|   migrate     [DONE]  | 12:01:03.420  INFO  api     Retrying connection...      |
-|   seed-data   [FAIL]  | 12:01:03.421  WARN  worker  Queue depth > 100           |
-|                        | 12:01:03.425  INFO  api     Connected to db:5432        |
-|                        |                                                         |
-|                        |                                                         |
++--[ tasks ]-------------+--[ logs ]----------------------------------------------+
+|   All tasks            | 12:01:03.410  INFO  [1] task   Starting deployment...   |
+|                        | 12:01:03.412  INFO  [2] api     Request handled GET     |
+| > deploy      [READY]  | 12:01:03.415  DEBUG [3] worker  Processing job 4821     |
+|     api-server [RUN]   | 12:01:03.418  ERROR [2] api     Connection refused      |
+|     worker    [RUN]    | 12:01:03.420  INFO  [2] api     Retrying connection     |
+|     migrate   [DONE]   | 12:01:03.421  WARN  [3] worker  Queue depth > 100       |
+|                        | 12:01:03.425  INFO  [2] api     Connected to db:5432    |
+|   build       [DONE]   |                                                         |
+|     cargo build [DONE] |                                                         |
 |                        |                                                         |
 +------------------------+---------------------------------------------------------+
 | [filter: level:error ]                                               TAIL | 842 |
 +----------------------------------------------------------------------------+-----+
 ```
 
-**Process sidebar** (left):
+**Sidebar** (left): built each frame from `GraphSnapshot` via `build_sidebar_entries_from_graph`. Top entry is always **All tasks** — selecting it focuses the synthetic root and shows the unfiltered merged log. Below it, direct children of root render in spawn order with their child processes (and any descendant tasks) nested under them. Completed tasks remain visible.
 
-The sidebar shows the active task and all processes it has spawned, organized into three sections:
+Status tags (`SETUP`, `READY`, `DONE`, `FAIL`, `RUN`, `STOP`, `CANCELLED`, `TIMEOUT`) come from the snapshot. Color-coded — see `theme.rs`. Sidebar focus drives log filtering: navigating to a task focuses it, computing the visible source set as `engine.source_ids_for(task_id)`.
 
-1. **Task** (top): the running task function itself, with status:
-   - `SETUP` — task function is still executing (spawning processes, doing initialization)
-   - `READY` — task function has returned; spawned processes continue running
-   - `DONE` — task function returned and had no long-running processes
-   - `FAIL` — task function returned an error or panicked
-2. **Running processes**: child processes currently alive, ordered by spawn time
-3. **Completed processes**: child processes that have exited, with exit status
+Source identity is unified: every task and every process has a `TaskId` from the same allocator. `LogEntry.source` is a `TaskId`. The source column in the log viewer renders as `[N] label` where `N` is the entry's position in the visible source list and `label` is the task name or process command. Duplicate labels (e.g., two `cargo build`) are disambiguated first by source color, then by the `[N]` prefix.
 
-Process status indicators:
-- `RUN` — running
-- `DONE` (exit 0) — exited successfully
-- `FAIL` (non-zero exit/signal) — failed
-- `STOP` — user-stopped
+**Log viewer** (main area): occupies the remaining width. Each line shows timestamp, level, source tag, message. Structured entries show the extracted `message`; raw text entries show the raw line. Lines wrap (`w` toggle) or truncate.
 
-Color-coded: green for running, dim for done, red for failed.
-
-Other sidebar behavior:
-- Current selection highlighted — cursor moves with j/k
-- Selecting a process scopes the log view to that source (or toggle to include/exclude from a multi-source view)
-- Collapsible — toggle with a key to give the log viewer full width
-
-**Log viewer** (main area):
-- Occupies the majority of screen real estate
-- Each line shows: timestamp, level (color-coded), source tag, message
-- Structured entries show the extracted `message`; raw text entries show the raw line
-- Source tags are short, color-coded labels (auto-assigned colors per source)
-- Lines wrap or truncate (user preference; default truncate with horizontal scroll)
-
-**Status bar** (bottom):
-- Active filter expression (editable in-place)
-- Scroll mode indicator: `TAIL` (auto-following) or `LINE 4821` (pinned position)
-- Total entry count / filtered count
-- Active search pattern if searching
+**Status bar** (bottom): active filter (editable in-place), scroll mode (`TAIL` or `LINE 4821 (+47 new)`), entry counts, search status.
 
 ### Detail View: Expanded Log Entry
 
-When the user presses Enter on a log entry, an overlay or bottom pane expands to show the full structured content:
+`Enter` on a log entry opens an overlay with all extracted fields, flattened key paths, and the raw text at the bottom. `Esc` or `q` closes. Scrollable with `j`/`k`.
 
-```
-+--[ entry detail ]------------------------------------------------------+
-| timestamp: 2024-01-15T12:01:03.418Z                                    |
-| level:     error                                                        |
-| source:    api-server                                                   |
-| message:   Connection refused: db:5432                                  |
-|                                                                         |
-| service:    "api"                                                       |
-| error.code: "ECONNREFUSED"                                              |
-| error.host: "db"                                                        |
-| error.port: 5432                                                        |
-| trace_id:   "abc-123-def"                                               |
-| span_id:    "0x7f3a"                                                    |
-|                                                                         |
-| --- raw ---                                                             |
-| {"level":"error","msg":"Connection refused: db:5432","service":"api"..} |
-+-------------------------------------------------------------------------+
-```
+### Picker Overlay
 
-- Shows all extracted fields, not just the summary line
-- Flattened key paths for nested JSON (`error.code`, `error.host`)
-- Raw text at the bottom for reference
-- Scrollable if the entry has many fields
-- Esc or q to close and return to log view
-
-### Activation View: Task Picker
-
-On startup (or when invoked with no specific task), the TUI shows a task picker that spans all discovered RUNME.rs files in the directory tree.
-
-Because all RUNME.rs files are compiled into a single binary (see `build_system_design.md`), the picker has immediate access to every task from every file via `Registry::from_inventory()`. No per-file compilation at picker time — that happened when the binary was built.
-
-#### Grouping & Naming
-
-Tasks are grouped by their `TaskDef.group` key. The display name comes from `GroupDef.display_name` — which defaults to the relative path of the RUNME.rs file, overridable via `#[runme::init]` with `InitContext.set_group_name()`:
+`t` opens the picker over the existing TUI shell. The picker is **always an overlay**, never a full-screen mode — sidebar and logs stay rendered behind it. Re-entrant from any state. On startup with no task, the shell is empty (just "All tasks" in the sidebar) and the picker opens automatically; visually identical to opening it later.
 
 ```
 +--[ pick a task ]---------------------------------------------------+
-| > web                                                               |
-|                                                                     |
-| .                                                                   |
-|   start              Start all services                             |
-|   clean              Clean all build artifacts                      |
-|                                                                     |
-| services/auth                                                       |
-|   build              Build the auth service                         |
-|   test               Run auth service tests                         |
-|   migrate            Run database migrations                        |
-|                                                                     |
-| services/gateway                                                    |
-|   build              Build the gateway                              |
-|   start              Start the gateway in dev mode                  |
-|                                                                     |
-| web-app                                                             |
-|   dev                Start webpack dev server                       |
-|   build              Production build                               |
-|   test               Run jest tests                                 |
-|                                                                     |
-+---------------------------------------------------------------------+
+| > web                                                              |
+|                                                                    |
+| .                                                                  |
+|   start              Start all services                            |
+|   clean              Clean all build artifacts                     |
+|                                                                    |
+| services/auth                                                      |
+|   build              Build the auth service                        |
+|   test               Run auth service tests                        |
+|                                                                    |
+| web-app                                                            |
+|   dev                Start webpack dev server                      |
+|   build              Production build                              |
++--------------------------------------------------------------------+
 ```
 
-The root RUNME.rs group is shown as `.` (or the project name if one is set).
+Tasks are grouped by `TaskDef.group`. Display name comes from `GroupDef.display_name` (defaults to relative path; overridable via `#[rnme::init]::set_group_name`). Root group renders as `.`.
 
-A RUNME.rs file can override its group display name via `#[runme::init]` using `InitContext.set_group_name("Web Frontend")`. The path-based key remains the internal identifier; the display name is what the user sees.
+- **Browse**: the full hierarchy. Navigate with `j`/`k`.
+- **Fuzzy search**: typing filters across task names, descriptions, group names. Matches the fully qualified name, so `auth build` finds `services/auth > build`.
+- **Enter**: launches the selected task by emitting `EngineHandle::spawn_task(def, args)`. The new child appears in the sidebar; the overlay closes.
+- **Esc**: closes the overlay without launching. **Ctrl-C** quits the TUI entirely. **`q` is just text** in the picker, not a quit.
 
-#### Interaction
-
-- **Browse mode**: on launch, the full hierarchy is shown. Navigate with j/k, groups are collapsible with Enter or arrow keys.
-- **Fuzzy search**: start typing to filter across all task names, descriptions, and group names. The hierarchy flattens into a ranked list as you type. Matching is across the fully qualified name (`services/auth > build`) so typing `auth build` finds it.
-- **Enter** launches the selected task and transitions to the log viewer.
-- **Multi-select** (stretch): select multiple tasks to launch in parallel (e.g. start the API server and the web dev server together). Toggle selection with Space, Enter to launch all selected.
-- **Recent/frequent**: tasks you've run before surface higher in the fuzzy results. History is persisted across sessions (stored alongside the cache).
+The picker is designed to grow a split layout for an argument-input form when launching tasks that take args — that's not built yet but the overlay shape accommodates it.
 
 ## App State Model
 
-### Core State
-
 ```
 AppState
-  mode: AppMode              // which view is active
-  task: Option<TaskState>    // the currently running task
-  log_view: LogViewState
-  filter: FilterState
+  mode: AppMode                              // active modal-style submode
+  picker_open: bool                          // picker overlay visible
+  quit_confirm: bool                         // quit-confirmation modal visible
+  engine: Option<EngineHandle>               // engine for control + observation
+  log_store: Arc<Mutex<LogStore>>            // cloned from engine
+  log_lines: Vec<LogEntry>                   // tail of merged log store
+  sidebar: SidebarState                      // focus + selection
+  sidebar_entries: Vec<SidebarEntry>         // rebuilt each frame from snapshot
+  focus_filter: HashSet<TaskId>              // sources visible from focused entry
+  hidden_sources: HashSet<TaskId>            // user-hidden sources (composes with focus)
+  scroll: ScrollState                        // tail or pinned anchor
+  display_mode: DisplayMode                  // Preview or Raw
+  wrap: bool                                 // truncated or wrapped
+  filter_input: FilterInputState
   search: SearchState
-  sidebar: SidebarState
+  source_colors: SourceColors
+  current_task_id: Option<TaskId>            // most recently launched (for r/restart)
+  current_task: Option<&'static TaskDef>     // for restart
+  ...
 ```
 
-### TaskState
-
-```
-struct TaskState {
-    name: String,
-    status: TaskStatus,        // Setup, Ready, Done, Failed(String)
-    processes: Vec<ProcessState>,  // spawned child processes
-    log_source: String,        // source name for task's own tracing output (e.g. "task")
-}
-
-enum TaskStatus {
-    Setup,              // task function still executing
-    Ready,              // task function returned, processes still running
-    Done,               // task function returned, no running processes
-    Failed(String),     // task function returned error or panicked
-}
-```
-
-### AppMode (what the user is doing right now)
+`AppMode` is for modal-style submodes that take over the input layer:
 
 ```
 enum AppMode {
-    TaskPicker,         // fuzzy-find task selection
-    Normal,             // log viewer, navigating with keyboard
-    FilterInput,        // typing in the filter bar
-    SearchInput,        // typing a search query
-    EntryDetail,        // viewing expanded log entry
-    CommandPalette,     // command palette overlay (future)
+    Normal,
+    FilterInput,
+    SearchInput,
+    Help,
+    EntryDetail,
+    ProcessDetail,
+    CopyMenu,
+    KillMenu,
 }
 ```
 
-Modes are a stack — entering FilterInput pushes onto Normal, Esc pops back. This means the underlying view stays rendered while the input overlay is active.
+The picker and quit-confirm are **not** modes — they're flags (`picker_open`, `quit_confirm`) that overlay the existing shell, since the shell stays rendered behind them. The picker can open from any mode.
 
-### ProcessState
+### Source visibility composition
 
-```
-struct ProcessState {
-    name: String,
-    status: ProcessStatus,    // Running, Done, Failed(i32), Stopped, Waiting
-    handle: Option<ProcessHandle>,
-    visible: bool,            // whether this source appears in the log view
-    color: Color,             // auto-assigned source color
-}
-```
-
-### LogViewState
-
-```
-struct LogViewState {
-    // Indices into the LogStore, after filtering (source + expression + search context)
-    visible_entries: Vec<usize>,
-
-    // Scroll anchor
-    scroll: ScrollState,
-
-    // Which sources are currently visible
-    source_filter: HashSet<String>,  // empty = show all
-
-    // Display settings
-    display_mode: DisplayMode,  // Preview or Raw
-    wrap: bool,                 // truncated (false) or wrapped (true)
-}
-
-enum ScrollState {
-    Tail,                              // anchor is last entry, pinned to bottom
-    Pinned { entry: usize, y: u16 },   // anchor entry index (into visible_entries) + its Y position in viewport
-}
-
-enum DisplayMode {
-    Preview,  // structured: timestamp | level | source | message
-    Raw,      // original text as received
-}
-```
-
-The visible entry list is a `Vec<usize>` of indices — lightweight to rebuild on filter changes. Layout (formatting, height computation, search highlighting) is only performed for the entries actually on screen, computed fresh each frame from the anchor outward. See § Scrolling for details.
-
-### FilterState
-
-```
-struct FilterState {
-    input: String,               // current text in the filter bar
-    compiled: Option<FilterExpr>, // parsed filter (None if input is empty or invalid)
-    error: Option<String>,        // parse error to display
-    live: bool,                   // whether filter updates as you type (default: true)
-}
-```
-
-### SearchState
-
-```
-struct SearchState {
-    pattern: String,
-    active: bool,                 // whether we're in search mode
-    matches: Vec<usize>,          // indices into visible_entries that matched
-    current_match: usize,         // which match we're focused on (for n/N navigation)
-    highlight: bool,              // whether matches are highlighted in the log view
-}
-```
+Visible sources = (`focus_filter` if non-empty, else "all sources") **minus** `hidden_sources`. Sidebar focus rewrites `focus_filter` via `engine.source_ids_for(focused_task)`. Manual toggles (`Space`/`Enter` on a sidebar process, number keys `1-9`) flip entries in `hidden_sources`. The two compose, so manual hides persist across focus changes (entries that aren't part of the current `focus_filter` simply stay hidden silently).
 
 ## Navigation & Interaction
 
 ### Keyboard Map
 
-**Normal mode (log viewer)**
+**Top level (any pane focus)**
 
 | Key | Action |
 |-----|--------|
-| `j` / `Down` | Move cursor down one entry |
-| `k` / `Up` | Move cursor up one entry |
-| `Ctrl-d` / `]` / `Page Down` | Scroll down half page |
-| `Ctrl-u` / `[` / `Page Up` | Scroll up half page |
-| `g` / `Home` | Jump to first entry |
-| `G` / `End` | Jump to last entry, re-enter tail mode |
-| `Enter` | Expand selected entry (detail view) |
-| `f` | Focus filter input |
-| `/` | Start search |
-| `n` | Next search match |
-| `N` | Previous search match |
-| `Tab` | Toggle sidebar focus |
-| `1-9` | Toggle visibility of source N |
-| `a` | Show all sources |
-| `q` | Quit |
 | `?` | Help overlay |
+| `q` | Quit (with confirmation if any task is running) |
+| `Ctrl-c` | Quit immediately, no prompt |
+| `t` | Open picker overlay (re-entrant) |
+| `k` | Open kill submenu |
+| `r` | Restart current task |
+| `Tab` | Toggle sidebar focus |
+
+**Normal mode (log viewer focused)**
+
+| Key | Action |
+|-----|--------|
+| `Down` / `Up` | Move cursor by one entry |
+| `Ctrl-d` / `]` / `PgDown` | Half page down |
+| `Ctrl-u` / `[` / `PgUp` | Half page up |
+| `g` / `Home` | Jump to first entry |
+| `G` / `End` | Jump to last entry, enter tail mode |
+| `Enter` | Open entry detail overlay |
+| `v` / `m` | Toggle Preview / Raw display mode |
+| `w` | Toggle truncate / wrap |
+| `d` | Toggle inline structured fields |
+| `\` | Toggle sidebar visibility |
+| `f` | Enter filter input mode |
+| `/` | Enter search input mode |
+| `n` / `N` | Next / previous search match |
+| `1`–`9` | Toggle source N |
+| `a` | Show all sources (clear `hidden_sources`) |
+| `y` | Copy focused entry to clipboard (OSC 52) |
+| `c` | Open copy submenu (`v` viewport, `s` stream, `a` all) |
+| `e` | Export visible log to file |
 
 **Sidebar focused**
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Move process selection |
-| `Enter` / `Space` | Toggle source visibility in log view |
-| `r` | Restart selected process |
-| `s` | Stop selected process |
-| `S` | Send SIGHUP to selected process |
-| `Tab` | Return focus to log viewer |
+| `Down` / `Up` | Move selection (drives focus filter) |
+| `Enter` | Toggle source visibility (task entries); open process detail (process entries) |
+| `Space` | Toggle source visibility |
+| `s` | SIGTERM selected process |
+| `S` | SIGHUP selected process |
+| `a` | Show all sources |
+| `1`–`9` | Toggle source N |
 
-**Filter input mode**
-
-| Key | Action |
-|-----|--------|
-| typing | Updates filter expression, live-filters the log view |
-| `Enter` | Confirm filter and return to normal mode |
-| `Esc` | Cancel (revert to previous filter) and return to normal mode |
-| `Ctrl-u` | Clear the filter input |
-| `Up` / `Down` | Cycle through filter history |
-
-**Search mode**
+**Kill submenu** (under `k`)
 
 | Key | Action |
 |-----|--------|
-| typing | Updates search pattern |
-| `Enter` | Confirm search, jump to first match, return to normal mode |
-| `Esc` | Cancel search |
+| `k` | SIGTERM the focused task (so `kk` is "kill this") |
+| `9` | SIGKILL the focused task |
+| `a` | SIGTERM all direct children of root (root stays alive) |
+| any other | Dismiss |
 
-**Entry detail mode**
+**Copy submenu** (under `c`), **Filter input** (`f` / `Esc` / `Enter` / history with `Up`/`Down`), **Search input** (`/` / `Enter` / `Esc`), **Entry detail** (`Esc`/`q` to close, `j`/`k` to scroll, `n`/`N` to step matches), **Process detail** (`Esc`/`q` to close, `s`/`S` for signal), **Quit confirmation** (`Enter` to confirm, anything else to dismiss).
 
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Scroll within the detail pane |
-| `Esc` / `q` | Close detail, return to log view |
-| `y` | Copy entry to clipboard (raw or formatted, TBD) |
-| `n` / `N` | Close detail and jump to next/previous entry |
+The current keybinding scheme mostly mirrors Vim motions plus ad-hoc letters. A redesign pass is planned (see `open_issues.md`); the multi-task plumbing was deliberately shipped first.
 
 ### Tail Mode vs Pinned Mode
 
-This is critical for log viewer UX.
+**Tail mode** (default while logs are flowing): new entries push the view to follow them. Status: `TAIL`. Any upward scroll (j/k up, Ctrl-u, PgUp) pins the view.
 
-**Tail mode** (default when processes are running):
-- New entries appear at the bottom, view auto-scrolls to follow
-- The cursor stays at the bottom
-- Visual indicator: `TAIL` in the status bar, possibly a subtle pulsing/color indicator
-- Any scroll-up action (j with nothing below, k, Ctrl-u, Page Up, mouse scroll up) immediately switches to pinned mode
+**Pinned mode**: view stays put. New entries accumulate. Status: `LINE 4821 (+47 new)` — current cursor entry plus how many new entries arrived since pinning. `G` / `End` jumps to the latest and re-enters tail mode.
 
-**Pinned mode** (the user is reading):
-- View stays at the current scroll position
-- New entries accumulate but don't push the view
-- Visual indicator: `LINE 4821 (+47 new)` — shows current position and how many new entries have arrived since pinning
-- The `(+N new)` counter is a key affordance — the user knows they're behind and can see how fast entries are arriving
-- Pressing `G` (or `End`) jumps to the latest entry and re-enters tail mode
-- Pressing `Shift-G` or a dedicated key could jump to the newest entry *without* re-entering tail mode (peek at latest, then return to reading position)
-
-**Transition rules:**
-- Start in tail mode
-- Any upward scroll -> pinned
-- `G` / `End` -> tail
-- Changing filter -> stay in current mode but recompute visible entries from the new position
-- New process starts -> stay in current mode
+Filter and source-visibility changes recompute the visible entry list; the cursor stays on the same entry if it's still visible, otherwise jumps to the nearest one. New tasks starting don't change scroll mode.
 
 ## Log Display
 
-### Entry Rendering
+Entries are the unit of navigation; `j`/`k` always moves one entry regardless of visual height.
 
-Each log entry is the fundamental unit — navigation (j/k) always moves one entry at a time, regardless of how many visual lines it occupies. An entry may take one line or many, depending on content and display mode.
+**Preview mode** (default): structured columns — timestamp, level badge, source tag, message. Source tags render as `[N] label` (numbered prefix matches the sidebar; `1-9` keys map to the same numbering). Cargo diagnostics and panic backtraces use specialized parser output for color-coding.
 
-### Display Modes
+**Raw mode**: original text, no column formatting. Useful for output that has its own formatting.
 
-The log viewer supports two display modes, toggled at runtime:
+**Wrap toggle** (`w`): orthogonal to display mode. Truncated = one visual line per entry; wrapped = entries occupy as many lines as needed.
 
-**Preview mode** (default): structured view with fixed-width columns for scannability.
+**Highlighting**: search matches are inline-highlighted (reverse video). The current `n`/`N` match gets a brighter highlight. Filter matches don't highlight inline — the filter just controls visibility.
 
-```
-12:01:03.418  ERROR  api     Connection refused: db:5432
-^timestamp    ^level ^source ^message (extracted)
-```
-
-- Timestamp: extracted `timestamp` field, formatted as local time `HH:MM:SS.mmm`. If no timestamp, blank/dash.
-- Level: color-coded badge. ERROR=red, WARN=yellow, INFO=green, DEBUG=dim. Fixed width for alignment.
-- Source: short name, color-coded per source. Fixed width (truncated if long).
-- Message: extracted `message` field. This is the primary content the user scans.
-
-Plain text entries (no structured fields extracted):
-```
-12:01:03.418  ---    api     Compiling runme v0.1.0
-```
-
-**Raw mode**: shows the original text as received, without column formatting. Useful for cargo diagnostics, compiler errors, and other output that has its own formatting.
-
-Cargo diagnostics and panic backtraces use the specialized parser output for color-coding (errors in red, warnings in yellow, note/help in blue) in both modes.
-
-### Truncation and Wrapping
-
-Entries have two line-length behaviors, toggled independently of display mode:
-
-**Truncated** (default): each entry occupies exactly one visual line. Content beyond the terminal width is clipped. The status bar or a visual indicator shows that the line continues. Horizontal scrolling (TBD: vim-style `h`/`l` or another mechanism) reveals the clipped content.
-
-**Wrapped**: entries occupy as many visual lines as needed. Long messages wrap at the terminal width. Multi-line content (stack traces, multi-line JSON) renders fully. This is essential when you need to see the full content without extra interaction.
-
-Truncation is best for scanning; wrapping is best for reading. The user should be able to switch quickly.
-
-### Multi-Line Entries
-
-Some entries are inherently multi-line regardless of wrapping: stack traces, multi-line log messages, cargo diagnostic groups. In truncated mode, these collapse to their first line. In wrapped mode, they render fully.
-
-Future consideration: selective expansion — expand entries matching a pattern (e.g., expand all errors) while keeping the rest truncated. This would allow targeted visibility without switching the entire view to wrapped mode.
-
-### Variable-Height Entries
-
-Entries can span multiple visual lines (in wrapped mode, or with multi-line content). The viewport handles this via anchor-based rendering — only computing heights for on-screen entries, not maintaining a global height index. See § Scrolling for the full approach.
-
-### Column Alignment
-
-In preview mode, fixed-width columns for timestamp, level, and source create a scannable layout. The message column gets all remaining space. This is important: when scanning logs quickly, the eye needs to be able to find the message column at a consistent horizontal position.
-
-If a field is missing (no timestamp, no level), the column stays blank to preserve alignment.
-
-### Source Colors
-
-Auto-assigned from a palette of distinguishable terminal colors. The color is consistent per source name within a session. The same color appears in:
-- The source tag in log lines
-- The process name in the sidebar
-- The source indicator in the detail view
-
-### Highlighting
-
-Active search matches are highlighted inline (reverse video or bright color on the match range). The current match (the one `n`/`N` is focused on) gets a distinct highlight color (e.g. bright yellow vs dim yellow for other matches).
-
-Filter matches don't highlight inline — the filter just controls which entries are visible.
+**Source colors**: `theme::SourceColors` assigns from a distinguishable palette per session; consistent across sidebar status tag, log source column, and detail view.
 
 ## Filtering
 
-### Live Filter
+`f` enters filter input mode. The expression parses live on every keystroke; the log view updates immediately. Parse errors render inline (red text after the cursor) without clearing the view — the last valid filter stays active. `Up`/`Down` cycle filter history (session-scoped).
 
-When the user presses `f` to enter filter mode:
-1. The cursor moves to the filter bar at the bottom
-2. As they type, the filter expression is parsed and applied **on every keystroke**
-3. The log view updates live, showing only matching entries
-4. Parse errors are shown inline (red text after the cursor) but don't clear the view — the last valid filter stays active
-
-This means the filter engine needs to be fast. The existing `FilterExpr` evaluator runs per-entry, so the bottleneck is recomputing the visible entry list. Approaches for performance:
-
-- **Incremental filtering**: when the filter changes, don't re-scan the entire LogStore. Instead, maintain a materialized view that can be incrementally updated.
-- **Debounce**: if keystroke rate exceeds filter computation rate, debounce to avoid falling behind. But aim for <16ms per filter pass so debouncing isn't needed for reasonable buffer sizes.
-- **Background computation**: filter recomputation happens on a background task. The UI thread never blocks on filtering. Stale-but-visible is better than frozen.
-
-### Filter Syntax
-
-The existing `FilterExpr` DSL supports:
+Filter syntax (`FilterExpr`):
 
 ```
-level:error                          # field match
-level:error AND source:api           # boolean AND
-level:error OR level:warn            # boolean OR
-NOT source:health-check              # negation
--source:health-check                 # prefix negation (same as NOT)
-message:"connection refused"         # quoted exact match
-level:/err.*/                        # regex
-status:>400                          # numeric comparison
-error.code:ECONNREFUSED              # dotted field paths
+level:error
+level:error AND source:api
+level:error OR level:warn
+NOT source:health-check
+-source:health-check                  # prefix negation
+message:"connection refused"
+level:/err.*/                         # regex
+status:>400
+error.code:ECONNREFUSED               # dotted field paths
 ```
 
-This should work well for the TUI. The filter bar should show a brief syntax hint when empty (placeholder text like `filter: level:error AND source:api ...`).
-
-### Source Toggle Shorthand
-
-In addition to the filter DSL, the sidebar's source visibility toggles provide a quick way to include/exclude sources. These compose with the filter: a source must be both visible (sidebar) AND match the filter to appear.
-
-Toggle interaction:
-- In the sidebar, `Enter`/`Space` on a process toggles its `visible` flag
-- Number keys `1-9` toggle source N from anywhere (mapped to sidebar order)
-- `a` shows all sources
-- The filter bar shows active source toggles as a visual indicator (dimmed names in the sidebar for excluded sources)
+Source visibility (sidebar focus + `hidden_sources` toggles + `1-9` keys + `a` show-all) composes with the filter expression: a source must be both visible AND match the filter to appear.
 
 ## Search
 
-### Interaction
+`/` opens the search input. As the user types, search runs against the current visible entries; matches highlight inline. `Enter` confirms, `Esc` cancels. After confirming, `n`/`N` jump forward/backward through matches.
 
-`/` opens the search input. As the user types, the search is executed against the current visible entries. Matches are highlighted in the log view. Enter confirms; Esc cancels.
-
-After confirming, `n` jumps forward to the next match, `N` jumps backward. The status bar shows `[match 3/17]` or similar.
-
-Search operates on the *visible* (post-filter) entries. This is intentional — you filter first to narrow down, then search within the result.
-
-### Implementation
-
-The existing `Search` builder handles text search, regex, case sensitivity, and match range extraction. For the TUI, we need:
-
-- Compile the search once, then reuse across entries
-- Apply incrementally as new entries arrive (in tail mode, new entries should be checked against the active search)
-- Maintain a list of matching entry indices for `n`/`N` navigation
-- Compute match byte ranges per-entry at render time (only for on-screen entries) for highlighting
+Search operates on the post-filter entries — filter first to narrow, then search within. The existing `Search` builder handles regex, case sensitivity, match ranges; the TUI compiles once and reuses across entries, computing match byte ranges per-entry at render time only for on-screen entries.
 
 ## Scrolling
 
-### The Core Idea: Anchor-Based Rendering
+### Anchor-Based Rendering
 
-Rather than maintaining a global height index for all entries (prefix sum arrays, Fenwick trees, etc.), the log viewer only computes layout for what's on screen. The key insight: a terminal viewport is at most a few hundred visual lines. We never need to know the visual height of an off-screen entry.
+Rather than maintaining a global height index, the log viewer only computes layout for what's on screen.
 
-The approach:
+1. **Anchor entry**: scroll state tracks one entry and its Y position in the viewport.
+2. **Render outward**: from the anchor, compute heights and lay out upward and downward until the viewport fills. ~100–200 entries even on tall terminals.
+3. **No precomputation**: heights computed on demand at render time; no global cache across frames.
 
-1. **Anchor entry**: the scroll state tracks a single entry and its Y position in the viewport. This is the stable reference point.
-2. **Render outward**: from the anchor, compute entry heights and lay out entries upward (filling above the anchor) and downward (filling below) until the viewport is full. This touches at most ~100-200 entries even on a tall display.
-3. **No global height computation**: entry heights are computed on demand during rendering, only for visible entries. No precomputation, no caching across frames (though caching is possible as an optimization if needed).
+**Operations**: `j`/`k` move the anchor by one entry. `Ctrl-d`/`Ctrl-u` walk forward/back summing heights until a viewport's worth is consumed. `g`/`G` set the anchor to first/last visible. Resize re-renders from the same anchor (heights reflow around it). Filter or source-visibility change rebuilds the visible list and clamps the anchor to the nearest still-visible entry. Search jumps set the anchor to the matched entry.
 
-### Operations
+The scroll position indicator uses entry count (`LINE 4821`), not visual line count — more meaningful for a log viewer anyway.
 
-**Scroll by entry** (j/k): move the anchor to the next/previous entry. Re-render.
+### Render Layer Separation
 
-**Page down** (Ctrl-d): walk forward from the anchor, summing heights until one viewport's worth of visual lines has been consumed. That entry becomes the new anchor.
-
-**Tail mode**: the anchor is always the last entry in the visible list, pinned to the viewport bottom. New entries push the anchor forward automatically.
-
-**Jump to top/bottom** (g/G): set anchor to first/last visible entry.
-
-**Resize**: re-render from the same anchor entry. Heights reflow around it — the anchor entry stays at the same viewport position, everything else adjusts.
-
-**Filter/mode change**: rebuild the visible entry list. If the anchor entry is still in the list, keep it at the same Y position. If it was filtered out, find the nearest visible entry.
-
-**Search jump** (n/N): set the anchor to the matched entry.
-
-### What This Gives Up
-
-No cheap "total visual lines" count — we can only cheaply know "entry 5,000 of 50,000," not "visual line 12,000 of 180,000." The scroll position indicator uses entry count, not visual line count. This is arguably more meaningful for a log viewer anyway.
-
-### Formatting and Highlighting
-
-Text formatting (ANSI colors from process output, level badges, source tags) and search highlighting are computed per-entry during rendering. Formatting layers compose:
-
-1. **Base content**: the entry text with any original ANSI formatting
-2. **Structured formatting**: in preview mode, timestamp/level/source column styling
-3. **Search highlights**: overlaid on the base content at match byte ranges
-4. **Selection highlight**: the currently focused entry gets a distinct background
-
-These layers are applied only to the ~100-200 entries on screen. Search match byte ranges (from the existing `Search` infrastructure) are translated to visual positions within the entry during rendering — in wrapped mode this means knowing where wraps fall, but only for that one entry.
-
-### Separation of Concerns
-
-- **Data layer**: `LogStore` holds entries, `FilterExpr` determines visibility, `Search` finds matches. None of these know about rendering.
-- **View model layer**: `LogViewState` maintains the filtered entry index list and scroll anchor. Updated when new entries arrive or filters change.
-- **Render layer**: given the anchor and viewport dimensions, selects visible entries, computes their layout and formatting, and draws them. Pure function of (anchor, visible_entries, terminal_size, display_mode, search_state). Target: 16ms per frame (60fps). Drop frames rather than queue them — the user should never see input lag.
-
-### Smooth Scrolling
-
-- Keyboard repeat rate drives scroll speed naturally
-- Consider scroll acceleration: holding j/k for extended time could increase step size (1 → 5 → 20 entries)
-- Mouse scroll events map to 3-entry jumps (configurable)
-- Page up/down moves by approximately one viewport height in visual lines, landing on an entry boundary
+- **Data layer**: `LogStore` holds entries, `FilterExpr` decides visibility, `Search` finds matches. Render-agnostic.
+- **View model**: `AppState` maintains the visible entry list, anchor, and source visibility. Updated on engine events.
+- **Render**: pure function of (anchor, visible entries, terminal size, display mode, search state). Target 16ms per frame; drop frames rather than queue.
 
 ## Process Management
 
 ### Lifecycle
 
-Each process has a state machine:
+Process states (`ProcessStatus`):
 
 ```
-Waiting -> Running -> Done
-                  \-> Failed(exit_code)
-                  \-> Stopped (user-initiated)
+Running -> Done
+        \-> Failed(i32)
+        \-> Stopped (user-initiated)
 ```
 
-`Waiting` is for tasks with unmet dependencies (not yet implemented but the slot exists in the model).
+The engine tracks every spawned process group, polls signal-0 every 250ms (`monitor_spawns`) to detect exit, and republishes the snapshot when status changes. A global reaper task (`src/process.rs`) wait()s on each `tokio::process::Child` so zombies don't accumulate even when task code never awaits its handles.
 
 ### Controls
 
-From the sidebar:
-- **Stop** (`s`): sends `ProcessHandle::stop()` (SIGTERM -> wait -> SIGKILL)
-- **Restart** (`r`): stop then re-launch the same command
-- **Signal** (`S`): sends SIGHUP for reload semantics
-- **Kill** (stretch: `K`): immediate SIGKILL, no grace period
+From the sidebar (focused on a process entry):
 
-The restart action preserves the existing log buffer and appends new output. A visual separator (`--- restarted at 12:05:03 ---`) marks the boundary.
+- `s` — SIGTERM (graceful)
+- `S` — SIGHUP (reload semantics)
+- `Enter` — open process detail panel (PID, PGID, command, status; future: live `lsof` for open sockets, controls)
+
+Killing a single process via the sidebar's `s` does not stop the parent task — the engine's `kill_process` only signals the process group, mirroring how a server might handle SIGTERM. Stopping the parent task itself uses the kill submenu (`k`).
 
 ### Crash Surfacing
 
-When a process fails:
-- Its status in the sidebar turns red: `seed-data [FAIL:1]` (showing exit code)
-- If the log view is in tail mode and includes this source, the last few lines (including any error output) are visible naturally
-- If the source is filtered out or the user is scrolled up, a transient notification appears: `seed-data exited with code 1` — shown briefly at the top or bottom of the log view, non-modal, auto-dismisses after a few seconds (or on any keypress)
+When a process fails, its sidebar entry turns red with the exit code (`seed-data [FAIL:1]`). If the user is in tail mode and the source is visible, the failure output is naturally on screen. Otherwise, a transient notification appears at the top — non-modal, auto-dismisses.
 
 ## Export & Re-streaming
 
-### Dump to File
+### Export Visible Log
 
-From normal mode or entry detail:
-- A command (`:export` or a keybinding) writes the current visible log view to a file
-- Options: raw text, JSON lines, or formatted (with colors stripped)
-- Default filename: `runme-export-{timestamp}.log`
-- Respects current filter and source visibility — exports what you see
+`e` (or `c v` viewport / `c s` stream / `c a` all from the copy submenu) writes the current visible entries to a file. Default filename: `runme-export-{timestamp}.log`. Respects current filter and source visibility — exports what you see.
 
 ### Copy to Clipboard
 
-- In entry detail: `y` copies the full entry (raw or formatted)
-- In normal mode with a selection: `y` copies the selected line(s)
-- Clipboard integration via OSC 52 escape sequence (works over SSH) or platform-specific fallback
-
-### Pipe to External Command
-
-Stretch goal: select a source and pipe its live output to an external command. Uses the existing `stream::tail_source()` infrastructure. The TUI would spawn a child process and connect a filtered broadcast receiver to its stdin.
+`y` copies the focused entry's raw text via OSC 52 (works over SSH). The `c` submenu offers viewport / stream / all variants.
 
 ## Event Loop Architecture
 
 ```
 tokio::select! {
-    // Terminal input events (keyboard, mouse, resize)
-    event = terminal_events.next() => {
-        handle_input(event, &mut app_state);
-    }
-
-    // New log entry from any running process
-    entry = log_receiver.recv() => {
-        ingest_entry(entry, &mut app_state);
-    }
-
-    // Process status change (exited, crashed)
-    status = process_watcher.next() => {
-        update_process_status(status, &mut app_state);
-    }
-
-    // Render tick (if state has changed)
-    _ = render_interval.tick(), if app_state.dirty => {
-        render(&app_state, &mut terminal);
-        app_state.dirty = false;
-    }
+    event = terminal_events.next()          => handle_input(event, &mut app),
+    Ok(entry) = log_rx.recv()                => app.ingest_entry(entry),
+    Ok(_) = graph_rx.changed()               => app.refresh_from_graph(),
+    _ = render_interval.tick(), if app.dirty => render(&app, &mut term); app.dirty = false,
 }
 ```
 
-Key design points:
-- **Dirty flag rendering**: only re-render when state has changed. New log entries set the dirty flag; the render tick picks it up. This prevents redundant renders when entries arrive faster than the frame rate.
-- **Input is never blocked**: terminal event handling runs independently of log ingestion. The user can always scroll, filter, or quit, even if logs are arriving at high volume.
-- **Backpressure**: if log entries arrive faster than the view can ingest them, the broadcast channel's lagged behavior drops old entries. The ring buffer in `OutputBuffer` provides the same safety net. The TUI should detect and surface lag: `(N entries dropped)`.
+Key points:
+
+- **Engine-driven state**: graph and log streams are the inputs. `app` holds a snapshot of derived state (sidebar entries, focus filter, log lines) rebuilt on the appropriate engine signal.
+- **Dirty-flag rendering**: only redraw on state change. Logs arriving faster than the frame rate set the flag once; the next tick picks it up.
+- **Input never blocks**: terminal events are independent of log/graph ingestion. The user can scroll, filter, kill, or quit even when output is pouring in.
+- **Backpressure**: `OutputBuffer` is a ring buffer, the broadcast channel drops old entries on lag. The TUI surfaces drops when it sees them.
 
 ## Open Questions
 
-These are things to figure out during implementation, not blockers:
+These are TUI-specific items that haven't earned a design pass yet:
 
-1. **Sidebar width**: fixed vs auto-sized to longest task name? Resizable by the user?
-2. **Mouse support**: click to select entry, click sidebar to toggle source, scroll wheel. Not first priority, but scroll and click would be significant QoL — worth doing before the UI is "done."
-3. **Horizontal scroll mechanism**: in truncated mode, how to reveal clipped content. Vim-style `h`/`l`? Arrow keys? Something else?
-4. **Theme/color configuration**: hardcode a sensible dark theme first, make configurable later? Current hardcoded colors (DarkGray cursor highlight, cyan/green/yellow/blue/magenta/red source palette) need validation across different terminal themes — they may look bad on light backgrounds. Design a color scheme system at some point.
-5. **Split views**: show two sources side-by-side instead of interleaved? Useful for comparing, but adds layout complexity. Defer to a later iteration?
-6. **Completed process accumulation**: if a task spawns hundreds of short-lived processes, the completed section of the sidebar could grow unwieldy. Cap? Collapse? Defer until it's a real problem.
-7. **Re-runs**: returning to the task picker and re-launching the same task. Clear previous state? Append to existing logs?
-8. **Selective expansion**: expand entries matching a pattern while keeping the rest truncated. Interaction model TBD.
-9. **Process detail panel**: Enter on a sidebar process entry opens a detail overlay showing full command, PID/PGID, status, CWD, source name, start time/duration. Live-polling `lsof -p <pid>` to show open sockets/listeners — extremely useful for service processes. Should also expose process controls (stop, restart, signal) directly from the detail view.
-10. **Command bar**: `:` opens a command input bar (same UI pattern as filter/search). Provides an extensible command surface without consuming keybindings. Initial commands: `:export` (dump visible log to file), `:export json` (JSON lines), `:quit`, `:clear` (clear log buffer), `:help`. Future: `:set wrap`, `:set raw`, `:set margin N`, etc.
-
-## Implementation Order
-
-Suggested sequence for incremental buildout:
-
-1. **App shell**: ratatui setup, event loop, terminal init/restore, quit handling. Empty screen with a status bar.
-2. **Process sidebar**: render task list with status, handle process lifecycle events. No log view yet.
-3. **Log viewer (basic)**: render entries from OutputBuffer, tail mode, basic scrolling (j/k, Ctrl-d/u, G).
-4. **Scroll refinement**: pinned vs tail mode, `+N new` indicator, smooth scrolling, viewport-based rendering.
-5. **Source filtering**: sidebar toggles, source colors, multi-source interleaving.
-6. **Filter bar**: live filtering with the existing `FilterExpr` engine, filter input mode.
-7. **Search**: `/` search, `n`/`N` navigation, match highlighting.
-8. **Entry detail**: expand a log entry to see all fields, raw text.
-9. **Process controls**: stop, restart, signal from sidebar.
-10. **Export**: dump to file, clipboard copy.
-11. **Task picker**: fuzzy-find activation UI.
+1. **Sidebar redesign**: with multiple tasks each spawning multiple processes, the entry list gets dense. Collapsing / grouping / a separate "completed" section all need real-use validation before locking down a layout.
+2. **Picker → argument form**: split layout for tasks that take args. Designed to fit; not built.
+3. **Keybinding redesign**: current scheme is a flat per-mode match. LazyGit / LazyDocker / k9s patterns (numbered pane focus, multi-stage menus, footer hints, `?` cheatsheet) are inspirations. See `open_issues.md`.
+4. **Theme/color configuration**: hardcoded dark theme today. Validate across terminal palettes; design a config system later.
+5. **Mouse support**: scroll, click-to-select, click-sidebar-to-toggle. Significant QoL.
+6. **Carriage-return progress output**: commands using `\r` to update a progress line in place produce garbled output today. See `open_issues.md`.
+7. **Per-task UI mode**: `UiHint` lets tasks declare a preferred mode; could also let them declare a TUI quit preference (auto-close on success, stay open). Probably subsumed by the existing mode hint in practice.

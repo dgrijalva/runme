@@ -5,7 +5,7 @@
 //! `IntoFuture`). Drop-without-spawn is a no-op — the drop-cancels
 //! semantics belong to `TaskHandle`, not to the builder.
 //!
-//! See `docs/plans/notes/architecture.md` §8.
+//! See `docs/runtime_engine_design.md` § Types — `TaskBuilder`.
 
 use std::future::IntoFuture;
 use std::pin::Pin;
