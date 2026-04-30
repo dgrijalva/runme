@@ -3,7 +3,6 @@ pub mod event;
 pub mod filter;
 pub mod frame;
 pub mod keys;
-pub mod output;
 pub mod picker;
 pub mod render;
 pub mod runner;
@@ -13,7 +12,6 @@ pub mod viewport;
 
 pub use app::{App, AppMode, AppState};
 pub use filter::FilterInputState;
-pub use output::{TuiOutput, TuiOutputHandle, TuiOutputStreamHandle};
 pub use picker::PickerState;
 pub use render::{DisplayMode, SourceColors};
 pub use runner::TaskStatus;

@@ -40,7 +40,6 @@ pub use crate::task::{
     ArgMetadataFn, DynamicTaskFn, Registry, SpawnEvent, StepGuard, TaskContext, TaskDef, TaskFn,
     TaskFnKind, TaskGuard, TaskInfo, TaskQuery, UiHint,
 };
-pub use crate::tui::output::{TuiOutput, TuiOutputHandle, TuiOutputStreamHandle};
 pub use crate::watch::{Watch, WatchInfo, WatchKind, glob_filter};
 pub use rnme_macros::cmd;
 pub use rnme_macros::init;

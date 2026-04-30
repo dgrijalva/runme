@@ -1330,10 +1330,6 @@ mod tests {
         assert!(results[0].is_err());
     }
 
-    // tui_wait/tui_output were removed in slice 2 of the multi-task runtime
-    // (per design decision 7). Tests for those APIs deleted along with the
-    // plumbing — see docs/plans/notes/architecture.md §2 migration table.
-
     #[tokio::test]
     async fn test_task_output_returns_output() {
         let ctx = TaskContext::new("test");
