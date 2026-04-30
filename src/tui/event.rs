@@ -381,6 +381,12 @@ fn handle_key(
         return;
     }
 
+    if state.mode == AppMode::KillMenu {
+        keys::handle_kill_menu_key(key, state);
+        state.dirty = true;
+        return;
+    }
+
     match key.code {
         KeyCode::Char('?') => {
             state.mode = AppMode::Help;
@@ -411,6 +417,14 @@ fn handle_key(
         KeyCode::Char('t') => {
             // Open the task picker overlay (decision 1 + 8). Re-entrant.
             state.open_picker();
+            return;
+        }
+        // `k`: open the kill submenu (design decision 4). Global trigger —
+        // works from either pane focus. The follow-up key (`k`/`9`/`a`)
+        // is handled in `handle_kill_menu_key`.
+        KeyCode::Char('k') => {
+            state.mode = AppMode::KillMenu;
+            state.dirty = true;
             return;
         }
         KeyCode::Tab => {
@@ -447,7 +461,11 @@ fn handle_mouse(
     }
     if matches!(
         state.mode,
-        AppMode::Help | AppMode::EntryDetail | AppMode::ProcessDetail | AppMode::CopyMenu
+        AppMode::Help
+            | AppMode::EntryDetail
+            | AppMode::ProcessDetail
+            | AppMode::CopyMenu
+            | AppMode::KillMenu
     ) {
         return;
     }

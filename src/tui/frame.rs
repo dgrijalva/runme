@@ -207,6 +207,7 @@ pub fn render_frame(
                     AppMode::EntryDetail => "DETAIL",
                     AppMode::ProcessDetail => "PROCESS",
                     AppMode::CopyMenu => "COPY",
+                    AppMode::KillMenu => "KILL",
                 }
             };
 
@@ -304,6 +305,11 @@ pub fn render_frame(
         // -- Copy menu overlay --
         if state.mode == AppMode::CopyMenu {
             render_copy_menu(frame, area);
+        }
+
+        // -- Kill menu overlay (design decision 4) --
+        if state.mode == AppMode::KillMenu {
+            render_kill_menu(frame, area);
         }
 
         // -- Entry detail overlay --
@@ -455,6 +461,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
             Span::styled("Restart task", desc),
         ]),
         Line::from(vec![
+            Span::raw("  k      "),
+            Span::styled("Kill menu (kk=TERM, k9=KILL, ka=all)", desc),
+        ]),
+        Line::from(vec![
             Span::raw("  q      "),
             Span::styled("Quit (prompts if tasks running)", desc),
         ]),
@@ -547,6 +557,62 @@ fn render_copy_menu(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     frame.render_widget(menu_paragraph, popup_area);
 }
 
+/// Render the kill menu overlay (design decision 4). Mirrors the copy
+/// menu visually — small centered popup listing the chord follow-ups.
+fn render_kill_menu(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::widgets::{Borders, Clear, Wrap};
+
+    let desc = Style::default().fg(THEME.dim);
+    let menu_text = vec![
+        Line::from(Span::styled(
+            "Kill Task",
+            Style::default()
+                .fg(THEME.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  k  "),
+            Span::styled("SIGTERM the focused task", desc),
+        ]),
+        Line::from(vec![
+            Span::raw("  9  "),
+            Span::styled("SIGKILL the focused task", desc),
+        ]),
+        Line::from(vec![
+            Span::raw("  a  "),
+            Span::styled("Terminate all tasks", desc),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("  Esc to cancel", desc)),
+    ];
+
+    let menu_height = (menu_text.len() + 2) as u16;
+    let menu_width = 40u16;
+
+    let x = area.width.saturating_sub(menu_width) / 2;
+    let y = area.height.saturating_sub(menu_height) / 2;
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + x,
+        area.y + y,
+        menu_width.min(area.width),
+        menu_height.min(area.height),
+    );
+
+    frame.render_widget(Clear, popup_area);
+
+    let menu_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME.accent))
+        .title(Span::styled(" Kill ", Style::default().fg(THEME.accent)));
+
+    let menu_paragraph = Paragraph::new(menu_text)
+        .block(menu_block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(menu_paragraph, popup_area);
+}
+
 /// Render the task picker as a centered overlay covering most of the
 /// screen. The Normal-mode shell (sidebar, log pane, status bar) stays
 /// visible behind it (decisions 1 + 8).
@@ -591,7 +657,7 @@ fn render_quit_confirm(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Quit anyway? [y/N]", desc)),
+        Line::from(Span::styled("[enter] quit  [esc] cancel", desc)),
     ];
 
     let modal_height = (modal_text.len() + 2) as u16;

@@ -16,14 +16,14 @@ use super::viewport::{
 /// Handle keys when sidebar is focused.
 pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
     match key.code {
-        // j / Down: move sidebar selection down, re-deriving the focus filter.
-        KeyCode::Char('j') | KeyCode::Down => {
+        // Down: move sidebar selection down, re-deriving the focus filter.
+        KeyCode::Down => {
             state.sidebar.move_down(state.sidebar_entries.len());
             state.refresh_focus_filter();
         }
 
-        // k / Up: move sidebar selection up, re-deriving the focus filter.
-        KeyCode::Char('k') | KeyCode::Up => {
+        // Up: move sidebar selection up, re-deriving the focus filter.
+        KeyCode::Up => {
             state.sidebar.move_up();
             state.refresh_focus_filter();
         }
@@ -89,8 +89,8 @@ pub(super) fn handle_log_viewer_key(
     source_labels: &HashMap<TaskId, String>,
 ) {
     match key.code {
-        // j / Down: move cursor to next entry
-        KeyCode::Char('j') | KeyCode::Down => {
+        // Down: move cursor to next entry
+        KeyCode::Down => {
             state.scroll = scroll_down(
                 &state.scroll,
                 filtered_entries,
@@ -103,8 +103,8 @@ pub(super) fn handle_log_viewer_key(
             );
         }
 
-        // k / Up: move cursor to previous entry
-        KeyCode::Char('k') | KeyCode::Up => {
+        // Up: move cursor to previous entry
+        KeyCode::Up => {
             state.scroll = scroll_up(
                 &state.scroll,
                 filtered_entries,
@@ -846,15 +846,15 @@ pub(super) fn navigate_to_entry(
 /// Handle keys in the quit-confirmation modal.
 ///
 /// Design decision 7: prompted only when tasks are still running.
-/// `y` confirms (running -> false; the outer driver calls `engine.quit()`
-/// when the event loop exits). Anything else dismisses.
+/// Enter confirms (running -> false; the outer driver calls `engine.quit()`
+/// when the event loop exits). Esc / anything else dismisses.
 pub(super) fn handle_quit_confirm_key(key: KeyEvent, state: &mut AppState) {
     match key.code {
-        KeyCode::Char('y') | KeyCode::Char('Y') => {
+        KeyCode::Enter => {
             state.quit_confirm = false;
             state.running = false;
         }
-        // n / N / Esc / anything else dismisses.
+        // Esc / anything else dismisses.
         _ => {
             state.quit_confirm = false;
         }
@@ -881,6 +881,150 @@ pub(super) fn handle_copy_menu_key(key: KeyEvent, state: &mut AppState) {
             state.mode = AppMode::Normal;
         }
     }
+}
+
+/// Handle keys in the kill menu overlay (design decision 4).
+///
+/// `k` SIGTERMs the focused task ("kk" = "kill this"); `9` SIGKILLs it;
+/// `a` SIGTERMs all direct children of root (`KillAll`). Any other key
+/// dismisses, mirroring the copy menu.
+///
+/// Async engine calls are fire-and-forget via `tokio::spawn` — the handler
+/// itself stays sync so it can be invoked from the event-loop key dispatch.
+pub(super) fn handle_kill_menu_key(key: KeyEvent, state: &mut AppState) {
+    use crate::execution::KillSignal;
+
+    match key.code {
+        // `kk` — SIGTERM the focused task.
+        KeyCode::Char('k') => {
+            kill_focused(state, KillSignal::Term);
+            state.mode = AppMode::Normal;
+        }
+        // `k9` — SIGKILL the focused task.
+        KeyCode::Char('9') => {
+            kill_focused(state, KillSignal::Kill);
+            state.mode = AppMode::Normal;
+        }
+        // `ka` — KillAll: cancel each direct child of root, root stays.
+        KeyCode::Char('a') => {
+            if let Some(handle) = state.engine.clone() {
+                tokio::spawn(async move {
+                    let _ = handle.kill_all().await;
+                });
+                state.notifications.push((
+                    "Killed all tasks".to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            state.mode = AppMode::Normal;
+        }
+        // Any other key dismisses the menu (mirror copy menu).
+        _ => {
+            state.mode = AppMode::Normal;
+        }
+    }
+}
+
+/// What the kill menu's `kk`/`k9` should target. Process entries get
+/// killed individually (just that process); task entries kill the whole
+/// task subtree via `engine.kill_task`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KillTarget {
+    Task(crate::execution::TaskId),
+    Process(crate::execution::TaskId),
+}
+
+/// Resolve the kill target from the current sidebar selection.
+///
+/// - `None` if the "All tasks" row (root) is selected, or selection is empty.
+///   Caller should treat as no-op + status hint.
+/// - For task entries (excluding root), returns `Task(entry.source)`.
+/// - For process entries, returns `Process(entry.source)` — the engine
+///   walks its table to find the owning task and signals just that
+///   process group.
+pub(super) fn resolve_kill_target(state: &AppState) -> Option<KillTarget> {
+    let entry = state.sidebar_entries.get(state.sidebar.selection)?;
+
+    // "All tasks" row points at root — never a valid kill target via `kk`/`k9`.
+    if let Some(handle) = state.engine.as_ref()
+        && entry.source == handle.root
+    {
+        return None;
+    }
+
+    if entry.is_task {
+        Some(KillTarget::Task(entry.source))
+    } else {
+        Some(KillTarget::Process(entry.source))
+    }
+}
+
+/// Fire-and-forget engine kill for whatever's focused in the sidebar.
+///
+/// Task entries dispatch to `engine.kill_task` (cancels the task subtree);
+/// process entries dispatch to `engine.kill_process` (signals just the
+/// individual process group, leaving sibling processes and the parent
+/// task running). Posts a notification reporting the action.
+///
+/// No-op (with a status hint) when "All tasks" is selected or when
+/// nothing resolves. Mirrors the kill semantics in design decision 4.
+fn kill_focused(state: &mut AppState, signal: crate::execution::KillSignal) {
+    use crate::execution::KillSignal;
+
+    let Some(target) = resolve_kill_target(state) else {
+        state.notifications.push((
+            "Select a task to kill, or use `ka` for all".to_string(),
+            std::time::Instant::now(),
+        ));
+        return;
+    };
+    let Some(handle) = state.engine.clone() else {
+        return;
+    };
+
+    // Stash a display name for the notification before spawning. For
+    // task targets we look up the matching task entry; for process
+    // targets we find the process entry by source.
+    let entry = state
+        .sidebar_entries
+        .iter()
+        .find(|e| {
+            e.source
+                == match target {
+                    KillTarget::Task(id) | KillTarget::Process(id) => id,
+                }
+        })
+        .cloned();
+    let name = entry
+        .as_ref()
+        .map(|e| e.name.clone())
+        .unwrap_or_else(|| match target {
+            KillTarget::Task(id) => format!("task {}", id.0),
+            KillTarget::Process(id) => format!("process {}", id.0),
+        });
+
+    let signal_label = match signal {
+        KillSignal::Term => "SIGTERM",
+        KillSignal::Kill => "SIGKILL",
+    };
+
+    match target {
+        KillTarget::Task(id) => {
+            tokio::spawn(async move {
+                let _ = handle.kill_task(id, signal).await;
+            });
+        }
+        KillTarget::Process(id) => {
+            tokio::spawn(async move {
+                let _ = handle.kill_process(id, signal).await;
+            });
+        }
+    }
+
+    state.notifications.push((
+        format!("Sent {} to {}", signal_label, name),
+        std::time::Instant::now(),
+    ));
 }
 
 /// Copy all entries currently visible on screen (viewport) to clipboard via OSC 52.
@@ -1032,7 +1176,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_jk_moves_selection() {
+    fn sidebar_arrows_move_selection() {
         let mut state = AppState::new();
         state.sidebar.focused = true;
         state.sidebar_entries = vec![
@@ -1067,24 +1211,24 @@ mod tests {
 
         assert_eq!(state.sidebar.selection, 0);
         handle_sidebar_key(
-            make_key_event(KeyCode::Char('j'), KeyModifiers::NONE),
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
             &mut state,
         );
         assert_eq!(state.sidebar.selection, 1);
         handle_sidebar_key(
-            make_key_event(KeyCode::Char('j'), KeyModifiers::NONE),
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
             &mut state,
         );
         assert_eq!(state.sidebar.selection, 2);
         // Clamp at max
         handle_sidebar_key(
-            make_key_event(KeyCode::Char('j'), KeyModifiers::NONE),
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
             &mut state,
         );
         assert_eq!(state.sidebar.selection, 2);
         // Move back up
         handle_sidebar_key(
-            make_key_event(KeyCode::Char('k'), KeyModifiers::NONE),
+            make_key_event(KeyCode::Up, KeyModifiers::NONE),
             &mut state,
         );
         assert_eq!(state.sidebar.selection, 1);
@@ -1674,11 +1818,11 @@ mod tests {
     // -- Quit-confirm modal tests --
 
     #[test]
-    fn quit_confirm_y_quits() {
+    fn quit_confirm_enter_quits() {
         let mut state = AppState::new();
         state.quit_confirm = true;
         handle_quit_confirm_key(
-            make_key_event(KeyCode::Char('y'), KeyModifiers::NONE),
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
             &mut state,
         );
         assert!(!state.quit_confirm);
@@ -1686,18 +1830,7 @@ mod tests {
     }
 
     #[test]
-    fn quit_confirm_uppercase_y_quits() {
-        let mut state = AppState::new();
-        state.quit_confirm = true;
-        handle_quit_confirm_key(
-            make_key_event(KeyCode::Char('Y'), KeyModifiers::NONE),
-            &mut state,
-        );
-        assert!(!state.running);
-    }
-
-    #[test]
-    fn quit_confirm_n_dismisses() {
+    fn quit_confirm_other_key_dismisses() {
         let mut state = AppState::new();
         state.quit_confirm = true;
         handle_quit_confirm_key(
@@ -1715,5 +1848,138 @@ mod tests {
         handle_quit_confirm_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
         assert!(!state.quit_confirm);
         assert!(state.running);
+    }
+
+    // -- Kill menu tests --
+
+    fn make_task_entry(name: &str, id: TaskId) -> SidebarEntry {
+        SidebarEntry {
+            name: name.to_string(),
+            source: id,
+            status_tag: "RUN".to_string(),
+            status_color: Color::Green,
+            visible: true,
+            is_task: true,
+            depth: 0,
+        }
+    }
+
+    fn make_proc_entry(name: &str, id: TaskId) -> SidebarEntry {
+        SidebarEntry {
+            name: name.to_string(),
+            source: id,
+            status_tag: "RUN".to_string(),
+            status_color: Color::Green,
+            visible: true,
+            is_task: false,
+            depth: 1,
+        }
+    }
+
+    #[test]
+    fn kill_menu_esc_dismisses() {
+        let mut state = AppState::new();
+        state.mode = AppMode::KillMenu;
+        handle_kill_menu_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn kill_menu_unknown_key_dismisses() {
+        // Mirror copy menu: any unrecognized key closes the menu.
+        let mut state = AppState::new();
+        state.mode = AppMode::KillMenu;
+        handle_kill_menu_key(
+            make_key_event(KeyCode::Char('z'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn kill_menu_kk_returns_to_normal() {
+        // Without an engine, `kk` is still safe — just no async dispatch.
+        let mut state = AppState::new();
+        state.mode = AppMode::KillMenu;
+        state.sidebar_entries = vec![make_task_entry("api", TaskId(2))];
+        state.sidebar.selection = 0;
+        handle_kill_menu_key(
+            make_key_event(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn kill_menu_k9_returns_to_normal() {
+        let mut state = AppState::new();
+        state.mode = AppMode::KillMenu;
+        state.sidebar_entries = vec![make_task_entry("api", TaskId(2))];
+        state.sidebar.selection = 0;
+        handle_kill_menu_key(
+            make_key_event(KeyCode::Char('9'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn kill_menu_ka_returns_to_normal() {
+        let mut state = AppState::new();
+        state.mode = AppMode::KillMenu;
+        handle_kill_menu_key(
+            make_key_event(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn kill_menu_kk_with_no_selection_posts_hint() {
+        // No engine + no entries: resolve_kill_target returns None,
+        // kill_focused posts a hint notification rather than panicking.
+        let mut state = AppState::new();
+        state.mode = AppMode::KillMenu;
+        let initial_notifs = state.notifications.len();
+        handle_kill_menu_key(
+            make_key_event(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.mode, AppMode::Normal);
+        assert!(state.notifications.len() > initial_notifs);
+    }
+
+    #[test]
+    fn resolve_kill_target_task_entry() {
+        // Selecting a task entry should resolve to KillTarget::Task with
+        // the entry's id (engine-less: the root check short-circuits via
+        // handle absence).
+        let mut state = AppState::new();
+        state.sidebar_entries = vec![make_task_entry("api", TaskId(7))];
+        state.sidebar.selection = 0;
+        assert_eq!(
+            resolve_kill_target(&state),
+            Some(KillTarget::Task(TaskId(7)))
+        );
+    }
+
+    #[test]
+    fn resolve_kill_target_process_entry() {
+        // Process entries now resolve to KillTarget::Process — the
+        // engine signals just that process group, not its parent task.
+        let mut state = AppState::new();
+        state.sidebar_entries = vec![make_proc_entry("echo hello", TaskId(9))];
+        state.sidebar.selection = 0;
+        assert_eq!(
+            resolve_kill_target(&state),
+            Some(KillTarget::Process(TaskId(9)))
+        );
+    }
+
+    #[test]
+    fn resolve_kill_target_empty_selection_is_none() {
+        let state = AppState::new();
+        // No sidebar_entries — selection out of bounds.
+        assert_eq!(resolve_kill_target(&state), None);
     }
 }

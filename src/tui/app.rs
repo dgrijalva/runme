@@ -47,6 +47,8 @@ pub enum AppMode {
     ProcessDetail,
     /// Copy menu overlay (choose what to copy)
     CopyMenu,
+    /// Kill menu overlay (terminate task — `k` chord; design decision 4)
+    KillMenu,
 }
 
 /// Core application state, shared across the event loop and rendering.

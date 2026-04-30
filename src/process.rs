@@ -342,7 +342,6 @@ async fn drain_records_async(
 /// ctx.exec(cmd!(build)).await?;
 /// ```
 pub struct ProcessHandle {
-    child: tokio::process::Child,
     /// Unique id for this process in the unified task-id space. Allocated
     /// at spawn time; routed onto every `LogEntry` for this process and
     /// surfaced via `SpawnEvent` so the engine can register it as a leaf
@@ -351,11 +350,26 @@ pub struct ProcessHandle {
     task_name: String,
     command_label: String,
     pgid: Option<i32>,
+    /// The OS pid, captured at spawn. Stable for the handle's lifetime
+    /// (the reaper task owns the `tokio::process::Child` so we can't
+    /// query it via the Child after spawn).
+    pid: Option<u32>,
     /// The output buffer for this process (private — use `.output()` to access).
     buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
     /// Background tasks reading stdout/stderr
     _stdout_task: Option<tokio::task::JoinHandle<()>>,
     _stderr_task: Option<tokio::task::JoinHandle<()>>,
+    /// Receives the child's exit status from the reaper task. Owned by
+    /// the handle until `wait()` / `stop()` consumes it. The reaper task
+    /// owns the `tokio::process::Child` and calls `child.wait().await`,
+    /// publishing the result here. This guarantees zombies are reaped
+    /// promptly even when the user never calls `wait()` on the handle —
+    /// the engine's exit watcher (signal-0 polling) then sees the pid
+    /// disappear and updates process status. Wrapped in a `tokio::sync`
+    /// mutex so peek-style methods (`is_running`) can use `try_recv`
+    /// behind a shared `&self` while `wait`/`stop` consume on `&mut self`.
+    result_rx:
+        Option<tokio::sync::oneshot::Receiver<Result<std::process::ExitStatus, std::io::Error>>>,
     /// Readiness state — `true` when the readiness probe has succeeded.
     readiness_rx: tokio::sync::watch::Receiver<bool>,
     /// Background readiness probe task (if configured).
@@ -377,12 +391,20 @@ impl ProcessHandle {
     pub fn signal(&self, sig: Signal) -> Result<(), ProcessError> {
         if let Some(pgid) = self.pgid {
             killpg(Pid::from_raw(pgid), Some(sig)).map_err(ProcessError::Signal)
-        } else if let Some(id) = self.child.id() {
+        } else if let Some(pid) = self.pid {
             // Fallback: signal the child directly
-            killpg(Pid::from_raw(id as i32), Some(sig)).map_err(ProcessError::Signal)
+            killpg(Pid::from_raw(pid as i32), Some(sig)).map_err(ProcessError::Signal)
         } else {
-            Ok(()) // Process already exited
+            Ok(()) // Process already exited / never had a pid
         }
+    }
+
+    /// Await the reaper's exit-status publication. Returns `None` if the
+    /// receiver has already been consumed by a previous `wait()`/`stop()`,
+    /// or if the reaper task panicked before publishing.
+    async fn await_reaper(&mut self) -> Option<Result<std::process::ExitStatus, std::io::Error>> {
+        let rx = self.result_rx.take()?;
+        rx.await.ok()
     }
 
     /// Graceful shutdown: send SIGTERM, wait for the timeout, then SIGKILL if still alive.
@@ -390,29 +412,46 @@ impl ProcessHandle {
         // Caller is taking ownership of process termination — disarm
         // the Drop signal so we don't double-signal.
         self.armed = false;
-        // Send SIGTERM to the process group
+        // Send SIGTERM to the process group; the reaper will publish
+        // the eventual exit status on the oneshot.
         let _ = self.signal(Signal::SIGTERM);
 
-        // Wait for the process to exit within the timeout
-        match tokio::time::timeout(timeout, self.child.wait()).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(ProcessError::Wait(e)),
+        // Take the receiver up-front; if it's already gone, the process
+        // has already been waited on.
+        let Some(rx) = self.result_rx.take() else {
+            return Ok(());
+        };
+
+        // Wait for the reaper to publish, up to the SIGTERM timeout.
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(_status))) => Ok(()),
+            Ok(Ok(Err(e))) => Err(ProcessError::Wait(e)),
+            Ok(Err(_)) => Ok(()), // sender dropped without sending — treat as exited
             Err(_) => {
-                // Timeout: send SIGKILL
+                // Timeout: SIGKILL the group, but we no longer have the
+                // receiver to await on. Give it a moment to die; rely on
+                // the reaper running to completion (the kernel will
+                // collect the zombie via the reaper's `child.wait()`).
                 let _ = self.signal(Signal::SIGKILL);
-                // Give it a moment to die
-                match tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await {
-                    Ok(Ok(_)) => Ok(()),
-                    Ok(Err(e)) => Err(ProcessError::Wait(e)),
-                    Err(_) => Err(ProcessError::Timeout),
-                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok(())
             }
         }
     }
 
     /// Check if the process is still running.
+    ///
+    /// Peeks the reaper's oneshot without consuming it: if no value has
+    /// been sent yet, the process is still alive (the reaper publishes
+    /// only after `child.wait()` returns).
     pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        match self.result_rx.as_mut() {
+            None => false,
+            Some(rx) => matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+        }
     }
 
     /// Wait for the process to exit and return the result.
@@ -422,9 +461,9 @@ impl ProcessHandle {
     /// signal anything.
     pub async fn wait(&mut self) -> ProcessResult {
         self.armed = false;
-        let termination = match self.child.wait().await {
-            Ok(status) => Termination::from_exit_status(status),
-            Err(_) => Termination::Exited(-1),
+        let termination = match self.await_reaper().await {
+            Some(Ok(status)) => Termination::from_exit_status(status),
+            _ => Termination::Exited(-1),
         };
         ProcessResult {
             termination,
@@ -458,9 +497,12 @@ impl ProcessHandle {
         self.pgid
     }
 
-    /// Get the child's PID if still running.
+    /// Get the child's PID. Stable for the handle's lifetime — captured
+    /// at spawn time and unchanged by the process exiting (since the
+    /// reaper task owns the underlying `tokio::process::Child`, not the
+    /// handle).
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.pid
     }
 
     /// Whether the process's readiness probe has succeeded.
@@ -498,8 +540,8 @@ impl Drop for ProcessHandle {
         // Try the process group first; fall back to the pid if no pgid.
         if let Some(pgid) = self.pgid {
             let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGTERM));
-        } else if let Some(id) = self.child.id() {
-            let _ = killpg(Pid::from_raw(id as i32), Some(Signal::SIGTERM));
+        } else if let Some(pid) = self.pid {
+            let _ = killpg(Pid::from_raw(pid as i32), Some(Signal::SIGTERM));
         }
     }
 }
@@ -669,7 +711,8 @@ pub async fn spawn(
 
     let mut child = build_command(cmd).spawn().map_err(ProcessError::Spawn)?;
 
-    let pgid = child.id().map(|id| id as i32);
+    let pid = child.id();
+    let pgid = pid.map(|id| id as i32);
 
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
@@ -749,15 +792,32 @@ pub async fn spawn(
     let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(true);
     drop(readiness_tx); // No probe needed
 
+    // Reaper task: owns the `Child` from here on. Awaits `child.wait()`
+    // and publishes the exit status on a oneshot. This guarantees the
+    // kernel reaps the child as soon as it exits — without it, a zombie
+    // sticks around until something else (typically a user-side `wait`
+    // / `complete`) calls into `Child::wait`. The engine's exit watcher
+    // (signal-0 polling) needs the kernel to clear the pid before it
+    // can flip status from Running to Done.
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = child.wait().await;
+        // Receiver may have been dropped (e.g. handle dropped without
+        // wait()) — that's expected; the result is then discarded.
+        let _ = result_tx.send(result);
+        // `child` drops here, but `wait()` already reaped it.
+    });
+
     Ok(ProcessHandle {
-        child,
         id: process_id,
         task_name: task_name.to_string(),
         command_label: task_name.to_string(),
         pgid,
+        pid,
         buffer,
         _stdout_task: Some(stdout_task),
         _stderr_task: Some(stderr_task),
+        result_rx: Some(result_rx),
         readiness_rx,
         _readiness_task: None,
         armed: true,
@@ -1109,6 +1169,45 @@ mod tests {
             "process group {} should be dead after handle drop",
             pgid,
         );
+    }
+
+    #[tokio::test]
+    async fn reaper_publishes_exit_status() {
+        // The spawn pipeline starts a reaper task that owns the
+        // tokio::process::Child and calls `child.wait()` on it. As soon
+        // as the OS process exits, the reaper reaps it and the kernel
+        // releases the pid — even if nobody calls `.wait()` /
+        // `.complete()` on the handle. This test verifies that
+        // `kill(pid, 0)` returns ESRCH within a reasonable timeout
+        // after a short-lived process exits, with the handle dropped
+        // (but never awaited).
+        use nix::sys::signal::kill;
+
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let handle = spawn("sh -c 'exit 0'", "test", buffer).await.unwrap();
+        let pid = handle.pid().expect("should have a pid") as i32;
+
+        // Drop the handle without consuming. The Drop impl SIGTERMs an
+        // armed handle — but the process is already exiting on its own
+        // (`exit 0`), so SIGTERM is harmless. The reaper runs to
+        // completion regardless and `child.wait()` reaps the zombie.
+        drop(handle);
+
+        // Poll `kill(pid, 0)` — returns Ok while the process record
+        // exists (alive or zombie), Err once the kernel has cleared it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if kill(Pid::from_raw(pid), None).is_err() {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "pid {} still present after reaper deadline; reaper not reaping",
+                    pid
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     #[tokio::test]

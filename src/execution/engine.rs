@@ -12,6 +12,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use nix::sys::signal;
+use nix::unistd::Pid;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
@@ -22,7 +24,7 @@ use crate::task::{Registry, TaskDef};
 
 use super::TaskId;
 use super::control::{Control, EngineError, KillSignal, SpawnOptions};
-use super::execution::{ProcessInfo, TaskExecution, TaskStatus};
+use super::execution::{ProcessInfo, ProcessStatus, TaskExecution, TaskStatus};
 use super::handle::TaskHandle;
 use super::root::ROOT_TASK;
 
@@ -438,6 +440,89 @@ impl EngineInternals {
         }
         self.publish_snapshot().await;
     }
+
+    /// Send a signal to a single spawned process, identified by its
+    /// `TaskId` in the unified id space. Walks `table` to find the
+    /// owning `TaskExecution`.
+    ///
+    /// - `KillSignal::Term`: SIGTERM, then poll for exit every 50ms up
+    ///   to `CANCEL_TIMEOUT`, fall back to SIGKILL on any survivor.
+    /// - `KillSignal::Kill`: SIGKILL immediately.
+    ///
+    /// Does **not** touch task status. The 250ms `monitor_spawns`
+    /// signal-0 watcher detects the exit and updates the process's
+    /// status + publishes a snapshot.
+    ///
+    /// No-op if the process can't be found (already exited, wrong id,
+    /// or not yet registered).
+    pub async fn kill_process(self: &Arc<Self>, process_id: TaskId, signal: KillSignal) {
+        // Find which TaskExecution owns this process and capture its
+        // pgid/pid in one async lock pass to keep critical sections small.
+        let target: Option<(Option<i32>, Option<u32>)> = {
+            let entries: Vec<Arc<TaskExecution>> = {
+                let table = self.table.lock().expect("engine table poisoned");
+                table.values().cloned().collect()
+            };
+            let mut found = None;
+            for exec in entries {
+                let procs = exec.processes().lock().await;
+                if let Some(proc) = procs.iter().find(|p| p.id == process_id) {
+                    if proc.status != ProcessStatus::Running {
+                        return;
+                    }
+                    found = Some((proc.pgid, proc.pid));
+                    break;
+                }
+            }
+            found
+        };
+
+        let Some((pgid, pid)) = target else {
+            return;
+        };
+
+        // Helper: send the given signal to pgid (preferred) or pid (fallback).
+        let send = |sig: signal::Signal| {
+            if let Some(pgid) = pgid {
+                let _ = signal::killpg(Pid::from_raw(pgid), Some(sig));
+            } else if let Some(pid) = pid {
+                let _ = signal::kill(Pid::from_raw(pid as i32), Some(sig));
+            }
+        };
+
+        // Helper: probe whether the target is still alive (signal-0).
+        let alive = || -> bool {
+            if let Some(pgid) = pgid {
+                signal::killpg(Pid::from_raw(pgid), None).is_ok()
+            } else if let Some(pid) = pid {
+                signal::kill(Pid::from_raw(pid as i32), None).is_ok()
+            } else {
+                false
+            }
+        };
+
+        match signal {
+            KillSignal::Kill => {
+                send(signal::Signal::SIGKILL);
+            }
+            KillSignal::Term => {
+                send(signal::Signal::SIGTERM);
+                let deadline = tokio::time::Instant::now() + CANCEL_TIMEOUT;
+                loop {
+                    if !alive() {
+                        return;
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                if alive() {
+                    send(signal::Signal::SIGKILL);
+                }
+            }
+        }
+    }
 }
 
 /// The engine. Owns the synthetic root, the table, the log store, and
@@ -499,6 +584,24 @@ impl EngineHandle {
             .send(Control::KillAll { reply: tx })
             .map_err(|_| EngineError::ShuttingDown)?;
         rx.await.map_err(|_| EngineError::ShuttingDown)?
+    }
+
+    /// Send a signal to a single spawned process by its `TaskId`.
+    ///
+    /// Calls `EngineInternals::kill_process` directly — process kills do
+    /// not need to be serialized through the root body's control loop
+    /// (no graph mutation, no task lifecycle change). The 250ms
+    /// `monitor_spawns` watcher detects the resulting exit and updates
+    /// the process status / publishes a snapshot.
+    ///
+    /// No-op if the process is not found or already exited.
+    pub async fn kill_process(
+        &self,
+        process_id: TaskId,
+        signal: KillSignal,
+    ) -> Result<(), EngineError> {
+        self.internals.kill_process(process_id, signal).await;
+        Ok(())
     }
 
     /// Shut down the runtime: cancel root subtree, then root body returns.
@@ -734,6 +837,28 @@ mod tests {
         })
     }
 
+    /// Task body that spawns a real long-running child process and then
+    /// waits indefinitely. Used by `kill_process_*` tests to exercise
+    /// per-process signalling without taking down the parent task.
+    ///
+    /// The handle is held but not awaited — `process::spawn`'s reaper
+    /// task owns the underlying `tokio::process::Child` and reaps it as
+    /// soon as it exits, so the engine's signal-0 exit watcher sees the
+    /// death promptly even though this body never calls `wait()`.
+    fn spawner_task<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move {
+            let _handle = ctx
+                .spawn("sleep 60")
+                .await
+                .map_err(|e| crate::error::TaskError::from(format!("spawn failed: {e}")))?;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        })
+    }
+
     static OK: TaskDef = TaskDef {
         name: "ok",
         description: None,
@@ -748,6 +873,15 @@ mod tests {
         description: None,
         group: "",
         func: TaskFnKind::Static(slow_task),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
+    static SPAWNER: TaskDef = TaskDef {
+        name: "spawner",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(spawner_task),
         arg_metadata: no_args,
         ui_hint: None,
     };
@@ -930,6 +1064,92 @@ mod tests {
             "root must stay alive after kill_all; got {:?}",
             root_node.status
         );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn kill_process_signals_pgid_and_leaves_task_running() {
+        let registry = build_registry(&[&SPAWNER]);
+        let (engine, handle) = Engine::start(registry);
+
+        let task_id = handle
+            .spawn_task(&SPAWNER, vec![])
+            .await
+            .expect("spawn_task should succeed");
+
+        // Wait for the child process to register in the graph.
+        let process_id = {
+            let mut graph = handle.graph.clone();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let snap = graph.borrow().clone();
+                if let Some(node) = snap.tasks.get(&task_id)
+                    && let Some(proc) = node.processes.first()
+                {
+                    break proc.id;
+                }
+                tokio::select! {
+                    _ = graph.changed() => {}
+                    _ = tokio::time::sleep_until(deadline) => {
+                        panic!("spawned process never registered in graph");
+                    }
+                }
+            }
+        };
+
+        // SIGTERM the process. Engine walks the table, finds the owning
+        // task, signals the pgid. monitor_spawns' 250ms watcher then
+        // detects the exit and republishes the snapshot.
+        handle
+            .kill_process(process_id, KillSignal::Term)
+            .await
+            .expect("kill_process should succeed");
+
+        // Wait for the process to flip to a non-Running status.
+        let mut graph = handle.graph.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let snap = graph.borrow().clone();
+            if let Some(node) = snap.tasks.get(&task_id)
+                && let Some(proc) = node.processes.iter().find(|p| p.id == process_id)
+                && proc.status != ProcessStatus::Running
+            {
+                break;
+            }
+            tokio::select! {
+                _ = graph.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("process never exited after kill_process");
+                }
+            }
+        }
+
+        // Parent task must still be alive (not Cancelled) — kill_process
+        // only signals the process, not the task.
+        let snap = handle.graph.borrow().clone();
+        let task_node = snap.tasks.get(&task_id).expect("task in graph");
+        assert!(
+            !matches!(task_node.status, TaskStatus::Cancelled),
+            "task must stay alive after kill_process; got {:?}",
+            task_node.status
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn kill_process_unknown_id_is_noop() {
+        let registry = build_registry(&[]);
+        let (engine, handle) = Engine::start(registry);
+
+        // Use an arbitrary id that won't match any process.
+        handle
+            .kill_process(TaskId(99_999), KillSignal::Term)
+            .await
+            .expect("kill_process on unknown id should still return Ok");
 
         let _ = handle.quit().await;
         engine.shutdown().await;
