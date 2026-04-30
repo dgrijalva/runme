@@ -64,7 +64,7 @@ fn resolve_field(field: &FieldPath, entry: &LogEntry) -> Vec<String> {
         "level" => return entry.level.iter().cloned().collect(),
         "message" => return entry.message.iter().cloned().collect(),
         "timestamp" => return entry.timestamp.iter().cloned().collect(),
-        "source" => return vec![entry.source.clone()],
+        "source" => return vec![entry.source.to_string()],
         "raw" => return vec![entry.raw.clone()],
         _ => {}
     }

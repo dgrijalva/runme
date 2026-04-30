@@ -9,8 +9,7 @@
 use std::collections::HashMap;
 use std::future::IntoFuture;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot, watch};
@@ -30,6 +29,26 @@ use super::root::ROOT_TASK;
 /// Cancel ladder timeout — used as the per-step grace period in
 /// `cancel_task_with` and as the default `kill_timeout`.
 pub(crate) const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Install the global `tracing` subscriber. Exactly one install site in
+/// the codebase. The subscriber is a single `LogEntryLayer` that reads
+/// `TASK_TRACING_CTX` (set by `spawn_body` for each task) to route events
+/// to the right buffer with the right `TaskId`. Idempotent across
+/// multiple `Engine::start` calls (a `Once` gates the install).
+fn install_global_tracing_subscriber() {
+    use std::sync::Once;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::Registry;
+
+    use crate::tracing_layer::LogEntryLayer;
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let subscriber = Registry::default().with(LogEntryLayer::new());
+        let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
+        let _ = tracing::dispatcher::set_global_default(dispatch);
+    });
+}
 
 /// A single immutable snapshot of the task graph.
 ///
@@ -71,6 +90,8 @@ pub struct TaskNode {
 /// state.
 #[derive(Clone)]
 pub struct ProcessNodeInfo {
+    /// Unique id in the unified TaskId space (arch.md decision 22).
+    pub id: TaskId,
     pub task_name: String,
     pub command_label: String,
     pub pid: Option<u32>,
@@ -82,6 +103,7 @@ pub struct ProcessNodeInfo {
 impl ProcessNodeInfo {
     fn from_process(info: &ProcessInfo) -> Self {
         Self {
+            id: info.id,
             task_name: info.task_name.clone(),
             command_label: info.command_label.clone(),
             pid: info.pid,
@@ -96,7 +118,11 @@ impl ProcessNodeInfo {
 /// `EngineHandle`'s methods (which serialize into Control messages).
 pub struct EngineInternals {
     pub root: Arc<TaskExecution>,
-    pub table: Mutex<HashMap<TaskId, Arc<TaskExecution>>>,
+    /// Task table, keyed by `TaskId`. Uses a `std::sync::Mutex` so
+    /// `spawn_child` can register synchronously before the body runs —
+    /// otherwise `lookup(id)` would race with the just-spawned tokio task.
+    /// Critical sections are tiny (insert/remove/clone-out an Arc).
+    pub table: StdMutex<HashMap<TaskId, Arc<TaskExecution>>>,
     pub graph_tx: watch::Sender<GraphSnapshot>,
     pub log_store: Arc<Mutex<LogStore>>,
     pub(crate) control_tx: mpsc::UnboundedSender<Control>,
@@ -104,24 +130,24 @@ pub struct EngineInternals {
     /// `Engine::start`; the root body takes it on first run.
     pub(crate) control_rx_slot: Mutex<Option<mpsc::UnboundedReceiver<Control>>>,
     pub registry: Arc<Registry>,
-    /// Engine-canonical tracing-installed flag. Shared with each
-    /// `TaskExecution` via the existing `set_tracing_installed` setter
-    /// at spawn_body time.
-    pub tracing_installed: Arc<AtomicBool>,
 }
 
 impl EngineInternals {
     /// Look up a task by id. Includes the synthetic root at `TaskId::ROOT`.
-    pub async fn lookup(&self, id: TaskId) -> Option<Arc<TaskExecution>> {
-        self.table.lock().await.get(&id).cloned()
+    pub fn lookup(&self, id: TaskId) -> Option<Arc<TaskExecution>> {
+        self.table.lock().expect("engine table poisoned").get(&id).cloned()
     }
 
     /// Walk `table` and broadcast a fresh `GraphSnapshot`. Best-effort —
-    /// uses async locks but never blocks longer than briefly.
+    /// briefly holds the (sync) table mutex while cloning Arcs, then uses
+    /// async locks for status/children/processes.
     pub async fn publish_snapshot(&self) {
-        let table = self.table.lock().await;
-        let mut tasks = HashMap::with_capacity(table.len());
-        for (id, exec) in table.iter() {
+        let snapshot_entries: Vec<(TaskId, Arc<TaskExecution>)> = {
+            let table = self.table.lock().expect("engine table poisoned");
+            table.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+        let mut tasks = HashMap::with_capacity(snapshot_entries.len());
+        for (id, exec) in snapshot_entries {
             let status = exec.task_status().lock().await.clone();
             let kids: Vec<TaskId> = exec
                 .children
@@ -138,9 +164,9 @@ impl EngineInternals {
                 .map(ProcessNodeInfo::from_process)
                 .collect();
             tasks.insert(
-                *id,
+                id,
                 TaskNode {
-                    id: *id,
+                    id,
                     name: exec.task_name.clone(),
                     parent: exec.parent,
                     children: kids,
@@ -163,6 +189,12 @@ impl EngineInternals {
     /// `args` and per-invocation `opts`. Returns the handle synchronously
     /// after the body's tokio task is spawned. Sets up the timeout
     /// watchdog if `opts.timeout.is_some()` (arch.md §11).
+    ///
+    /// Registration (table insert + parent's `children` push) happens
+    /// **synchronously, before** `spawn_body` launches. This eliminates
+    /// the race where `lookup(id)` could return `None` for a task whose
+    /// body had already started running — which used to be observable
+    /// from `ctx.run` chains and from the cancel ladder.
     pub fn spawn_child(
         self: &Arc<Self>,
         parent_id: TaskId,
@@ -171,16 +203,13 @@ impl EngineInternals {
         opts: SpawnOptions,
     ) -> Result<TaskHandle, TaskError> {
         let id = TaskId::next();
-
-        // Build the new execution. Engine-aware constructor wires the
-        // monitor_spawns loop with our weak so process events publish
-        // snapshots automatically.
         let log_store = self.log_store.clone();
         let engine_weak = Arc::downgrade(self);
 
-        // Prepare the registry on the exec before launch (mirrors
-        // legacy launch).
-        let new_exec = {
+        // Build the execution and wrap in Arc::new_cyclic so the body's
+        // TaskContext holds a Weak<TaskExecution> back to its own node
+        // (for `ctx.run` → parent.children attachment).
+        let exec_arc = {
             let mut e = TaskExecution::with_log_store_and_engine(
                 id,
                 log_store,
@@ -188,63 +217,54 @@ impl EngineInternals {
             );
             e.parent = Some(parent_id);
             e.set_registry(self.registry.clone());
-            // Engine-canonical tracing flag: share with this exec via
-            // the existing setter. Only one global subscriber install
-            // ever happens because the AtomicBool is shared.
-            e.set_tracing_installed(self.tracing_installed.clone());
-            e
+            Arc::new_cyclic(|self_weak| {
+                let mut e = e;
+                // Synchronous registration BEFORE spawn_body, so that any
+                // immediate observation (lookup, snapshot, cancel ladder)
+                // sees a consistent table.
+                e.spawn_body(self_weak.clone(), engine_weak.clone(), def, args);
+                e
+            })
         };
 
-        // `Arc::new_cyclic` so the body can hold a `Weak<TaskExecution>`
-        // pointing at the freshly-built node (for `ctx.run` → child
-        // attachment).
-        let exec_arc = Arc::new_cyclic(|self_weak| {
-            let mut e = new_exec;
-            e.spawn_body(self_weak.clone(), engine_weak.clone(), def, args);
-            e
-        });
-
-        // Register in the table and on the parent's children list.
-        // Both happen on the runtime so we can hold an async lock; we
-        // do this synchronously by spawning a task — but that creates a
-        // race with the just-launched body. Instead, hold a parking
-        // operation: we use blocking_lock in a tokio::task::block_in_place
-        // — but block_in_place requires a multi_thread runtime. Cleanest:
-        // do the registration after spawn_body using a tokio::spawn that
-        // runs immediately, and gate snapshot publish on it.
-        //
-        // Practical approach: do the locks via try_lock; they should be
-        // uncontended at this point because no other code holds them.
-        // Fall back to spawning a task if try_lock fails (shouldn't in
-        // practice).
-        let to_register = exec_arc.clone();
-        let parent_for_link = if parent_id != TaskId::ROOT
-            || self.root.id == TaskId::ROOT
+        // Insert into the table and onto the parent's children list,
+        // synchronously. The table mutex is sync (`std::sync::Mutex`);
+        // children is async but uncontested at this point — `try_lock`
+        // would always succeed but we defer to a brief blocking-on-async
+        // trick: since `spawn_body` already pushed a tokio task and may
+        // have triggered no other accesses, we hold the std mutex here
+        // and push to children via a same-task `try_lock` retry loop.
         {
-            // Look up the parent. Handled below.
-            Some(parent_id)
-        } else {
-            None
-        };
+            let mut table = self.table.lock().expect("engine table poisoned");
+            table.insert(id, exec_arc.clone());
+        }
+        // For parent.children: try_lock first; if contended (rare —
+        // only the cancel-ladder walker would hold it), fall back to a
+        // brief detached task. Either way, the new node is already in
+        // `table`, so `lookup(id)` works immediately.
+        if let Some(parent) = self.lookup(parent_id) {
+            match parent.children.try_lock() {
+                Ok(mut kids) => kids.push(exec_arc.clone()),
+                Err(_) => {
+                    let parent_clone = parent.clone();
+                    let to_register = exec_arc.clone();
+                    tokio::spawn(async move {
+                        parent_clone.children.lock().await.push(to_register);
+                    });
+                }
+            }
+        }
+        // Publish snapshot in the background — best-effort; uses async
+        // locks for the per-node fields.
         let engine_clone = self.clone();
         tokio::spawn(async move {
-            // Insert into table.
-            engine_clone
-                .table
-                .lock()
-                .await
-                .insert(to_register.id, to_register.clone());
-            // Push onto parent's children list.
-            if let Some(pid) = parent_for_link
-                && let Some(parent) = engine_clone.lookup(pid).await
-            {
-                parent.children.lock().await.push(to_register.clone());
-            }
-            // Snapshot publish.
             engine_clone.publish_snapshot().await;
         });
 
-        // Spawn the watchdog, if any (arch.md §11).
+        // Spawn the watchdog, if any (arch.md §11). The abort handle is
+        // stored synchronously into the std::sync::Mutex so a cancel
+        // arriving immediately after `spawn_child` returns can find and
+        // abort it without racing with a deferred write.
         if let Some(d) = opts.timeout {
             let engine_w = self.clone();
             let id_w = id;
@@ -253,10 +273,10 @@ impl EngineInternals {
                 engine_w.timeout_task(id_w).await;
             });
             let abort = watchdog.abort_handle();
-            let exec_for_abort = exec_arc.clone();
-            tokio::spawn(async move {
-                *exec_for_abort.watchdog_abort.lock().await = Some(abort);
-            });
+            *exec_arc
+                .watchdog_abort
+                .lock()
+                .expect("watchdog_abort poisoned") = Some(abort);
         }
 
         Ok(TaskHandle::new(exec_arc, Arc::downgrade(self)))
@@ -275,13 +295,18 @@ impl EngineInternals {
         id: TaskId,
         kill_timeout: Duration,
     ) {
-        let Some(exec) = self.lookup(id).await else {
+        let Some(exec) = self.lookup(id) else {
             return;
         };
 
         // Abort the watchdog first so a Cancel→Timeout race doesn't
         // overwrite Cancelled with Timeout (arch.md §11).
-        if let Some(h) = exec.watchdog_abort.lock().await.take() {
+        if let Some(h) = exec
+            .watchdog_abort
+            .lock()
+            .expect("watchdog_abort poisoned")
+            .take()
+        {
             h.abort();
         }
 
@@ -328,28 +353,32 @@ impl EngineInternals {
         root: TaskId,
         kill_timeout: Duration,
     ) {
-        // BFS via an explicit stack.
-        let mut stack = vec![root];
+        // Walk the subtree parent-first via BFS, recording each node in
+        // visit order. Cancel in that same parent-first order so
+        // subscribers observe the parent transition to `Cancelled`
+        // before any of its children — matching arch.md §7 semantics.
+        let mut queue: std::collections::VecDeque<TaskId> =
+            std::collections::VecDeque::new();
+        queue.push_back(root);
         let mut visited: Vec<TaskId> = Vec::new();
-        while let Some(id) = stack.pop() {
-            let kids: Vec<TaskId> = match self.lookup(id).await {
+        while let Some(id) = queue.pop_front() {
+            let kids: Vec<TaskId> = match self.lookup(id) {
                 Some(exec) => exec.children.lock().await.iter().map(|c| c.id).collect(),
                 None => continue,
             };
             visited.push(id);
-            stack.extend(kids);
+            for k in kids {
+                queue.push_back(k);
+            }
         }
-        // Cancel in reverse so leaves get hit first; matches "subtree
-        // teardown" semantics and avoids parent-aborts-before-child
-        // oddness.
-        for id in visited.into_iter().rev() {
+        for id in visited {
             self.cancel_task_with(id, kill_timeout).await;
         }
     }
 
     /// Cancel each direct child of root. Root stays alive (arch.md §7).
     pub async fn kill_all(self: &Arc<Self>) {
-        let direct: Vec<TaskId> = match self.lookup(TaskId::ROOT).await {
+        let direct: Vec<TaskId> = match self.lookup(TaskId::ROOT) {
             Some(root) => root.children.lock().await.iter().map(|c| c.id).collect(),
             None => return,
         };
@@ -362,7 +391,7 @@ impl EngineInternals {
     /// instead of `Cancelled` (arch.md §11). Called by per-task
     /// watchdog tokio tasks.
     pub async fn timeout_task(self: &Arc<Self>, id: TaskId) {
-        let Some(exec) = self.lookup(id).await else {
+        let Some(exec) = self.lookup(id) else {
             return;
         };
         // Don't re-abort the watchdog here — it is the caller.
@@ -461,13 +490,44 @@ impl EngineHandle {
     }
 
     /// Subscribe to log entries from any task or process.
-    pub async fn subscribe_logs(&self) -> broadcast::Receiver<LogEntry> {
-        self.log_store.lock().await.subscribe()
+    ///
+    /// Synchronous per arch.md §5: the only contention path is
+    /// `LogStore::push` (which doesn't hold the lock across an await).
+    /// `try_lock` should always succeed; if it doesn't, we fall back to
+    /// a brief blocking wait via `blocking_lock` (sync mutex semantics
+    /// over the tokio mutex, fine here because contention is bounded).
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<LogEntry> {
+        match self.log_store.try_lock() {
+            Ok(store) => store.subscribe(),
+            Err(_) => self.log_store.blocking_lock().subscribe(),
+        }
     }
 
-    /// Look up a task in the graph.
-    pub async fn lookup(&self, id: TaskId) -> Option<Arc<TaskExecution>> {
-        self.internals.lookup(id).await
+    /// Look up a task in the graph (synchronous — table is a sync mutex).
+    pub fn lookup(&self, id: TaskId) -> Option<Arc<TaskExecution>> {
+        self.internals.lookup(id)
+    }
+
+    /// All source `TaskId`s belonging to `task_id` and any descendant
+    /// (tasks AND processes). Used by frontends focusing a non-leaf task
+    /// and wanting filtered logs (`LogStore::output_for_many`).
+    pub fn source_ids_for(&self, task_id: TaskId) -> Vec<TaskId> {
+        let snapshot = self.graph.borrow().clone();
+        let mut out = Vec::new();
+        let mut stack = vec![task_id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = snapshot.tasks.get(&id) else {
+                continue;
+            };
+            out.push(node.id);
+            for proc in &node.processes {
+                out.push(proc.id);
+            }
+            for &child in &node.children {
+                stack.push(child);
+            }
+        }
+        out
     }
 }
 
@@ -517,65 +577,57 @@ impl IntoFuture for EngineSpawnBuilder {
 impl Engine {
     /// Start the engine. Spawns the synthetic root task and returns the
     /// handle frontends use to send control and read state.
+    ///
+    /// Installs the global `tracing` subscriber here — exactly once per
+    /// process. Multiple `Engine::start` calls (e.g. tests) all attempt
+    /// to set the global default; subsequent calls are no-ops thanks to
+    /// `set_global_default`'s built-in once semantics.
     pub fn start(registry: Arc<Registry>) -> (Self, EngineHandle) {
+        // Install the global tracing subscriber. This is the only place
+        // in the codebase that does it. Returns Err if a default was
+        // already set (subsequent engines, test runs sharing a process);
+        // we ignore that — the subscriber is idempotently good.
+        install_global_tracing_subscriber();
+
         let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
         let (graph_tx, graph_rx) = watch::channel(GraphSnapshot::default());
         let log_store = Arc::new(Mutex::new(LogStore::new()));
-        let tracing_installed = Arc::new(AtomicBool::new(false));
 
-        // Build the root TaskExecution. Note: at this point we don't
-        // have an Arc<EngineInternals> yet — we'll thread the weak in
-        // after the Arc is constructed below via a self-cyclic
-        // construction.
-        //
-        // Trick: build internals with a placeholder root, then replace
-        // the root's wiring by re-launching once internals exists.
-        // Simpler: use Arc::new_cyclic on EngineInternals so the root
-        // can take a Weak<EngineInternals> at construction time.
+        // Build the engine internals via Arc::new_cyclic so the root
+        // TaskExecution can hold a Weak<EngineInternals>.
         let internals = Arc::new_cyclic(|engine_weak: &std::sync::Weak<EngineInternals>| {
-            // Build the root TaskExecution with an engine weak so the
-            // monitor_spawns loop can publish snapshots. The root has
-            // TaskId::ROOT.
-            let root_exec_inner = TaskExecution::with_log_store_and_engine(
+            let mut root_exec_inner = TaskExecution::with_log_store_and_engine(
                 TaskId::ROOT,
                 log_store.clone(),
                 engine_weak.clone(),
             );
-            let mut root_exec_inner = root_exec_inner;
             root_exec_inner.set_registry(registry.clone());
-            root_exec_inner.set_tracing_installed(tracing_installed.clone());
 
             let root_arc = Arc::new_cyclic(|self_weak: &std::sync::Weak<TaskExecution>| {
                 let mut e = root_exec_inner;
-                // Launch the root body via spawn_body so the root has
-                // a real TaskContext, JoinHandle, and tracing wiring —
-                // exactly like any child task per arch.md §6.
                 e.spawn_body(self_weak.clone(), engine_weak.clone(), &ROOT_TASK, vec![]);
                 e
             });
 
             EngineInternals {
                 root: root_arc,
-                table: Mutex::new(HashMap::new()),
+                table: StdMutex::new(HashMap::new()),
                 graph_tx,
                 log_store: log_store.clone(),
                 control_tx: control_tx.clone(),
                 control_rx_slot: Mutex::new(Some(control_rx)),
                 registry: registry.clone(),
-                tracing_installed,
             }
         });
 
-        // Insert root into the table.
+        // Insert root into the table synchronously.
+        {
+            let mut table = internals.table.lock().expect("engine table poisoned");
+            table.insert(TaskId::ROOT, internals.root.clone());
+        }
         {
             let internals_clone = internals.clone();
-            let root_clone = internals.root.clone();
             tokio::spawn(async move {
-                internals_clone
-                    .table
-                    .lock()
-                    .await
-                    .insert(TaskId::ROOT, root_clone);
                 internals_clone.publish_snapshot().await;
             });
         }

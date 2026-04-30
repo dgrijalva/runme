@@ -119,7 +119,7 @@ impl TuiOutput {
         let entry = LogEntry {
             raw: text.to_string(),
             parsed: crate::log::ParsedContent::PlainText,
-            source: String::new(),
+            source: crate::execution::TaskId::ROOT,
             seq: 0,
             received_at: chrono::Utc::now(),
             timestamp: None,
@@ -344,7 +344,7 @@ mod tests {
                 let entry = LogEntry {
                     raw: text.to_string(),
                     parsed: crate::log::ParsedContent::PlainText,
-                    source: "test".to_string(),
+                    source: crate::execution::TaskId(0),
                     seq: i as u64,
                     received_at: chrono::Utc::now(),
                     timestamp: None,
@@ -434,7 +434,7 @@ mod tests {
             let entry = LogEntry {
                 raw: "live line".to_string(),
                 parsed: crate::log::ParsedContent::PlainText,
-                source: "test".to_string(),
+                source: crate::execution::TaskId(0),
                 seq: 0,
                 received_at: chrono::Utc::now(),
                 timestamp: None,
@@ -468,7 +468,7 @@ mod tests {
             let entry = LogEntry {
                 raw: "forced to stderr".to_string(),
                 parsed: crate::log::ParsedContent::PlainText,
-                source: "test".to_string(),
+                source: crate::execution::TaskId(0),
                 seq: 0,
                 received_at: chrono::Utc::now(),
                 timestamp: None,

@@ -166,10 +166,11 @@ pub struct TaskContext {
     /// Working directory for file watches. Defaults to the current directory.
     watch_dir: PathBuf,
     /// Shared registry for cross-file task invocation via `ctx.run()`.
-    /// Injected by the runtime when tasks are launched through `Registry::run_with_registry()`.
+    /// Injected by the engine via `EngineInternals::spawn_child` /
+    /// `TaskExecution::spawn_body`.
     /// `None` when running outside the full runtime (e.g., standalone tests).
     registry: Option<Arc<Registry>>,
-    /// Shared task status, injected by `TaskExecution::launch()`.
+    /// Shared task status, injected by `TaskExecution::spawn_body()`.
     /// Used by `bind_ready()` and `mark_ready()` to set `TaskStatus::Ready`.
     task_status: Option<Arc<Mutex<crate::execution::TaskStatus>>>,
     /// Identity of the running task (slice 3). `None` outside the engine
@@ -177,7 +178,7 @@ pub struct TaskContext {
     task_id: Option<TaskId>,
     /// Cancellation token of the running task (slice 3). Independent —
     /// not a child token of any parent. Cloned into here from
-    /// `TaskExecution::cancellation` by `TaskExecution::launch`.
+    /// `TaskExecution::cancellation` by `TaskExecution::spawn_body`.
     cancellation: Option<CancellationToken>,
     /// Weak ref to the running task's `TaskExecution`. Slice 3 uses
     /// this so `ctx.run` can attach the freshly-created child node to
@@ -225,8 +226,12 @@ impl<'a> Future for CancellationSignal<'a> {
 
 /// Event emitted when a process is spawned through a TaskContext.
 ///
-/// Contains the information the TUI runner needs to track and display the process.
+/// Contains the information the engine needs to track and display the process.
 pub struct SpawnEvent {
+    /// The process's unique `TaskId` in the unified id space (arch.md
+    /// decision 22). This id is what `LogEntry.source` carries for every
+    /// log entry produced by this process.
+    pub process_id: TaskId,
     /// The output buffer for the spawned process.
     pub buffer: Arc<Mutex<OutputBuffer>>,
     /// The task name associated with this process.
@@ -323,7 +328,11 @@ impl TaskContext {
     /// visible regardless of UI mode.
     pub async fn println(&self, text: impl std::fmt::Display) {
         let text = text.to_string();
-        let entry = LogEntry::raw(&text, &self.name);
+        // Use the running task's TaskId so the entry routes to the right
+        // source bucket. Falls back to ROOT for tests built via
+        // `TaskContext::new` directly.
+        let source = self.task_id.unwrap_or(TaskId::ROOT);
+        let entry = LogEntry::raw(&text, source);
         // Push to the tracing buffer if available (TUI mode), otherwise exec buffer
         let buffer = self
             .tracing_output
@@ -420,7 +429,7 @@ impl TaskContext {
                 }
             }
 
-            // Notify the TUI runner (if connected) about the new process
+            // Notify the engine (if connected) about the new process
             if let Some(tx) = &spawn_tx {
                 let readiness_rx = if handle.is_ready() {
                     None // No readiness condition — already ready
@@ -428,6 +437,7 @@ impl TaskContext {
                     Some(handle.readiness_rx())
                 };
                 let _ = tx.send(SpawnEvent {
+                    process_id: handle.id(),
                     buffer: handle.output().0.clone(),
                     task_name: handle.task_name().to_string(),
                     pgid: handle.pgid(),
@@ -592,19 +602,19 @@ impl TaskContext {
 
     /// Set the shared registry for cross-file task invocation.
     ///
-    /// Called by the runtime when launching tasks through `Registry::run_with_registry()`.
+    /// Called by the engine via `TaskExecution::spawn_body`.
     /// Once set, `ctx.run()` and `ctx.tasks()` become available.
     pub fn set_registry(&mut self, registry: Arc<Registry>) {
         self.registry = Some(registry);
     }
 
-    /// Inject the shared task status (called by TaskExecution::launch).
+    /// Inject the shared task status (called by TaskExecution::spawn_body).
     pub fn set_task_status(&mut self, status: Arc<Mutex<crate::execution::TaskStatus>>) {
         self.task_status = Some(status);
     }
 
     /// Inject task identity + cancellation token + self-weak ref
-    /// (called by `TaskExecution::launch`). After this call the body
+    /// (called by `TaskExecution::spawn_body`). After this call the body
     /// can use `ctx.cancelled()`, `ctx.cancellation()`, and the
     /// `ctx.run` builder will attach children to this node's
     /// `children` list.
@@ -625,7 +635,7 @@ impl TaskContext {
         self.task_exec = Some(self_weak);
     }
 
-    /// Inject the shared `LogStore` (called by `TaskExecution::launch`).
+    /// Inject the shared `LogStore` (called by `TaskExecution::spawn_body`).
     /// Slice 4 will route this through `Weak<EngineInternals>` instead.
     pub fn set_log_store(&mut self, store: Arc<Mutex<LogStore>>) {
         self.log_store = Some(store);
@@ -661,7 +671,7 @@ impl TaskContext {
     ///
     /// Returns `false` when no cancellation token is wired (e.g. tests
     /// using `TaskContext::new` directly without going through
-    /// `TaskExecution::launch`).
+    /// `TaskExecution::spawn_body`).
     pub fn cancelled(&self) -> bool {
         self.cancellation
             .as_ref()
@@ -693,17 +703,30 @@ impl TaskContext {
     /// Bind this task's readiness to a process handle's readiness.
     ///
     /// When the process's readiness probe succeeds, this task's status
-    /// transitions to `TaskStatus::Ready`. Spawns a background task to
-    /// watch the process's readiness state.
+    /// transitions to `TaskStatus::Ready` and the engine publishes a
+    /// fresh graph snapshot so observers see the transition immediately
+    /// (arch.md item 10).
     pub fn bind_ready(&self, handle: &process::ProcessHandle) {
         if let Some(task_status) = &self.task_status {
             let mut rx = handle.readiness_rx();
             let task_status = task_status.clone();
+            let engine_weak = self.engine.clone();
             tokio::spawn(async move {
                 let _ = rx.wait_for(|&ready| ready).await;
-                let mut status = task_status.lock().await;
-                if matches!(*status, crate::execution::TaskStatus::Setup) {
-                    *status = crate::execution::TaskStatus::Ready;
+                let transitioned = {
+                    let mut status = task_status.lock().await;
+                    if matches!(*status, crate::execution::TaskStatus::Setup) {
+                        *status = crate::execution::TaskStatus::Ready;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if transitioned
+                    && let Some(weak) = engine_weak
+                    && let Some(eng) = weak.upgrade()
+                {
+                    eng.publish_snapshot().await;
                 }
             });
         }
@@ -712,14 +735,28 @@ impl TaskContext {
     /// Manually mark this task as ready.
     ///
     /// Sets the task status to `TaskStatus::Ready` if the task is still
-    /// in the `Setup` phase.
+    /// in the `Setup` phase, and publishes a fresh graph snapshot so
+    /// observers see the transition (arch.md item 10).
     pub fn mark_ready(&self) {
         if let Some(task_status) = &self.task_status {
-            // Use try_lock since this may be called from sync context
-            if let Ok(mut status) = task_status.try_lock() {
+            let transitioned = if let Ok(mut status) = task_status.try_lock() {
                 if matches!(*status, crate::execution::TaskStatus::Setup) {
                     *status = crate::execution::TaskStatus::Ready;
+                    true
+                } else {
+                    false
                 }
+            } else {
+                false
+            };
+            if transitioned
+                && let Some(weak) = self.engine.clone()
+            {
+                tokio::spawn(async move {
+                    if let Some(eng) = weak.upgrade() {
+                        eng.publish_snapshot().await;
+                    }
+                });
             }
         }
     }
@@ -760,25 +797,12 @@ impl TaskContext {
             Err(e) => return TaskBuilder::failed(e),
         };
 
-        // Prefer the parent's existing LogStore so child output flows
-        // into the same store. In test paths where no store was wired,
-        // mint a fresh one — the body still runs, output just doesn't
-        // share with anyone (mirrors the slice 2 single-task path).
-        let log_store = self
-            .log_store
-            .clone()
-            .unwrap_or_else(|| Arc::new(Mutex::new(LogStore::new())));
+        let Some(engine) = self.engine.clone() else {
+            return TaskBuilder::failed(TaskError::from_display("no engine context"));
+        };
 
         let string_args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        TaskBuilder::new(
-            self.task_id,
-            self.task_exec.clone(),
-            self.engine.clone(),
-            log_store,
-            registry,
-            task_def,
-            string_args,
-        )
+        TaskBuilder::new(self.task_id, engine, task_def, string_args)
     }
 
     /// Query the task registry for discovery and listing.
@@ -1000,30 +1024,6 @@ impl Registry {
             }
             None => Err(TaskError::from_display(format!("unknown task: {}", name))),
         }
-    }
-
-    /// Resolve and run a task, injecting the registry into the TaskContext.
-    ///
-    /// Slice 3: backward-compatible shim. Funnels through the new
-    /// `TaskBuilder` path so the call still resolves task names through
-    /// `resolve` and produces identical results, but goes through the
-    /// engine seam. Slice 4 will fold this into
-    /// `EngineHandle::spawn_task` once the engine type exists.
-    pub async fn run_with_registry(
-        &self,
-        name: &str,
-        args: &[String],
-        registry: &Arc<Registry>,
-    ) -> Result<(), TaskError> {
-        // Build a synthetic parent context carrying the registry so the
-        // builder's resolve path matches what an in-task `ctx.run` would
-        // do. No `task_id` / `task_exec` is set, so the child's
-        // `parent_id` is `None` and it does not attach to any
-        // `children` list — equivalent to running at the root.
-        let mut ctx = TaskContext::new(name);
-        ctx.set_registry(registry.clone());
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        ctx.run(name, &arg_refs).await
     }
 
     /// Resolve a task name to a `TaskDef` using 3-tier resolution.
@@ -1539,20 +1539,11 @@ mod tests {
     }
 
     // --- ctx.run() and ctx.tasks() tests ---
-
-    #[tokio::test]
-    async fn test_ctx_run_with_registry() {
-        let mut reg = Registry::new();
-        reg.register(&TEST_TASK_A);
-        let reg = Arc::new(reg);
-
-        let mut ctx = TaskContext::new("caller");
-        ctx.set_registry(reg.clone());
-
-        // Should be able to invoke "alpha" through ctx.run()
-        let result = ctx.run("alpha", &[]).await;
-        assert!(result.is_ok());
-    }
+    //
+    // Note: ctx.run() now requires an engine context. Tests that exercise
+    // the full ctx.run path live in `execution/handle.rs::tests` where a
+    // real `Engine` is started. Here we only verify the resolution-error
+    // surface: missing registry surfaces synchronously at .await.
 
     #[tokio::test]
     async fn test_ctx_run_without_registry() {
@@ -1582,28 +1573,5 @@ mod tests {
     fn test_ctx_tasks_without_registry() {
         let ctx = TaskContext::new("caller");
         assert!(ctx.tasks().is_none());
-    }
-
-    // --- run_with_registry test ---
-
-    #[tokio::test]
-    async fn test_run_with_registry() {
-        let mut reg = Registry::new();
-        reg.register(&TEST_TASK_A);
-        let reg = Arc::new(reg);
-
-        let result = reg.run_with_registry("alpha", &[], &reg).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_run_with_registry_resolve_fails() {
-        let reg = Arc::new(Registry::new());
-        let result = reg.run_with_registry("nonexistent", &[], &reg).await;
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "unknown task: nonexistent"
-        );
     }
 }

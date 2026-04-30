@@ -10,6 +10,8 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use ratatui::style::Color;
 
+use crate::execution::TaskId;
+
 // ---------------------------------------------------------------------------
 // Global access
 // ---------------------------------------------------------------------------
@@ -118,7 +120,7 @@ impl Theme {
 /// Manages source-to-color assignment, cycling through the theme's palette.
 #[derive(Debug, Clone)]
 pub struct SourceColors {
-    map: HashMap<String, Color>,
+    map: HashMap<TaskId, Color>,
 }
 
 impl SourceColors {
@@ -128,15 +130,15 @@ impl SourceColors {
         }
     }
 
-    /// Get or assign a color for the given source name.
-    pub fn color_for(&mut self, source: &str) -> Color {
-        if let Some(&color) = self.map.get(source) {
+    /// Get or assign a color for the given source id.
+    pub fn color_for(&mut self, source: TaskId) -> Color {
+        if let Some(&color) = self.map.get(&source) {
             return color;
         }
         let palette = THEME.source_palette;
         let idx = self.map.len() % palette.len();
         let color = palette[idx];
-        self.map.insert(source.to_string(), color);
+        self.map.insert(source, color);
         color
     }
 }

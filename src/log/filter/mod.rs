@@ -21,7 +21,16 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::execution::TaskId;
     use crate::log::{LogEntry, ParsedContent};
+
+    fn tid(name: &str) -> TaskId {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        TaskId(h.finish())
+    }
 
     /// Helper to create a simple LogEntry for testing.
     fn make_entry(raw: &str) -> LogEntry {
@@ -29,7 +38,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: "test".to_string(),
+            source: tid("test"),
             seq: 0,
             timestamp: None,
             level: None,
@@ -60,7 +69,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: "2024-01-01 ERROR connection refused to auth service".to_string(),
             parsed: ParsedContent::PlainText,
-            source: "web-server".to_string(),
+            source: tid("web-server"),
             seq: 42,
             timestamp: Some("2024-01-01T00:00:00Z".to_string()),
             level: Some("error".to_string()),
@@ -356,8 +365,10 @@ mod tests {
 
     #[test]
     fn eval_source_field() {
+        // `source` filters now match against the TaskId Display ("t<N>")
+        // since the storage layer dropped string source names.
         let entry = make_rich_entry();
-        let expr = parse("source:web-server").unwrap();
+        let expr = parse(&format!("source:{}", entry.source)).unwrap();
         assert!(matches(&expr, &entry));
     }
 

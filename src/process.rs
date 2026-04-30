@@ -239,7 +239,7 @@ pub use crate::log::buffer::OutputBuffer;
 fn build_log_entry(
     raw_record: super::log::RawRecord,
     extractor: &dyn FieldExtractor,
-    source: &str,
+    source: crate::execution::TaskId,
     seq: &mut u64,
     stream: Option<Stream>,
 ) -> LogEntry {
@@ -247,7 +247,7 @@ fn build_log_entry(
     let mut entry = LogEntry::new(
         raw_record.raw,
         raw_record.parsed,
-        source.to_string(),
+        source,
         *seq,
         extracted.timestamp,
         extracted.level,
@@ -266,7 +266,7 @@ fn drain_records(
     eof: bool,
     parser: &mut dyn RecordParser,
     extractor: &dyn FieldExtractor,
-    source: &str,
+    source: crate::execution::TaskId,
     seq: &mut u64,
     output: &mut OutputBuffer,
     stream: Option<Stream>,
@@ -294,7 +294,7 @@ async fn drain_records_async(
     eof: bool,
     parser: &mut dyn RecordParser,
     extractor: &dyn FieldExtractor,
-    source: &str,
+    source: crate::execution::TaskId,
     seq: &mut u64,
     output: &std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
     stream: Option<Stream>,
@@ -321,6 +321,11 @@ async fn drain_records_async(
 /// signal delivery for clean shutdown.
 pub struct ProcessHandle {
     child: tokio::process::Child,
+    /// Unique id for this process in the unified task-id space. Allocated
+    /// at spawn time; routed onto every `LogEntry` for this process and
+    /// surfaced via `SpawnEvent` so the engine can register it as a leaf
+    /// in the graph (arch.md §9, decision 22).
+    id: crate::execution::TaskId,
     task_name: String,
     command_label: String,
     pgid: Option<i32>,
@@ -403,6 +408,11 @@ impl ProcessHandle {
         &self.task_name
     }
 
+    /// Get the process's unique `TaskId`.
+    pub fn id(&self) -> crate::execution::TaskId {
+        self.id
+    }
+
     /// Get the command label (display name for this process).
     pub fn label(&self) -> &str {
         &self.command_label
@@ -474,6 +484,9 @@ pub async fn exec(
     buffer: &mut OutputBuffer,
 ) -> Result<ProcessResult, ProcessError> {
     let mut cmd = command.into();
+    // Allocate a TaskId for this process so its log entries route correctly
+    // through the unified id space (arch.md §9, decision 22).
+    let process_id = crate::execution::TaskId::next();
 
     // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
     // Separate parser instances for stdout and stderr (parsers are stateful).
@@ -510,7 +523,7 @@ pub async fn exec(
                         drain_records(
                             &mut stdout_buf, true,
                             stdout_parser.as_mut(), extractor.as_ref(),
-                            task_name, &mut seq, buffer,
+                            process_id, &mut seq, buffer,
                             Some(Stream::Stdout),
                         );
                     }
@@ -519,7 +532,7 @@ pub async fn exec(
                         drain_records(
                             &mut stdout_buf, false,
                             stdout_parser.as_mut(), extractor.as_ref(),
-                            task_name, &mut seq, buffer,
+                            process_id, &mut seq, buffer,
                             Some(Stream::Stdout),
                         );
                     }
@@ -535,7 +548,7 @@ pub async fn exec(
                         drain_records(
                             &mut stderr_buf, true,
                             stderr_parser.as_mut(), extractor.as_ref(),
-                            task_name, &mut seq, buffer,
+                            process_id, &mut seq, buffer,
                             Some(Stream::Stderr),
                         );
                     }
@@ -543,7 +556,7 @@ pub async fn exec(
                         drain_records(
                             &mut stderr_buf, false,
                             stderr_parser.as_mut(), extractor.as_ref(),
-                            task_name, &mut seq, buffer,
+                            process_id, &mut seq, buffer,
                             Some(Stream::Stderr),
                         );
                     }
@@ -584,6 +597,10 @@ pub async fn spawn(
     buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
 ) -> Result<ProcessHandle, ProcessError> {
     let mut cmd = command.into();
+    // Allocate a TaskId for this process — flows into log entries and is
+    // surfaced via the SpawnEvent so the engine table / graph snapshot can
+    // register the process as a leaf of its parent task.
+    let process_id = crate::execution::TaskId::next();
 
     // Extract parser/extractor from Cmd before consuming it, falling back to defaults.
     // Separate parser instances for stdout and stderr (parsers are stateful).
@@ -604,8 +621,6 @@ pub async fn spawn(
     let mut stdout = child.stdout.take().expect("stdout piped");
     let mut stderr = child.stderr.take().expect("stderr piped");
 
-    let task_name_owned = task_name.to_string();
-
     // Each stream gets its own parser instance (parsers are stateful).
     // The extractor is stateless and can be shared.
     let stdout_parser = std::sync::Arc::new(tokio::sync::Mutex::new(stdout_parser));
@@ -618,7 +633,6 @@ pub async fn spawn(
     let parser_clone = stdout_parser;
     let extractor_clone = extractor.clone();
     let seq_clone = seq.clone();
-    let source_clone = task_name_owned.clone();
     let stdout_task = tokio::spawn(async move {
         let mut byte_buf = BytesMut::new();
         while let Ok(n) = stdout.read_buf(&mut byte_buf).await {
@@ -632,7 +646,7 @@ pub async fn spawn(
                     eof,
                     p.as_mut(),
                     extractor_clone.as_ref(),
-                    &source_clone,
+                    process_id,
                     &mut s,
                     &buf_clone,
                     Some(Stream::Stdout),
@@ -651,7 +665,6 @@ pub async fn spawn(
     let parser_clone = stderr_parser;
     let extractor_clone = extractor;
     let seq_clone = seq;
-    let source_clone = task_name_owned;
     let stderr_task = tokio::spawn(async move {
         let mut byte_buf = BytesMut::new();
         while let Ok(n) = stderr.read_buf(&mut byte_buf).await {
@@ -665,7 +678,7 @@ pub async fn spawn(
                     eof,
                     p.as_mut(),
                     extractor_clone.as_ref(),
-                    &source_clone,
+                    process_id,
                     &mut s,
                     &buf_clone,
                     Some(Stream::Stderr),
@@ -685,6 +698,7 @@ pub async fn spawn(
 
     Ok(ProcessHandle {
         child,
+        id: process_id,
         task_name: task_name.to_string(),
         command_label: task_name.to_string(),
         pgid,
@@ -1062,7 +1076,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: "test".to_string(),
+            source: crate::execution::TaskId(0),
             seq,
             timestamp: None,
             level: None,
@@ -1092,7 +1106,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: "broadcast_test".to_string(),
             parsed: ParsedContent::PlainText,
-            source: "test".to_string(),
+            source: crate::execution::TaskId(0),
             seq: 0,
             timestamp: None,
             level: None,
@@ -1278,9 +1292,11 @@ mod tests {
         assert_eq!(buffer.len(), 3);
 
         let entries: Vec<_> = buffer.lines().iter().collect();
-        // All entries should have the correct source
+        // All entries from a single exec should share the same allocated
+        // process TaskId (the source field).
+        let first_source = entries[0].source;
         for entry in &entries {
-            assert_eq!(entry.source, "my_task");
+            assert_eq!(entry.source, first_source);
         }
         // Seq should be monotonically increasing
         assert_eq!(entries[0].seq, 0);

@@ -13,6 +13,7 @@ use std::io::Write;
 use tokio::sync::{broadcast, mpsc};
 
 use super::LogEntry;
+use crate::execution::TaskId;
 
 // ---------------------------------------------------------------------------
 // Live tailing
@@ -26,12 +27,12 @@ pub fn tail(tx: &broadcast::Sender<LogEntry>) -> broadcast::Receiver<LogEntry> {
     tx.subscribe()
 }
 
-/// Subscribe to a broadcast sender, filtering entries by source name.
+/// Subscribe to a broadcast sender, filtering entries by source id.
 ///
-/// Only entries whose `source` field matches the given name are yielded.
+/// Only entries whose `source` field matches the given id are yielded.
 pub fn tail_source(
     tx: &broadcast::Sender<LogEntry>,
-    source: String,
+    source: TaskId,
 ) -> FilteredStream<impl Fn(&LogEntry) -> bool> {
     let filter = move |entry: &LogEntry| entry.source == source;
     FilteredStream {
@@ -192,13 +193,24 @@ mod tests {
     use crate::log::ParsedContent;
     use std::collections::HashMap;
 
+    /// Encode a string source name as a TaskId for tests; uses a stable hash
+    /// so existing assertions on `entry.source == ...` keep working when
+    /// tests pass identical strings.
+    fn tid(name: &str) -> TaskId {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        TaskId(h.finish())
+    }
+
     /// Helper to create a LogEntry for testing.
     fn make_entry(source: &str, seq: u64, raw: &str) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source: tid(source),
             seq,
             timestamp: None,
             level: None,
@@ -220,7 +232,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source: tid(source),
             seq,
             timestamp: None,
             level: level.map(|s| s.to_string()),
@@ -236,7 +248,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::Json(json.clone()),
-            source: source.to_string(),
+            source: tid(source),
             seq,
             timestamp: None,
             level: json.get("level").and_then(|v| v.as_str()).map(String::from),
@@ -258,7 +270,7 @@ mod tests {
         let _ = tx.send(make_entry("app", 0, "hello world"));
         let received = rx.recv().await.unwrap();
         assert_eq!(received.raw, "hello world");
-        assert_eq!(received.source, "app");
+        assert_eq!(received.source, tid("app"));
     }
 
     #[tokio::test]
@@ -278,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn test_tail_source_filters_by_source() {
         let (tx, _) = broadcast::channel::<LogEntry>(16);
-        let mut filtered = tail_source(&tx, "important".to_string());
+        let mut filtered = tail_source(&tx, tid("important"));
 
         let _ = tx.send(make_entry("noise", 0, "ignore me"));
         let _ = tx.send(make_entry("important", 1, "pay attention"));
@@ -286,7 +298,7 @@ mod tests {
 
         let received = filtered.recv().await.unwrap();
         assert_eq!(received.raw, "pay attention");
-        assert_eq!(received.source, "important");
+        assert_eq!(received.source, tid("important"));
     }
 
     #[tokio::test]
@@ -500,10 +512,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);
 
-        // Each line should be valid JSON
+        // Each line should be valid JSON. `source` is now an integer TaskId.
         let parsed0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed0["raw"], "hello");
-        assert_eq!(parsed0["source"], "app");
+        assert!(parsed0["source"].is_u64());
         assert_eq!(parsed0["seq"], 0);
 
         let parsed1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
@@ -536,7 +548,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(parsed["level"], "error");
         assert_eq!(parsed["message"], "failed");
-        assert_eq!(parsed["source"], "app");
+        assert!(parsed["source"].is_u64());
     }
 
     #[test]
@@ -556,7 +568,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         // The parsed field should contain the JSON representation of ParsedContent::Json
         assert!(parsed.get("parsed").is_some());
-        assert_eq!(parsed["source"], "app");
+        assert!(parsed["source"].is_u64());
     }
 
     #[test]
@@ -630,7 +642,7 @@ mod tests {
         let text = String::from_utf8(output).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
         assert_eq!(parsed["raw"], "async json");
-        assert_eq!(parsed["source"], "app");
+        assert!(parsed["source"].is_u64());
     }
 
     #[tokio::test]

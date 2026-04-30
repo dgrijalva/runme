@@ -458,12 +458,20 @@ mod tests {
     use crate::log::{LogEntry, ParsedContent};
     use std::collections::HashMap;
 
+    fn tid(name: &str) -> crate::execution::TaskId {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        crate::execution::TaskId(h.finish())
+    }
+
     fn make_entry(raw: &str, source: &str) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source: tid(source),
             seq: 0,
             timestamp: None,
             level: Some("info".to_string()),

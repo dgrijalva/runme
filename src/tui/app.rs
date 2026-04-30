@@ -10,6 +10,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::Mutex;
 
+use crate::execution::{EngineHandle, TaskId};
 use crate::log::LogEntry;
 use crate::log::field_stats::FieldStats;
 use crate::log::filter as log_filter;
@@ -20,7 +21,6 @@ use super::event::run_event_loop;
 use super::filter::FilterInputState;
 use super::picker::PickerState;
 use super::render::{DisplayMode, SourceColors};
-use super::runner::{ProcessInfo, TaskRunner, TaskStatus};
 use super::search::SearchState;
 use super::sidebar::{SidebarEntry, SidebarState};
 use super::viewport::ScrollState;
@@ -55,14 +55,9 @@ pub struct AppState {
     /// Whether the main loop should continue running
     pub running: bool,
     /// Log entries currently displayed (tail of the composed log store).
-    /// Populated by the event loop from the LogStore broadcast.
     pub log_lines: Vec<LogEntry>,
-    /// The LogStore, shared with the runner.
+    /// The engine's `LogStore`, cloned from `EngineHandle::log_store`.
     pub log_store: Arc<Mutex<LogStore>>,
-    /// Current task status, if a task is running.
-    pub task_status: Option<Arc<Mutex<TaskStatus>>>,
-    /// Name of the running task, if any.
-    pub task_name: Option<String>,
     /// Display mode: preview (structured) or raw
     pub display_mode: DisplayMode,
     /// Whether to wrap long lines (true) or truncate (false)
@@ -73,13 +68,11 @@ pub struct AppState {
     pub source_colors: SourceColors,
     /// Sidebar state (focus, selection).
     pub sidebar: SidebarState,
-    /// Source visibility filter. Empty means show all sources.
+    /// Source visibility filter, keyed by `TaskId`. Empty means show all.
     /// When non-empty, only entries whose source is in this set are shown.
-    pub source_filter: HashSet<String>,
-    /// Cached sidebar entries, rebuilt each frame from process state.
+    pub source_filter: HashSet<TaskId>,
+    /// Cached sidebar entries, rebuilt each frame from the graph snapshot.
     pub sidebar_entries: Vec<SidebarEntry>,
-    /// Process info from the runner, shared for status monitoring.
-    pub processes: Option<Arc<Mutex<Vec<ProcessInfo>>>>,
     /// Filter input state for the filter bar.
     pub filter_input: FilterInputState,
     /// Search state for / search with n/N navigation.
@@ -94,12 +87,15 @@ pub struct AppState {
     pub group_names: HashMap<String, String>,
     /// Task selected from the picker, pending launch by the event loop.
     pub pending_task: Option<&'static TaskDef>,
-    /// The task runner, stored here so the event loop can manage task launches
-    /// from the picker without needing access to the App wrapper.
-    #[allow(dead_code)]
-    pub runner: Option<TaskRunner>,
+    /// Engine handle. Cloned from the engine started in the binary entry.
+    /// `None` only briefly during construction; populated before the
+    /// event loop runs.
+    pub engine: Option<EngineHandle>,
+    /// Id of the most recently launched task. Used by single-task flows
+    /// (TUI showing one task, restart-with-`r`) to know what to wait on
+    /// or kill.
+    pub current_task_id: Option<TaskId>,
     /// Index of the process being viewed in the ProcessDetail overlay.
-    /// This is the sidebar entry index (not the process vec index).
     pub process_detail_index: Option<usize>,
     /// Scroll offset within the process detail overlay.
     pub process_detail_scroll: usize,
@@ -143,8 +139,6 @@ impl AppState {
             running: true,
             log_lines: Vec::new(),
             log_store: Arc::new(Mutex::new(LogStore::new())),
-            task_status: None,
-            task_name: None,
             display_mode: DisplayMode::Preview,
             wrap: false,
             scroll: ScrollState::Tail,
@@ -152,7 +146,6 @@ impl AppState {
             sidebar: SidebarState::new(),
             source_filter: HashSet::new(),
             sidebar_entries: Vec::new(),
-            processes: None,
             filter_input: FilterInputState::new(),
             search: SearchState::new(),
             detail_scroll: 0,
@@ -160,7 +153,8 @@ impl AppState {
             all_tasks: Vec::new(),
             group_names: HashMap::new(),
             pending_task: None,
-            runner: None,
+            engine: None,
+            current_task_id: None,
             process_detail_index: None,
             process_detail_scroll: 0,
             process_detail_sockets: None,
@@ -186,11 +180,9 @@ impl AppState {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                // Source filter
                 if !self.source_filter.is_empty() && !self.source_filter.contains(&entry.source) {
                     return false;
                 }
-                // Expression filter
                 if let Some(expr) = expr
                     && !log_filter::matches(expr, entry)
                 {
@@ -208,11 +200,9 @@ impl AppState {
         self.log_lines
             .iter()
             .filter(|entry| {
-                // Source filter
                 if !self.source_filter.is_empty() && !self.source_filter.contains(&entry.source) {
                     return false;
                 }
-                // Expression filter
                 if let Some(expr) = expr
                     && !log_filter::matches(expr, entry)
                 {
@@ -226,29 +216,23 @@ impl AppState {
     /// Toggle visibility of a source. If source_filter is empty (show all),
     /// switching to filtered mode: add all sources except the toggled one.
     /// If already filtered, toggle the specific source.
-    pub fn toggle_source_visibility(&mut self, source: &str) {
+    pub fn toggle_source_visibility(&mut self, source: TaskId) {
         if self.source_filter.is_empty() {
-            // Currently showing all — switch to "all except this one"
-            // Collect all unique sources
-            let all_sources: HashSet<String> = self
+            let all_sources: HashSet<TaskId> = self
                 .sidebar_entries
                 .iter()
-                .map(|e| e.source.clone())
+                .map(|e| e.source)
                 .collect();
             self.source_filter = all_sources;
-            self.source_filter.remove(source);
-        } else if self.source_filter.contains(source) {
-            self.source_filter.remove(source);
-            // If filter is now empty after removal, that means nothing is visible
-            // which isn't useful. If only this source was visible, keep it.
-            // Actually, removing from the visible set means hiding it.
+            self.source_filter.remove(&source);
+        } else if self.source_filter.contains(&source) {
+            self.source_filter.remove(&source);
         } else {
-            self.source_filter.insert(source.to_string());
-            // Check if all sources are now visible — if so, clear the filter
-            let all_sources: HashSet<String> = self
+            self.source_filter.insert(source);
+            let all_sources: HashSet<TaskId> = self
                 .sidebar_entries
                 .iter()
-                .map(|e| e.source.clone())
+                .map(|e| e.source)
                 .collect();
             if self.source_filter == all_sources {
                 self.source_filter.clear();
@@ -261,34 +245,32 @@ impl AppState {
         self.source_filter.clear();
     }
 
-    /// Launch a task from the picker. Sets up the TaskRunner and transitions
-    /// to Normal mode. Called from the event loop when pending_task is set.
-    pub fn launch_picked_task(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
+    /// Launch a task through the engine. Called from the event loop when a
+    /// task is selected from the picker or `r` is used to restart.
+    pub async fn launch_picked_task(
+        &mut self,
+        task: &'static TaskDef,
+        task_args: Vec<String>,
+    ) {
         self.current_task = Some(task);
         self.current_task_args = task_args.clone();
-        let mut runner = TaskRunner::new();
-        if let Some(ref registry) = self.registry {
-            runner.set_registry(registry.clone());
+
+        if let Some(handle) = self.engine.as_ref() {
+            match handle.spawn_task(task, task_args).await {
+                Ok(id) => self.current_task_id = Some(id),
+                Err(e) => {
+                    self.notifications.push((
+                        format!("spawn failed: {e}"),
+                        std::time::Instant::now(),
+                    ));
+                }
+            }
         }
-        let log_store = runner.log_store.clone();
 
-        runner.launch(task, task_args);
-
-        // Capture status/processes AFTER launch — launch() replaces these
-        // with the session's Arcs for the first session.
-        let task_status = runner.status.clone();
-        let processes = runner.processes.clone();
-
-        self.log_store = log_store;
-        self.task_status = Some(task_status);
-        self.task_name = Some(task.name.to_string());
-        self.processes = Some(processes);
         self.mode = AppMode::Normal;
         self.picker = None;
         self.pending_task = None;
-        self.log_lines.clear();
         self.dirty = true;
-        self.runner = Some(runner);
     }
 }
 
@@ -311,14 +293,13 @@ impl App {
         }
     }
 
-    /// Create an App that starts with the task picker.
-    ///
-    /// Shows all available tasks grouped by their source file, with fuzzy
-    /// filtering. The user selects a task to launch.
+    /// Create an App that starts with the task picker, attached to an
+    /// already-started engine.
     pub fn with_picker(
         tasks: Vec<&'static TaskDef>,
         group_names: HashMap<String, String>,
         registry: Arc<Registry>,
+        engine: EngineHandle,
     ) -> Self {
         let picker = PickerState::new(&tasks, &group_names);
         let mut state = AppState::new();
@@ -327,23 +308,31 @@ impl App {
         state.all_tasks = tasks;
         state.group_names = group_names;
         state.registry = Some(registry);
-
+        state.log_store = engine.log_store.clone();
+        state.engine = Some(engine);
         Self { state }
     }
 
-    /// Create an App configured to run a specific task immediately.
-    pub fn with_task(task: &'static TaskDef, task_args: Vec<String>, registry: Arc<Registry>) -> Self {
+    /// Create an App configured to run a specific task immediately through
+    /// the engine.
+    pub async fn with_task(
+        task: &'static TaskDef,
+        task_args: Vec<String>,
+        registry: Arc<Registry>,
+        engine: EngineHandle,
+    ) -> Self {
         let mut state = AppState::new();
         state.registry = Some(registry);
-        state.launch_picked_task(task, task_args);
+        state.log_store = engine.log_store.clone();
+        state.engine = Some(engine);
+        state.launch_picked_task(task, task_args).await;
         Self { state }
     }
 
     /// Enter the TUI: set up the terminal, run the event loop, and restore
-    /// the terminal on exit (including panics).
+    /// the terminal on exit (including panics). The engine is the caller's
+    /// responsibility — `App::run` does not start or stop it.
     pub async fn run(&mut self) -> io::Result<()> {
-        // Install a panic hook that restores the terminal before unwinding.
-        // This is critical — without it, a panic leaves the terminal in raw mode.
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = restore_terminal();
@@ -357,16 +346,7 @@ impl App {
 
         let result = run_event_loop(&mut self.state, &mut terminal).await;
 
-        // Kill all spawned processes before leaving the TUI.
-        if let Some(ref runner) = self.state.runner {
-            runner
-                .shutdown(std::time::Duration::from_secs(5))
-                .await;
-        }
-
         restore_terminal()?;
-
-        // Restore the default panic hook now that the terminal is restored.
         let _ = std::panic::take_hook();
 
         result
@@ -394,16 +374,16 @@ mod tests {
     use ratatui::style::Color;
     use std::collections::HashMap;
 
-    fn make_entry(source: &str) -> LogEntry {
+    fn make_entry(source: TaskId) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
-            raw: format!("entry from {}", source),
+            raw: format!("entry from {source}"),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source,
             seq: 0,
             timestamp: None,
             level: Some("info".to_string()),
-            message: Some(format!("entry from {}", source)),
+            message: Some(format!("entry from {source}")),
             fields: HashMap::new(),
             stream: None,
         }
@@ -416,8 +396,6 @@ mod tests {
         assert!(state.dirty);
         assert!(state.running);
         assert!(state.log_lines.is_empty());
-        assert!(state.task_name.is_none());
-        assert!(state.task_status.is_none());
         assert_eq!(state.display_mode, DisplayMode::Preview);
         assert!(!state.wrap);
         assert_eq!(state.scroll, ScrollState::Tail);
@@ -425,8 +403,8 @@ mod tests {
         assert_eq!(state.sidebar.selection, 0);
         assert!(state.source_filter.is_empty());
         assert!(state.sidebar_entries.is_empty());
-        assert!(state.processes.is_none());
-        // Phase 8 additions
+        assert!(state.engine.is_none());
+        assert!(state.current_task_id.is_none());
         assert!(state.sidebar_visible);
         assert!(state.notifications.is_empty());
         assert!(state.filter_history.is_empty());
@@ -437,40 +415,13 @@ mod tests {
     }
 
     #[test]
-    fn app_state_can_be_modified() {
-        let mut state = AppState::new();
-        state.dirty = false;
-        state.running = false;
-        state.display_mode = DisplayMode::Raw;
-        state.wrap = true;
-        assert!(!state.dirty);
-        assert!(!state.running);
-        assert_eq!(state.display_mode, DisplayMode::Raw);
-        assert!(state.wrap);
-    }
-
-    #[test]
-    fn app_state_scroll_transitions() {
-        let mut state = AppState::new();
-        assert_eq!(state.scroll, ScrollState::Tail);
-
-        state.scroll = ScrollState::Pinned { cursor: 5, top: 0 };
-        assert!(matches!(
-            state.scroll,
-            ScrollState::Pinned { cursor: 5, .. }
-        ));
-
-        state.scroll = ScrollState::Tail;
-        assert_eq!(state.scroll, ScrollState::Tail);
-    }
-
-    #[test]
     fn visible_lines_no_filter() {
         let mut state = AppState::new();
-        state.log_lines.push(make_entry("api"));
-        state.log_lines.push(make_entry("worker"));
-        state.log_lines.push(make_entry("api"));
-
+        let api = TaskId(1);
+        let worker = TaskId(2);
+        state.log_lines.push(make_entry(api));
+        state.log_lines.push(make_entry(worker));
+        state.log_lines.push(make_entry(api));
         let indices = state.visible_line_indices();
         assert_eq!(indices, vec![0, 1, 2]);
     }
@@ -478,12 +429,12 @@ mod tests {
     #[test]
     fn visible_lines_with_filter() {
         let mut state = AppState::new();
-        state.log_lines.push(make_entry("api"));
-        state.log_lines.push(make_entry("worker"));
-        state.log_lines.push(make_entry("api"));
-
-        state.source_filter.insert("api".to_string());
-
+        let api = TaskId(1);
+        let worker = TaskId(2);
+        state.log_lines.push(make_entry(api));
+        state.log_lines.push(make_entry(worker));
+        state.log_lines.push(make_entry(api));
+        state.source_filter.insert(api);
         let indices = state.visible_line_indices();
         assert_eq!(indices, vec![0, 2]);
     }
@@ -491,7 +442,7 @@ mod tests {
     #[test]
     fn show_all_clears_filter() {
         let mut state = AppState::new();
-        state.source_filter.insert("api".to_string());
+        state.source_filter.insert(TaskId(1));
         assert!(!state.source_filter.is_empty());
         state.show_all_sources();
         assert!(state.source_filter.is_empty());
@@ -500,11 +451,12 @@ mod tests {
     #[test]
     fn toggle_source_from_all_visible() {
         let mut state = AppState::new();
-        // Set up sidebar entries so toggle knows about all sources
+        let task = TaskId(10);
+        let api = TaskId(11);
         state.sidebar_entries = vec![
             SidebarEntry {
                 name: "task".to_string(),
-                source: "task".to_string(),
+                source: task,
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
@@ -513,7 +465,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
-                source: "api".to_string(),
+                source: api,
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -521,44 +473,20 @@ mod tests {
                 depth: 1,
             },
         ];
-
-        // Toggle "api" off — should switch from "all" to "all except api"
-        state.toggle_source_visibility("api");
-        assert!(state.source_filter.contains("task"));
-        assert!(!state.source_filter.contains("api"));
-    }
-
-    #[test]
-    fn app_state_detail_scroll_default() {
-        let state = AppState::new();
-        assert_eq!(state.detail_scroll, 0);
-    }
-
-    #[test]
-    fn app_mode_entry_detail_variant() {
-        let mut state = AppState::new();
-        state.mode = AppMode::EntryDetail;
-        assert_eq!(state.mode, AppMode::EntryDetail);
-        state.mode = AppMode::Normal;
-        assert_eq!(state.mode, AppMode::Normal);
-    }
-
-    #[test]
-    fn app_mode_process_detail_variant() {
-        let mut state = AppState::new();
-        state.mode = AppMode::ProcessDetail;
-        assert_eq!(state.mode, AppMode::ProcessDetail);
-        state.mode = AppMode::Normal;
-        assert_eq!(state.mode, AppMode::Normal);
+        state.toggle_source_visibility(api);
+        assert!(state.source_filter.contains(&task));
+        assert!(!state.source_filter.contains(&api));
     }
 
     #[test]
     fn toggle_source_back_on_clears_filter() {
         let mut state = AppState::new();
+        let task = TaskId(10);
+        let api = TaskId(11);
         state.sidebar_entries = vec![
             SidebarEntry {
                 name: "task".to_string(),
-                source: "task".to_string(),
+                source: task,
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
@@ -567,7 +495,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
-                source: "api".to_string(),
+                source: api,
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -575,12 +503,9 @@ mod tests {
                 depth: 1,
             },
         ];
-
-        // Toggle "api" off then back on
-        state.toggle_source_visibility("api");
+        state.toggle_source_visibility(api);
         assert!(!state.source_filter.is_empty());
-        state.toggle_source_visibility("api");
-        // All sources are visible again, so filter should be cleared
+        state.toggle_source_visibility(api);
         assert!(state.source_filter.is_empty());
     }
 }

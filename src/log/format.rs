@@ -25,7 +25,8 @@ pub fn format_entry(entry: &LogEntry) -> String {
     let gap = " ".repeat(COLUMN_GAP_WIDTH);
     let ts = pad_or_truncate(&entry.display_timestamp(), TIMESTAMP_WIDTH);
     let level = pad_or_truncate(&format_level(&entry.level), LEVEL_WIDTH);
-    let source = pad_or_truncate(&entry.source, SOURCE_WIDTH);
+    let source_str = entry.source.to_string();
+    let source = pad_or_truncate(&source_str, SOURCE_WIDTH);
     let message = entry.message.as_deref().unwrap_or(&entry.raw);
 
     let fields_str = format_fields_inline(&entry.fields);
@@ -51,11 +52,12 @@ pub fn format_entry_colored(entry: &LogEntry, source_colors: &mut SourceColors) 
     let gap = " ".repeat(COLUMN_GAP_WIDTH);
     let ts = pad_or_truncate(&entry.display_timestamp(), TIMESTAMP_WIDTH);
     let level = pad_or_truncate(&format_level(&entry.level), LEVEL_WIDTH);
-    let source = pad_or_truncate(&entry.source, SOURCE_WIDTH);
+    let source_str = entry.source.to_string();
+    let source = pad_or_truncate(&source_str, SOURCE_WIDTH);
     let message = entry.message.as_deref().unwrap_or(&entry.raw);
 
     let level_color = ansi::fg(THEME.level_color(&entry.level));
-    let source_color = ansi::fg(source_colors.color_for(&entry.source));
+    let source_color = ansi::fg(source_colors.color_for(entry.source));
     let dim = ansi::fg(THEME.dim);
     let r = ansi::RESET;
 
@@ -177,10 +179,11 @@ mod tests {
 
     #[test]
     fn test_format_entry_plain() {
+        use crate::execution::TaskId;
         let entry = LogEntry::new(
             "hello world".to_string(),
             ParsedContent::PlainText,
-            "my-task".to_string(),
+            TaskId(42),
             0,
             None,
             Some("info".to_string()),
@@ -189,12 +192,13 @@ mod tests {
         );
         let line = format_entry(&entry);
         assert!(line.contains("INFO"));
-        assert!(line.contains("my-task"));
+        assert!(line.contains("t42"));
         assert!(line.contains("hello world"));
     }
 
     #[test]
     fn test_format_entry_with_fields() {
+        use crate::execution::TaskId;
         let mut fields = HashMap::new();
         fields.insert(
             "latency".to_string(),
@@ -203,7 +207,7 @@ mod tests {
         let entry = LogEntry::new(
             r#"{"msg":"heartbeat","latency":42}"#.to_string(),
             ParsedContent::PlainText,
-            "api".to_string(),
+            TaskId(7),
             0,
             None,
             Some("info".to_string()),

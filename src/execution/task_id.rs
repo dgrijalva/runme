@@ -5,15 +5,18 @@
 //! allocator (`TaskId::next`) starts at 1 so the root id is never accidentally
 //! re-issued. Allocation is process-global (a module-static `AtomicU64`) so
 //! ids can be minted from any code path that doesn't have an `Engine`
-//! reference (e.g. tests, the seam in `Registry::run_with_registry`).
+//! reference (e.g. tests).
 //!
 //! See `docs/plans/notes/architecture.md` §1.
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::Serialize;
+
 /// Process-lifetime monotonic identifier for a task or spawned process.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize)]
+#[serde(transparent)]
 pub struct TaskId(pub u64);
 
 impl TaskId {

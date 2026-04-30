@@ -1,10 +1,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+#[allow(unused_imports)]
+use crate::execution::TaskId;
 use crate::log::LogEntry;
 
 use super::app::{AppMode, AppState};
 use super::render::DisplayMode;
-use super::runner::ProcessStatus;
 use super::sidebar;
 use super::viewport::{
     self, scroll_down, scroll_down_half_page, scroll_to_bottom, scroll_to_top, scroll_up,
@@ -28,13 +29,12 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
         KeyCode::Enter => {
             if let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) {
                 if entry.is_task {
-                    let source = entry.source.clone();
-                    state.toggle_source_visibility(&source);
+                    let source = entry.source;
+                    state.toggle_source_visibility(source);
                 } else {
-                    // Open process detail overlay
                     state.process_detail_index = Some(state.sidebar.selection);
                     state.process_detail_scroll = 0;
-                    state.process_detail_sockets = None; // will be polled
+                    state.process_detail_sockets = None;
                     state.mode = AppMode::ProcessDetail;
                 }
             }
@@ -43,8 +43,8 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
         // Space: toggle source visibility
         KeyCode::Char(' ') => {
             if let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) {
-                let source = entry.source.clone();
-                state.toggle_source_visibility(&source);
+                let source = entry.source;
+                state.toggle_source_visibility(source);
             }
         }
 
@@ -58,8 +58,6 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
             send_signal_to_selected(state, nix::sys::signal::Signal::SIGHUP);
         }
 
-        // -- Source toggle shortcuts (work in sidebar too) --
-
         // a: show all sources
         KeyCode::Char('a') => {
             state.show_all_sources();
@@ -69,8 +67,7 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
             if let Some(source) = sidebar::source_for_index(&state.sidebar_entries, idx) {
-                let source = source.to_string();
-                state.toggle_source_visibility(&source);
+                state.toggle_source_visibility(source);
             }
         }
 
@@ -275,8 +272,7 @@ pub(super) fn handle_log_viewer_key(
         KeyCode::Char(c @ '1'..='9') => {
             let idx = (c as usize) - ('1' as usize);
             if let Some(source) = sidebar::source_for_index(&state.sidebar_entries, idx) {
-                let source = source.to_string();
-                state.toggle_source_visibility(&source);
+                state.toggle_source_visibility(source);
             }
         }
 
@@ -677,66 +673,26 @@ pub(super) fn send_signal_to_selected(state: &mut AppState, sig: nix::sys::signa
         Some(e) => e,
         None => return,
     };
-
-    // Skip task entries — only processes can be signaled
     if entry.is_task {
         return;
     }
-
-    // Find the matching process in the shared process list.
-    // The sidebar entries are built from processes, and we match by command_label.
-    // Since we don't have direct access to the mutex here (we're in a sync context),
-    // we use try_lock. The processes Arc is available on state.
-    if let Some(procs_arc) = &state.processes
-        && let Ok(mut procs) = procs_arc.try_lock()
-    {
-        // Find process matching this sidebar entry.
-        // Sidebar entry index 0 is the task, so process index = selection - 1
-        // (assuming task entry is present and is always first).
-        let proc_idx = if state.task_name.is_some() {
-            selection.checked_sub(1)
-        } else {
-            Some(selection)
-        };
-
-        if let Some(idx) = proc_idx {
-            // The sidebar lists running processes first, then completed.
-            // We need to find the right process. The sidebar build_sidebar_entries
-            // orders: running (by spawn order) then completed (by spawn order).
-            // The processes Vec is in spawn order. We need to map sidebar index
-            // back to the processes vec.
-            let mut running_indices: Vec<usize> = Vec::new();
-            let mut completed_indices: Vec<usize> = Vec::new();
-            for (i, p) in procs.iter().enumerate() {
-                if p.status == ProcessStatus::Running {
-                    running_indices.push(i);
-                } else {
-                    completed_indices.push(i);
-                }
-            }
-            let ordered: Vec<usize> = running_indices
-                .into_iter()
-                .chain(completed_indices)
-                .collect();
-
-            if let Some(&proc_vec_idx) = ordered.get(idx) {
-                let proc = &mut procs[proc_vec_idx];
-
-                // Try pgid first (sends to process group), then pid
+    // Find the process in the engine's graph snapshot, matched by id.
+    let Some(handle) = state.engine.as_ref() else {
+        return;
+    };
+    let snapshot = handle.graph.borrow().clone();
+    for node in snapshot.tasks.values() {
+        for proc in &node.processes {
+            if proc.id == entry.source {
                 let target_pid = if let Some(pgid) = proc.pgid {
-                    // Negative pid sends to the process group
                     Some(Pid::from_raw(-pgid))
                 } else {
                     proc.pid.map(|pid| Pid::from_raw(pid as i32))
                 };
-
                 if let Some(pid) = target_pid {
                     let _ = signal::kill(pid, sig);
-                    // If we sent SIGTERM, mark as Stopped
-                    if sig == signal::Signal::SIGTERM {
-                        proc.status = ProcessStatus::Stopped;
-                    }
                 }
+                return;
             }
         }
     }
@@ -952,7 +908,7 @@ fn copy_stream_to_clipboard(state: &mut AppState) {
     };
 
     let source = match state.log_lines.get(cursor_idx) {
-        Some(entry) => entry.source.clone(),
+        Some(entry) => entry.source,
         None => return,
     };
 
@@ -967,7 +923,7 @@ fn copy_stream_to_clipboard(state: &mut AppState) {
     let content = entries.join("\n");
     osc52_copy(&content);
     state.notifications.push((
-        format!("Copied {} entries from '{}'", count, source),
+        format!("Copied {} entries from {}", count, source),
         std::time::Instant::now(),
     ));
     state.dirty = true;
@@ -1024,7 +980,7 @@ mod tests {
         }
     }
 
-    fn make_log_entry(raw: &str, source: &str) -> LogEntry {
+    fn make_log_entry(raw: &str, source: TaskId) -> LogEntry {
         use crate::log::ParsedContent;
         use std::collections::HashMap;
 
@@ -1032,7 +988,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source,
             seq: 0,
             timestamp: None,
             level: Some("info".to_string()),
@@ -1049,7 +1005,7 @@ mod tests {
         state.sidebar_entries = vec![
             SidebarEntry {
                 name: "task".to_string(),
-                source: "task".to_string(),
+                source: TaskId(1),
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
@@ -1058,7 +1014,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "api".to_string(),
-                source: "api".to_string(),
+                source: TaskId(2),
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -1067,7 +1023,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "worker".to_string(),
-                source: "worker".to_string(),
+                source: TaskId(3),
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -1104,10 +1060,12 @@ mod tests {
     #[test]
     fn number_keys_toggle_source() {
         let mut state = AppState::new();
+        let task_id = TaskId(1);
+        let api_id = TaskId(2);
         state.sidebar_entries = vec![
             SidebarEntry {
                 name: "task".to_string(),
-                source: "task".to_string(),
+                source: task_id,
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
@@ -1116,7 +1074,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "api".to_string(),
-                source: "api".to_string(),
+                source: api_id,
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -1125,7 +1083,6 @@ mod tests {
             },
         ];
 
-        // Press '2' to toggle the second source (api)
         handle_log_viewer_key(
             make_key_event(KeyCode::Char('2'), KeyModifiers::NONE),
             &mut state,
@@ -1133,15 +1090,14 @@ mod tests {
             24,
             80,
         );
-        // Should have toggled — now showing all except "api"
-        assert!(state.source_filter.contains("task"));
-        assert!(!state.source_filter.contains("api"));
+        assert!(state.source_filter.contains(&task_id));
+        assert!(!state.source_filter.contains(&api_id));
     }
 
     #[test]
     fn a_key_shows_all() {
         let mut state = AppState::new();
-        state.source_filter.insert("api".to_string());
+        state.source_filter.insert(TaskId(2));
         assert!(!state.source_filter.is_empty());
 
         handle_log_viewer_key(
@@ -1159,7 +1115,7 @@ mod tests {
     #[test]
     fn enter_opens_detail_view() {
         let mut state = AppState::new();
-        state.log_lines.push(make_log_entry("hello", "test"));
+        state.log_lines.push(make_log_entry("hello", TaskId(1)));
         // Pin to entry 0 so there's a cursor
         state.scroll = ScrollState::Pinned { cursor: 0, top: 0 };
 
@@ -1194,7 +1150,7 @@ mod tests {
     #[test]
     fn detail_esc_closes() {
         let mut state = AppState::new();
-        state.log_lines.push(make_log_entry("hello", "test"));
+        state.log_lines.push(make_log_entry("hello", TaskId(1)));
         state.mode = AppMode::EntryDetail;
 
         handle_detail_key(
@@ -1275,7 +1231,7 @@ mod tests {
         for i in 0..5 {
             state
                 .log_lines
-                .push(make_log_entry(&format!("entry {}", i), "test"));
+                .push(make_log_entry(&format!("entry {}", i), TaskId(1)));
         }
         state.scroll = ScrollState::Pinned { cursor: 2, top: 0 };
         state.mode = AppMode::EntryDetail;
@@ -1302,7 +1258,7 @@ mod tests {
         for i in 0..5 {
             state
                 .log_lines
-                .push(make_log_entry(&format!("entry {}", i), "test"));
+                .push(make_log_entry(&format!("entry {}", i), TaskId(1)));
         }
         state.scroll = ScrollState::Pinned { cursor: 2, top: 0 };
         state.mode = AppMode::EntryDetail;
@@ -1333,7 +1289,7 @@ mod tests {
         state.sidebar.selection = 0;
         state.sidebar_entries = vec![SidebarEntry {
             name: "my-task".to_string(),
-            source: "my-task".to_string(),
+            source: TaskId(7),
             status_tag: "SETUP".to_string(),
             status_color: Color::Yellow,
             visible: true,
@@ -1350,15 +1306,14 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_s_without_processes_is_noop() {
+    fn sidebar_s_without_engine_is_noop() {
         let mut state = AppState::new();
         state.sidebar.focused = true;
         state.sidebar.selection = 1;
-        state.task_name = Some("test".to_string());
         state.sidebar_entries = vec![
             SidebarEntry {
                 name: "test".to_string(),
-                source: "test".to_string(),
+                source: TaskId(1),
                 status_tag: "READY".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -1367,7 +1322,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
-                source: "test".to_string(),
+                source: TaskId(2),
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -1375,14 +1330,11 @@ mod tests {
                 depth: 1,
             },
         ];
-        // No processes Arc — should be a no-op
-        state.processes = None;
-
+        // No engine wired — should be a no-op
         handle_sidebar_key(
             make_key_event(KeyCode::Char('s'), KeyModifiers::NONE),
             &mut state,
         );
-        // No crash is the test here
     }
 
     // -- Process detail tests --
@@ -1391,11 +1343,11 @@ mod tests {
     fn sidebar_enter_on_process_opens_detail() {
         let mut state = AppState::new();
         state.sidebar.focused = true;
-        state.sidebar.selection = 1; // process entry
+        state.sidebar.selection = 1;
         state.sidebar_entries = vec![
             SidebarEntry {
                 name: "task".to_string(),
-                source: "task".to_string(),
+                source: TaskId(1),
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
@@ -1404,7 +1356,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
-                source: "task".to_string(),
+                source: TaskId(2),
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -1426,11 +1378,11 @@ mod tests {
     fn sidebar_enter_on_task_toggles_visibility() {
         let mut state = AppState::new();
         state.sidebar.focused = true;
-        state.sidebar.selection = 0; // task entry
+        state.sidebar.selection = 0;
         state.sidebar_entries = vec![
             SidebarEntry {
                 name: "task".to_string(),
-                source: "task".to_string(),
+                source: TaskId(1),
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
@@ -1439,7 +1391,7 @@ mod tests {
             },
             SidebarEntry {
                 name: "echo hello".to_string(),
-                source: "api".to_string(),
+                source: TaskId(2),
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
@@ -1452,7 +1404,6 @@ mod tests {
             make_key_event(KeyCode::Enter, KeyModifiers::NONE),
             &mut state,
         );
-        // Should stay in Normal mode (task toggle, not process detail)
         assert_eq!(state.mode, AppMode::Normal);
     }
 

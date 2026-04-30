@@ -141,16 +141,16 @@ impl Drop for TaskHandle {
 
 #[cfg(test)]
 mod tests {
-    //! Slice 3 tests: token-fires-on-drop, awaited handle returns Ok,
-    //! child appears in parent's children list. The full cancel ladder
-    //! (process stop, body wait, abort, status write) ships in slice 4
-    //! and has its own tests there.
+    //! `TaskHandle` tests, all driven through a real `Engine` so they
+    //! exercise the production path end-to-end. Engine-less paths no
+    //! longer exist (item 1 of the dual-path cleanup).
 
     use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
 
     use crate::error::{TaskError, TaskResult};
+    use crate::execution::{Engine, TaskId, TaskStatus};
     use crate::task::{Registry, TaskContext, TaskDef, TaskFnKind};
 
     fn no_args() -> Option<clap::Command> {
@@ -169,12 +169,24 @@ mod tests {
         _args: &[String],
     ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
         Box::pin(async move {
-            // Stays alive until cancelled; only fails the test if the
-            // sleep completes (drop-cancellation didn't fire).
             tokio::select! {
                 _ = ctx.cancellation_signal() => Err(TaskError::cancelled()),
                 _ = tokio::time::sleep(Duration::from_secs(30)) => Ok(()),
             }
+        })
+    }
+
+    fn parent_task<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move {
+            // Spawn (not await) so the parent's body returns before the
+            // child finishes. The child must already be in
+            // `parent.children` by the time spawn returns.
+            let h = ctx.run("ok", &[]).spawn()?;
+            drop(h);
+            Ok(())
         })
     }
 
@@ -196,199 +208,134 @@ mod tests {
         ui_hint: None,
     };
 
-    fn ctx_with_registry(reg: Arc<Registry>) -> TaskContext {
-        let mut ctx = TaskContext::new("test-parent");
-        ctx.set_registry(reg);
-        ctx
+    static PARENT: TaskDef = TaskDef {
+        name: "parent",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(parent_task),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
+    fn build_registry(extras: &[&'static TaskDef]) -> Arc<Registry> {
+        let mut r = Registry::new();
+        for d in extras {
+            r.register(d);
+        }
+        Arc::new(r)
+    }
+
+    async fn wait_terminal(
+        handle: &crate::execution::EngineHandle,
+        id: TaskId,
+    ) -> TaskStatus {
+        let mut graph = handle.graph.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snap = graph.borrow().clone();
+            if let Some(node) = snap.tasks.get(&id) {
+                match &node.status {
+                    TaskStatus::Done
+                    | TaskStatus::Failed(_)
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Timeout => return node.status.clone(),
+                    _ => {}
+                }
+            }
+            tokio::select! {
+                _ = graph.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("task {id} did not reach terminal status before deadline");
+                }
+            }
+        }
     }
 
     #[tokio::test]
-    async fn handle_awaited_returns_ok_for_successful_task() {
-        let mut reg = Registry::new();
-        reg.register(&OK);
-        let reg = Arc::new(reg);
-
-        let ctx = ctx_with_registry(reg);
-        let handle = ctx
-            .run("ok", &[])
-            .spawn()
-            .expect("spawn should succeed for resolvable task");
-
-        let result = handle.await;
-        assert!(result.is_ok(), "awaited handle should yield Ok: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn builder_await_runs_to_completion() {
-        let mut reg = Registry::new();
-        reg.register(&OK);
-        let reg = Arc::new(reg);
-
-        let ctx = ctx_with_registry(reg);
-        let result = ctx.run("ok", &[]).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn handle_dropped_un_awaited_fires_cancellation_token() {
-        let mut reg = Registry::new();
-        reg.register(&SLOW);
-        let reg = Arc::new(reg);
-
-        let ctx = ctx_with_registry(reg);
-        let handle = ctx
-            .run("slow", &[])
-            .spawn()
-            .expect("spawn should succeed for resolvable task");
-
-        let token = handle.cancellation();
-        assert!(!token.is_cancelled(), "token must start un-cancelled");
-
-        drop(handle);
-
-        // Token should be tripped synchronously by Drop.
-        assert!(
-            token.is_cancelled(),
-            "dropping an un-awaited TaskHandle must fire its cancellation token (slice 3)"
-        );
-    }
-
-    #[tokio::test]
-    async fn awaited_handle_does_not_fire_cancellation() {
-        let mut reg = Registry::new();
-        reg.register(&OK);
-        let reg = Arc::new(reg);
-
-        let ctx = ctx_with_registry(reg);
-        let handle = ctx
-            .run("ok", &[])
-            .spawn()
-            .expect("spawn should succeed");
-        let token = handle.cancellation();
-
-        let _ = handle.await;
-
-        // After awaiting, the body completed normally; Drop must NOT
-        // have fired the token.
-        assert!(
-            !token.is_cancelled(),
-            "awaited handle's IntoFuture must disarm Drop"
-        );
+    async fn engine_spawn_task_returns_id_and_completes() {
+        let registry = build_registry(&[&OK]);
+        let (engine, handle) = Engine::start(registry);
+        let id = handle.spawn_task(&OK, vec![]).await.expect("spawn ok");
+        let status = wait_terminal(&handle, id).await;
+        assert!(matches!(status, TaskStatus::Done));
+        let _ = handle.quit().await;
+        engine.shutdown().await;
     }
 
     #[tokio::test]
     async fn child_appears_in_parents_children_list() {
-        // Build a parent TaskExecution-backed context (mirrors what
-        // `TaskExecution::launch_with_self_weak` does inside the
-        // engine), then have its body call `ctx.run` and inspect
-        // the parent's children list.
-        use crate::execution::{TaskExecution, TaskId};
-        use crate::log::store::LogStore;
-        use tokio::sync::Mutex;
+        // Parent body uses ctx.run("ok"). After completion, the engine's
+        // graph snapshot should show "ok" as a child of "parent".
+        let registry = build_registry(&[&OK, &PARENT]);
+        let (engine, handle) = Engine::start(registry);
+        let parent_id = handle
+            .spawn_task(&PARENT, vec![])
+            .await
+            .expect("spawn parent");
+        let _ = wait_terminal(&handle, parent_id).await;
+        // Brief sleep so the child snapshot publish settles.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let snap = handle.graph.borrow().clone();
+        let parent_node = snap.tasks.get(&parent_id).expect("parent in graph");
+        assert_eq!(parent_node.children.len(), 1);
+        let child_id = parent_node.children[0];
+        let child_node = snap.tasks.get(&child_id).expect("child in graph");
+        assert_eq!(child_node.name, "ok");
+        assert_eq!(child_node.parent, Some(parent_id));
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
 
-        fn parent_task<'a>(
-            ctx: &'a TaskContext,
-            _args: &[String],
-        ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
-            Box::pin(async move {
-                // Use spawn (not await) so the parent's body returns
-                // before the child finishes. The child must already
-                // be in `parent.children` by the time spawn returns.
-                let _handle = ctx.run("ok", &[]).spawn()?;
-                // Drop the handle un-awaited — slice 3 only fires the
-                // token; the registered child node still lives in
-                // parent.children.
-                drop(_handle);
-                Ok(())
-            })
+    #[tokio::test]
+    async fn dropped_handle_fires_cancellation() {
+        // Spawn a SLOW task at the engine level, build a TaskHandle
+        // pointing at it, and drop it. The cancel ladder should fire
+        // the token (step 1) almost immediately.
+        let registry = build_registry(&[&SLOW]);
+        let (engine, handle) = Engine::start(registry);
+        let id = handle.spawn_task(&SLOW, vec![]).await.expect("spawn slow");
+        let exec = handle.lookup(id).expect("exec in table");
+        let token = exec.cancellation.clone();
+        assert!(!token.is_cancelled());
+
+        let internals_weak = std::sync::Arc::downgrade(&handle.internals);
+        let h = super::TaskHandle::new(exec.clone(), internals_weak);
+        drop(h);
+
+        for _ in 0..100 {
+            if token.is_cancelled() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        assert!(token.is_cancelled(), "Drop should fire cancellation token");
 
-        static PARENT: TaskDef = TaskDef {
-            name: "parent",
-            description: None,
-            group: "",
-            func: TaskFnKind::Static(parent_task),
-            arg_metadata: no_args,
-            ui_hint: None,
-        };
-
-        let mut reg = Registry::new();
-        reg.register(&OK);
-        reg.register(&PARENT);
-        let reg = Arc::new(reg);
-
-        let log_store = Arc::new(Mutex::new(LogStore::new()));
-        let parent_exec =
-            Arc::new_cyclic(|weak: &std::sync::Weak<TaskExecution>| {
-                let mut e = TaskExecution::with_log_store(
-                    TaskId::next(),
-                    log_store.clone(),
-                );
-                e.set_registry(reg.clone());
-                e.launch_with_self_weak(weak.clone(), &PARENT, vec![]);
-                e
-            });
-
-        // Wait for the parent body to finish. After it returns, the
-        // child must be in parent_exec.children.
-        let _ = parent_exec.wait().await;
-
-        let kids = parent_exec.children.lock().await;
-        assert_eq!(
-            kids.len(),
-            1,
-            "parent should have exactly one child after `ctx.run` was called"
-        );
-        assert_eq!(kids[0].task_name, "ok", "child node should reflect the spawned task");
-        assert_eq!(
-            kids[0].parent,
-            Some(parent_exec.id),
-            "child's parent_id should match the parent's id"
-        );
+        let _ = handle.quit().await;
+        engine.shutdown().await;
     }
 
     #[tokio::test]
-    async fn timeout_setter_is_inert_in_slice_3() {
-        // Slice 3 stores `timeout` on the builder but does not wire a
-        // watchdog. This test pins the contract: setting `.timeout`
-        // and awaiting should still resolve to Ok for a fast task.
-        let mut reg = Registry::new();
-        reg.register(&OK);
-        let reg = Arc::new(reg);
-
-        let ctx = ctx_with_registry(reg);
-        let result = ctx
-            .run("ok", &[])
-            .timeout(Duration::from_millis(1))
-            .await;
-
-        assert!(
-            result.is_ok(),
-            "slice 3: .timeout() is configuration only; the watchdog lands in slice 4"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_with_unknown_task_returns_error_at_await() {
-        let reg = Arc::new(Registry::new());
-        let ctx = ctx_with_registry(reg);
+    async fn run_unknown_task_errors_at_await() {
+        let registry = build_registry(&[]);
+        let (engine, handle) = Engine::start(registry.clone());
+        let mut ctx = TaskContext::new("orphan");
+        ctx.set_registry(registry.clone());
         let result = ctx.run("nonexistent", &[]).await;
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "unknown task: nonexistent"
-        );
+        assert_eq!(result.unwrap_err().to_string(), "unknown task: nonexistent");
+        let _ = handle.quit().await;
+        engine.shutdown().await;
     }
 
     #[tokio::test]
-    async fn run_without_registry_returns_error_at_await() {
-        let ctx = TaskContext::new("orphan");
+    async fn run_without_engine_errors_at_await() {
+        let mut reg = Registry::new();
+        reg.register(&OK);
+        let mut ctx = TaskContext::new("orphan");
+        ctx.set_registry(Arc::new(reg));
         let result = ctx.run("ok", &[]).await;
         assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "no registry available"
-        );
+        assert_eq!(result.unwrap_err().to_string(), "no engine context");
     }
 }
 

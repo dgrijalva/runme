@@ -82,8 +82,13 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
         match ui {
             UiMode::Tui => {
                 let tasks = registry.list().to_vec();
-                let mut app = App::with_picker(tasks, group_names, registry.clone());
-                if let Err(e) = app.run().await {
+                let (engine, handle) = crate::execution::Engine::start(registry.clone());
+                let mut app =
+                    App::with_picker(tasks, group_names, registry.clone(), handle.clone());
+                let result = app.run().await;
+                let _ = handle.quit().await;
+                engine.shutdown().await;
+                if let Err(e) = result {
                     eprintln!("TUI error: {}", e);
                     std::process::exit(1);
                 }
@@ -131,8 +136,13 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
 
     match ui {
         UiMode::Tui => {
-            let mut app = App::with_task(task, task_args, registry.clone());
-            if let Err(e) = app.run().await {
+            let (engine, handle) = crate::execution::Engine::start(registry.clone());
+            let mut app =
+                App::with_task(task, task_args, registry.clone(), handle.clone()).await;
+            let result = app.run().await;
+            let _ = handle.quit().await;
+            engine.shutdown().await;
+            if let Err(e) = result {
                 eprintln!("TUI error: {}", e);
                 std::process::exit(1);
             }
@@ -177,7 +187,7 @@ async fn run_cli(
     let (engine, handle) = Engine::start(registry.clone());
 
     // Subscribe to LogStore → stdio BEFORE launching the task.
-    let rx = handle.subscribe_logs().await;
+    let rx = handle.subscribe_logs();
     let use_raw = matches!(format, OutputFormat::Raw);
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tokio::spawn(forward_output_to_stdio(rx, use_raw, use_color));

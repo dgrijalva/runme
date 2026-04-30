@@ -1,7 +1,12 @@
 //! Process sidebar widget for the TUI.
 //!
-//! Renders a sidebar showing the task and its spawned processes with status
-//! indicators. Three sections: Task (top), Running processes, Completed processes.
+//! Renders a sidebar showing tasks and their spawned processes with status
+//! indicators. Entries are built from the engine's `GraphSnapshot` so the
+//! TUI never duplicates lifecycle bookkeeping.
+//!
+//! See `docs/plans/notes/architecture.md` §5/§9.
+
+use std::collections::HashSet;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -9,8 +14,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::theme::{THEME, SourceColors};
-use super::runner::{ProcessInfo, ProcessStatus, TaskSession, TaskStatus};
+use crate::execution::{
+    GraphSnapshot, ProcessStatus, TaskId, TaskNode, TaskStatus,
+};
+use crate::theme::{SourceColors, THEME};
 
 /// Fixed sidebar width in columns.
 pub const SIDEBAR_WIDTH: u16 = 28;
@@ -21,7 +28,6 @@ pub struct SidebarState {
     /// Whether the sidebar has keyboard focus.
     pub focused: bool,
     /// Index of the selected entry in the sidebar list.
-    /// 0 = the task itself, 1..N = processes in display order.
     pub selection: usize,
 }
 
@@ -33,19 +39,16 @@ impl SidebarState {
         }
     }
 
-    /// Move selection up, clamping at 0.
     pub fn move_up(&mut self) {
         self.selection = self.selection.saturating_sub(1);
     }
 
-    /// Move selection down, clamping at max_entries - 1.
     pub fn move_down(&mut self, max_entries: usize) {
         if max_entries > 0 {
             self.selection = (self.selection + 1).min(max_entries - 1);
         }
     }
 
-    /// Clamp selection to valid range.
     pub fn clamp_selection(&mut self, max_entries: usize) {
         if max_entries == 0 {
             self.selection = 0;
@@ -61,14 +64,14 @@ impl Default for SidebarState {
     }
 }
 
-/// An entry in the sidebar's display list. This is a snapshot taken at render
-/// time from the runner's process list.
+/// An entry in the sidebar's display list, derived from the engine's
+/// `GraphSnapshot` at render time.
 #[derive(Debug, Clone)]
 pub struct SidebarEntry {
-    /// Display name (task name or command label).
+    /// Display name (task name or process command label).
     pub name: String,
-    /// Source name for log filtering (matches LogEntry.source).
-    pub source: String,
+    /// Source `TaskId` for log filtering (matches `LogEntry.source`).
+    pub source: TaskId,
     /// Status tag text (e.g., "SETUP", "RUN", "DONE", "FAIL").
     pub status_tag: String,
     /// Color for the status tag.
@@ -81,154 +84,112 @@ pub struct SidebarEntry {
     pub depth: usize,
 }
 
-/// Build the list of sidebar entries from current task/process state.
+/// Build the list of sidebar entries from the engine's graph snapshot.
 ///
-/// Returns a Vec where index 0 is the task, and subsequent entries are
-/// processes ordered: running first (by spawn order), then completed.
-pub fn build_sidebar_entries(
-    task_name: Option<&str>,
-    task_status: &TaskStatus,
-    processes: &[ProcessInfo],
-    visible_sources: &std::collections::HashSet<String>,
+/// Lists every direct child of `TaskId::ROOT` as a top-level task, with its
+/// processes nested under it (running first, then completed). The synthetic
+/// root itself is not rendered.
+pub fn build_sidebar_entries_from_graph(
+    snapshot: &GraphSnapshot,
+    visible_sources: &HashSet<TaskId>,
     source_colors: &mut SourceColors,
 ) -> Vec<SidebarEntry> {
     let mut entries = Vec::new();
 
-    // Task entry
-    if let Some(name) = task_name {
-        let (tag, color) = task_status_display(task_status);
-        // Ensure a color is assigned for the task source
-        let _ = source_colors.color_for(name);
-        entries.push(SidebarEntry {
-            name: name.to_string(),
-            source: name.to_string(),
-            status_tag: tag,
-            status_color: color,
-            visible: visible_sources.is_empty() || visible_sources.contains(name),
-            is_task: true,
-            depth: 0,
-        });
-    }
+    // Walk children of root in deterministic order: order in `children`
+    // reflects spawn order, which is what users expect.
+    let Some(root) = snapshot.tasks.get(&snapshot.root) else {
+        return entries;
+    };
 
-    // Determine process depth: 1 if under a task, 0 if standalone
-    let proc_depth = if task_name.is_some() { 1 } else { 0 };
-
-    // Partition processes into running and completed
-    let mut running: Vec<&ProcessInfo> = Vec::new();
-    let mut completed: Vec<&ProcessInfo> = Vec::new();
-
-    for proc in processes {
-        match proc.status {
-            ProcessStatus::Running => running.push(proc),
-            _ => completed.push(proc),
-        }
-    }
-
-    // Running processes
-    for proc in &running {
-        let _ = source_colors.color_for(&proc.task_name);
-        entries.push(SidebarEntry {
-            name: proc.display_name().to_string(),
-            source: proc.task_name.clone(),
-            status_tag: "RUN".to_string(),
-            status_color: THEME.status_running,
-            visible: visible_sources.is_empty() || visible_sources.contains(&proc.task_name),
-            is_task: false,
-            depth: proc_depth,
-        });
-    }
-
-    // Completed processes
-    for proc in &completed {
-        let (tag, color) = process_status_display(&proc.status);
-        let _ = source_colors.color_for(&proc.task_name);
-        entries.push(SidebarEntry {
-            name: proc.display_name().to_string(),
-            source: proc.task_name.clone(),
-            status_tag: tag,
-            status_color: color,
-            visible: visible_sources.is_empty() || visible_sources.contains(&proc.task_name),
-            is_task: false,
-            depth: proc_depth,
-        });
+    // Recursive walk so descendant tasks (`ctx.run` children) appear under
+    // their parent at depth+1, processes at depth+2. For now we keep depth
+    // at 0/1 — multi-level nesting is a downstream UX pass.
+    for &child_id in &root.children {
+        push_task_subtree(snapshot, child_id, 0, visible_sources, source_colors, &mut entries);
     }
 
     entries
 }
 
-/// Build sidebar entries from multiple task sessions.
-///
-/// Groups entries by session: each session contributes a task entry at depth 0,
-/// followed by its processes at depth 1. Running processes appear before
-/// completed ones within each session.
-pub async fn build_sidebar_entries_multi(
-    sessions: &[TaskSession],
-    visible_sources: &std::collections::HashSet<String>,
+fn push_task_subtree(
+    snapshot: &GraphSnapshot,
+    id: TaskId,
+    depth: usize,
+    visible_sources: &HashSet<TaskId>,
     source_colors: &mut SourceColors,
-) -> Vec<SidebarEntry> {
-    let mut entries = Vec::new();
+    out: &mut Vec<SidebarEntry>,
+) {
+    let Some(node) = snapshot.tasks.get(&id) else {
+        return;
+    };
+    push_task_entry(node, depth, visible_sources, source_colors, out);
+    push_process_entries(node, depth + 1, visible_sources, source_colors, out);
+    for &child in &node.children {
+        push_task_subtree(snapshot, child, depth + 1, visible_sources, source_colors, out);
+    }
+}
 
-    for session in sessions {
-        let task_status = session.status.lock().await.clone();
-        let procs = session.processes.lock().await;
+fn push_task_entry(
+    node: &TaskNode,
+    depth: usize,
+    visible_sources: &HashSet<TaskId>,
+    source_colors: &mut SourceColors,
+    out: &mut Vec<SidebarEntry>,
+) {
+    let (tag, color) = task_status_display(&node.status);
+    let _ = source_colors.color_for(node.id);
+    out.push(SidebarEntry {
+        name: node.name.clone(),
+        source: node.id,
+        status_tag: tag,
+        status_color: color,
+        visible: visible_sources.is_empty() || visible_sources.contains(&node.id),
+        is_task: true,
+        depth,
+    });
+}
 
-        let (tag, color) = task_status_display(&task_status);
-        let _ = source_colors.color_for(&session.task_name);
-        entries.push(SidebarEntry {
-            name: session.task_name.clone(),
-            source: session.task_name.clone(),
-            status_tag: tag,
-            status_color: color,
-            visible: visible_sources.is_empty()
-                || visible_sources.contains(&session.task_name),
-            is_task: true,
-            depth: 0,
-        });
-
-        // Partition processes into running and completed
-        let mut running: Vec<&ProcessInfo> = Vec::new();
-        let mut completed: Vec<&ProcessInfo> = Vec::new();
-
-        for proc in procs.iter() {
-            match proc.status {
-                ProcessStatus::Running => running.push(proc),
-                _ => completed.push(proc),
-            }
-        }
-
-        // Running processes under this task
-        for proc in &running {
-            let _ = source_colors.color_for(&proc.task_name);
-            entries.push(SidebarEntry {
-                name: proc.display_name().to_string(),
-                source: proc.task_name.clone(),
-                status_tag: "RUN".to_string(),
-                status_color: THEME.status_running,
-                visible: visible_sources.is_empty()
-                    || visible_sources.contains(&proc.task_name),
-                is_task: false,
-                depth: 1,
-            });
-        }
-
-        // Completed processes under this task
-        for proc in &completed {
-            let (tag, color) = process_status_display(&proc.status);
-            let _ = source_colors.color_for(&proc.task_name);
-            entries.push(SidebarEntry {
-                name: proc.display_name().to_string(),
-                source: proc.task_name.clone(),
-                status_tag: tag,
-                status_color: color,
-                visible: visible_sources.is_empty()
-                    || visible_sources.contains(&proc.task_name),
-                is_task: false,
-                depth: 1,
-            });
+fn push_process_entries(
+    node: &TaskNode,
+    depth: usize,
+    visible_sources: &HashSet<TaskId>,
+    source_colors: &mut SourceColors,
+    out: &mut Vec<SidebarEntry>,
+) {
+    let mut running = Vec::new();
+    let mut completed = Vec::new();
+    for proc in &node.processes {
+        match proc.status {
+            ProcessStatus::Running => running.push(proc),
+            _ => completed.push(proc),
         }
     }
-
-    entries
+    for proc in running {
+        let _ = source_colors.color_for(proc.id);
+        out.push(SidebarEntry {
+            name: proc.command_label.clone(),
+            source: proc.id,
+            status_tag: "RUN".to_string(),
+            status_color: THEME.status_running,
+            visible: visible_sources.is_empty() || visible_sources.contains(&proc.id),
+            is_task: false,
+            depth,
+        });
+    }
+    for proc in completed {
+        let (tag, color) = process_status_display(&proc.status);
+        let _ = source_colors.color_for(proc.id);
+        out.push(SidebarEntry {
+            name: proc.command_label.clone(),
+            source: proc.id,
+            status_tag: tag,
+            status_color: color,
+            visible: visible_sources.is_empty() || visible_sources.contains(&proc.id),
+            is_task: false,
+            depth,
+        });
+    }
 }
 
 /// Render the sidebar into the given area.
@@ -245,11 +206,7 @@ pub fn render_sidebar(
         .title(Span::styled(
             " processes ",
             Style::default()
-                .fg(if state.focused {
-                    THEME.accent
-                } else {
-                    THEME.dim
-                })
+                .fg(if state.focused { THEME.accent } else { THEME.dim })
                 .add_modifier(Modifier::BOLD),
         ));
 
@@ -266,57 +223,40 @@ pub fn render_sidebar(
     }
 
     let mut lines: Vec<Line<'static>> = Vec::new();
-    // Fixed columns: prefix (2) + marker+space (2) + padding (1) + longest tag [SETUP] (7) = 12
     let base_overhead = 12_u16;
 
     for (i, entry) in entries.iter().enumerate() {
         let is_selected = state.focused && i == state.selection;
-
-        // Indentation based on depth (2 chars per level)
         let indent_width = entry.depth * 2;
         let indent = " ".repeat(indent_width);
         let max_name_width =
             inner.width.saturating_sub(base_overhead + indent_width as u16) as usize;
-
-        // Build the line: "  name  [TAG]" or "> name  [TAG]" if selected
         let prefix = if is_selected { "> " } else { "  " };
-
-        // Source color for the name
-        let name_color = source_colors.color_for(&entry.source);
+        let name_color = source_colors.color_for(entry.source);
         let name_style = if !entry.visible {
-            Style::default().fg(THEME.dim) // dimmed when filtered out
+            Style::default().fg(THEME.dim)
         } else if entry.is_task {
-            Style::default()
-                .fg(name_color)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(name_color).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(name_color)
         };
-
-        // Truncate name to fit
         let display_name = if entry.name.len() > max_name_width {
             format!("{}~", &entry.name[..max_name_width.saturating_sub(1)])
         } else {
             entry.name.clone()
         };
-
-        // Right-align the status tag
         let tag = format!("[{}]", entry.status_tag);
-        // Total line: prefix(2) + indent + marker+space(2) + name + padding + tag
         let used = prefix.len() + indent_width + 2 + display_name.len() + tag.len();
         let padding = if used < inner.width as usize {
             " ".repeat(inner.width as usize - used)
         } else {
             " ".to_string()
         };
-
-        // Dim everything when the source is hidden
         let tag_style = if !entry.visible {
             Style::default().fg(THEME.dim)
         } else {
             Style::default().fg(entry.status_color)
         };
-
         let visibility_marker = if !entry.visible { "-" } else { "*" };
         let marker_style = if !entry.visible {
             Style::default().fg(THEME.dim)
@@ -341,9 +281,7 @@ pub fn render_sidebar(
         spans.push(Span::raw(padding));
         spans.push(Span::styled(tag, tag_style));
 
-        // If this is a section separator, add a blank line before completed processes
         if i > 0 && !entry.is_task {
-            // Check if this is the first completed entry (transition from running to non-running)
             let prev = &entries[i - 1];
             let prev_is_running = prev.status_tag == "RUN" || prev.is_task;
             let curr_is_completed = entry.status_tag != "RUN";
@@ -363,23 +301,19 @@ pub fn render_sidebar(
     frame.render_widget(paragraph, inner);
 }
 
-/// Get display tag and color for a TaskStatus.
-fn task_status_display(status: &TaskStatus) -> (String, Color) {
+/// Get display tag and color for a `TaskStatus`.
+pub fn task_status_display(status: &TaskStatus) -> (String, Color) {
     match status {
         TaskStatus::Setup => ("SETUP".to_string(), THEME.status_setup),
         TaskStatus::Ready => ("READY".to_string(), THEME.status_running),
         TaskStatus::Done => ("DONE".to_string(), THEME.status_done),
         TaskStatus::Failed(_) => ("FAIL".to_string(), THEME.status_failed),
-        // Slice 2 (multi-task runtime): new sibling variants. Engine cancel
-        // ladder + timeout watchdog (slice 4) write these. Render as
-        // failure-colored for now; richer styling can land alongside the UX
-        // pass.
         TaskStatus::Cancelled => ("CANCEL".to_string(), THEME.status_failed),
         TaskStatus::Timeout => ("TIMEOUT".to_string(), THEME.status_failed),
     }
 }
 
-/// Get display tag and color for a ProcessStatus.
+/// Get display tag and color for a `ProcessStatus`.
 fn process_status_display(status: &ProcessStatus) -> (String, Color) {
     use crate::process::Termination;
     match status {
@@ -398,16 +332,42 @@ fn process_status_display(status: &ProcessStatus) -> (String, Color) {
     }
 }
 
-/// Get the source name for the Nth sidebar entry (0-indexed).
-/// Returns None if the index is out of range.
-pub fn source_for_index(entries: &[SidebarEntry], index: usize) -> Option<&str> {
-    entries.get(index).map(|e| e.source.as_str())
+/// Get the source `TaskId` for the Nth sidebar entry (0-indexed).
+pub fn source_for_index(entries: &[SidebarEntry], index: usize) -> Option<TaskId> {
+    entries.get(index).map(|e| e.source)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn snap_with_one_task(id: TaskId, name: &str, status: TaskStatus) -> GraphSnapshot {
+        let root = TaskNode {
+            id: TaskId::ROOT,
+            name: "<root>".to_string(),
+            parent: None,
+            children: vec![id],
+            status: TaskStatus::Setup,
+            processes: Vec::new(),
+        };
+        let task = TaskNode {
+            id,
+            name: name.to_string(),
+            parent: Some(TaskId::ROOT),
+            children: Vec::new(),
+            status,
+            processes: Vec::new(),
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(TaskId::ROOT, root);
+        map.insert(id, task);
+        GraphSnapshot {
+            root: TaskId::ROOT,
+            tasks: Arc::new(map),
+        }
+    }
 
     #[test]
     fn sidebar_state_defaults() {
@@ -419,7 +379,6 @@ mod tests {
     #[test]
     fn sidebar_state_move_up_clamps() {
         let mut state = SidebarState::new();
-        state.selection = 0;
         state.move_up();
         assert_eq!(state.selection, 0);
     }
@@ -432,7 +391,7 @@ mod tests {
         state.move_down(3);
         assert_eq!(state.selection, 2);
         state.move_down(3);
-        assert_eq!(state.selection, 2); // clamped
+        assert_eq!(state.selection, 2);
     }
 
     #[test]
@@ -446,25 +405,23 @@ mod tests {
     #[test]
     fn build_entries_empty() {
         let mut sc = SourceColors::new();
+        let snap = GraphSnapshot::default();
         let entries =
-            build_sidebar_entries(None, &TaskStatus::Setup, &[], &HashSet::new(), &mut sc);
+            build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
         assert!(entries.is_empty());
     }
 
     #[test]
-    fn build_entries_task_only() {
+    fn build_entries_single_task() {
         let mut sc = SourceColors::new();
-        let entries = build_sidebar_entries(
-            Some("my-task"),
-            &TaskStatus::Setup,
-            &[],
-            &HashSet::new(),
-            &mut sc,
-        );
+        let id = TaskId(7);
+        let snap = snap_with_one_task(id, "my-task", TaskStatus::Setup);
+        let entries = build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].is_task);
         assert_eq!(entries[0].name, "my-task");
         assert_eq!(entries[0].status_tag, "SETUP");
+        assert_eq!(entries[0].source, id);
     }
 
     #[test]
@@ -481,11 +438,13 @@ mod tests {
             task_status_display(&TaskStatus::Done),
             ("DONE".to_string(), Color::DarkGray)
         );
-        let (tag, color) = task_status_display(&TaskStatus::Failed(crate::execution::TaskFailure {
-            message: "err".to_string(),
-            exit_code: 1,
-            output_json: "{}".to_string(),
-        }));
+        let (tag, color) = task_status_display(&TaskStatus::Failed(
+            crate::execution::TaskFailure {
+                message: "err".to_string(),
+                exit_code: 1,
+                output_json: "{}".to_string(),
+            },
+        ));
         assert_eq!(tag, "FAIL");
         assert_eq!(color, Color::Red);
     }
@@ -500,8 +459,9 @@ mod tests {
             process_status_display(&ProcessStatus::Done),
             ("DONE".to_string(), Color::DarkGray)
         );
-        let (tag, color) =
-            process_status_display(&ProcessStatus::Failed(crate::process::Termination::Exited(1)));
+        let (tag, color) = process_status_display(&ProcessStatus::Failed(
+            crate::process::Termination::Exited(1),
+        ));
         assert_eq!(tag, "FAIL:1");
         assert_eq!(color, Color::Red);
         assert_eq!(
@@ -512,40 +472,31 @@ mod tests {
 
     #[test]
     fn source_for_index_valid() {
+        let id = TaskId(7);
         let entries = vec![
             SidebarEntry {
                 name: "task".to_string(),
-                source: "my-task".to_string(),
+                source: id,
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
                 is_task: true,
                 depth: 0,
             },
-            SidebarEntry {
-                name: "echo hello".to_string(),
-                source: "my-task".to_string(),
-                status_tag: "RUN".to_string(),
-                status_color: THEME.status_running,
-                visible: true,
-                is_task: false,
-                depth: 1,
-            },
         ];
-        assert_eq!(source_for_index(&entries, 0), Some("my-task"));
-        assert_eq!(source_for_index(&entries, 1), Some("my-task"));
-        assert_eq!(source_for_index(&entries, 2), None);
+        assert_eq!(source_for_index(&entries, 0), Some(id));
+        assert_eq!(source_for_index(&entries, 1), None);
     }
 
     #[test]
     fn build_entries_visibility_with_filter() {
         let mut sc = SourceColors::new();
+        let id = TaskId(7);
+        let snap = snap_with_one_task(id, "my-task", TaskStatus::Ready);
+        // visible_sources contains a different id, so this task is dimmed.
         let mut visible = HashSet::new();
-        visible.insert("visible-source".to_string());
-
-        let entries =
-            build_sidebar_entries(Some("my-task"), &TaskStatus::Ready, &[], &visible, &mut sc);
-        // Task name "my-task" is not in the visible set, so not visible
+        visible.insert(TaskId(99));
+        let entries = build_sidebar_entries_from_graph(&snap, &visible, &mut sc);
         assert!(!entries[0].visible);
     }
 }

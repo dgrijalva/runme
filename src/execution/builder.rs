@@ -9,19 +9,15 @@
 
 use std::future::IntoFuture;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::Weak;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
-
 use crate::error::{TaskError, TaskResult};
-use crate::log::store::LogStore;
-use crate::task::{Registry, TaskDef};
+use crate::task::TaskDef;
 
 use super::TaskId;
 use super::control::SpawnOptions;
 use super::engine::EngineInternals;
-use super::execution::TaskExecution;
 use super::handle::TaskHandle;
 
 /// Builder returned by [`TaskContext::run`](crate::task::TaskContext::run).
@@ -34,22 +30,13 @@ pub struct TaskBuilder {
 }
 
 struct TaskBuilderInner {
-    /// Parent task id. When the parent is the root or an out-of-engine
-    /// caller, this is `None`.
+    /// Parent task id. `None` when the caller's context has no running
+    /// task identity (defaults to root in that case).
     parent_id: Option<TaskId>,
-    /// Weak ref to the parent's `TaskExecution` so children can be
-    /// pushed onto its `children` list. `None` for top-level/test paths
-    /// where the caller's context has no execution attached.
-    parent_exec: Option<Weak<TaskExecution>>,
-    /// Weak ref to the engine. When present, `spawn` funnels through
-    /// `EngineInternals::spawn_child` (the canonical path). When
-    /// absent (out-of-engine test paths), falls back to inline launch.
-    engine: Option<Weak<EngineInternals>>,
-    /// Shared `LogStore` from the parent's `TaskExecution`. Used only
-    /// by the inline-launch fallback when no engine is available.
-    log_store: Arc<Mutex<LogStore>>,
-    /// Registry to pass to the child's context.
-    registry: Arc<Registry>,
+    /// Weak ref to the engine. Spawning requires an engine — there is
+    /// no engine-less path. (Out-of-engine `ctx.run` calls fail with
+    /// `TaskError::from_display("no engine context")` at `.spawn()`.)
+    engine: Weak<EngineInternals>,
     /// Resolved task definition. Resolution happens at `ctx.run` call
     /// time so name errors surface synchronously.
     task_def: &'static TaskDef,
@@ -70,20 +57,14 @@ impl TaskBuilder {
     /// `TaskContext::run`.
     pub(crate) fn new(
         parent_id: Option<TaskId>,
-        parent_exec: Option<Weak<TaskExecution>>,
-        engine: Option<Weak<EngineInternals>>,
-        log_store: Arc<Mutex<LogStore>>,
-        registry: Arc<Registry>,
+        engine: Weak<EngineInternals>,
         task_def: &'static TaskDef,
         args: Vec<String>,
     ) -> Self {
         Self {
             inner: Ok(TaskBuilderInner {
                 parent_id,
-                parent_exec,
                 engine,
-                log_store,
-                registry,
                 task_def,
                 args,
                 timeout: None,
@@ -91,8 +72,8 @@ impl TaskBuilder {
         }
     }
 
-    /// Set a per-invocation timeout for the task. The watchdog lives on
-    /// `EngineInternals::spawn_child` (slice 4).
+    /// Set a per-invocation timeout for the task. The watchdog is wired
+    /// in `EngineInternals::spawn_child`.
     pub fn timeout(mut self, d: Duration) -> Self {
         if let Ok(ref mut inner) = self.inner {
             inner.timeout = Some(d);
@@ -103,51 +84,20 @@ impl TaskBuilder {
     /// Synchronously register and launch the child task. Returns a
     /// [`TaskHandle`] observing the new node.
     ///
-    /// When an engine is wired (the production path), funnels through
-    /// `EngineInternals::spawn_child` so the child is registered in the
-    /// graph table, gets a snapshot publish, and (if a timeout was set)
-    /// gets a watchdog. Out-of-engine test paths fall back to a
-    /// minimal inline launch that just runs the task body.
+    /// Always funnels through `EngineInternals::spawn_child`. When the
+    /// engine has been dropped (runtime shutting down), returns
+    /// `Err("no engine context")`.
     pub fn spawn(self) -> Result<TaskHandle, TaskError> {
         let inner = self.inner?;
-
-        // Production path: route through the engine.
-        if let Some(weak) = inner.engine.as_ref()
-            && let Some(engine) = weak.upgrade()
-        {
-            let parent_id = inner.parent_id.unwrap_or(TaskId::ROOT);
-            let opts = SpawnOptions {
-                timeout: inner.timeout,
-            };
-            return engine.spawn_child(parent_id, inner.task_def, inner.args, opts);
-        }
-
-        // Fallback (no-engine path, used only by tests built via
-        // `TaskContext::new` directly): inline launch with no graph
-        // registration. The handle still cancels via token-only on
-        // Drop. This branch exists to preserve test ergonomics; the
-        // real runtime always has an engine.
-        let id = TaskId::next();
-        let mut exec = TaskExecution::with_log_store(id, inner.log_store.clone());
-        exec.set_registry(inner.registry.clone());
-        if let Some(parent_id) = inner.parent_id {
-            exec.parent = Some(parent_id);
-        }
-        let task_def = inner.task_def;
-        let task_args = inner.args;
-        let exec_arc = Arc::new_cyclic(|weak: &Weak<TaskExecution>| {
-            let mut e = exec;
-            e.launch_with_self_weak(weak.clone(), task_def, task_args);
-            e
-        });
-        if let Some(weak) = inner.parent_exec.as_ref()
-            && let Some(parent) = weak.upgrade()
-            && let Ok(mut kids) = parent.children.try_lock()
-        {
-            kids.push(exec_arc.clone());
-        }
-        let _ = inner.timeout; // inert in fallback path
-        Ok(TaskHandle::new(exec_arc, Weak::new()))
+        let engine = inner
+            .engine
+            .upgrade()
+            .ok_or_else(|| TaskError::from_display("no engine context"))?;
+        let parent_id = inner.parent_id.unwrap_or(TaskId::ROOT);
+        let opts = SpawnOptions {
+            timeout: inner.timeout,
+        };
+        engine.spawn_child(parent_id, inner.task_def, inner.args, opts)
     }
 }
 

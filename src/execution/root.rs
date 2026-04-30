@@ -137,7 +137,7 @@ pub(crate) fn root_body_fn<'a>(
         // We pass each direct child to cancel_subtree (rather than the
         // root) so root's own task_handle isn't aborted while we're
         // still in its body.
-        let direct_children: Vec<TaskId> = match engine.lookup(TaskId::ROOT).await {
+        let direct_children: Vec<TaskId> = match engine.lookup(TaskId::ROOT) {
             Some(root) => root.children.lock().await.iter().map(|c| c.id).collect(),
             None => Vec::new(),
         };

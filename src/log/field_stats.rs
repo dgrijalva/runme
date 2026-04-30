@@ -11,12 +11,14 @@ use std::hash::{Hash, Hasher};
 
 use serde_json::Value;
 
+use crate::execution::TaskId;
+
 /// Per-source field statistics for importance-based filtering.
 ///
 /// Call [`observe()`](Self::observe) as entries arrive, then
 /// [`field_scores()`](Self::field_scores) to get interestingness scores.
 pub struct FieldStats {
-    sources: HashMap<String, SourceStats>,
+    sources: HashMap<TaskId, SourceStats>,
 }
 
 struct SourceStats {
@@ -51,10 +53,10 @@ impl FieldStats {
     }
 
     /// Record field presence and values from a log entry.
-    pub fn observe(&mut self, source: &str, fields: &HashMap<String, Value>) {
+    pub fn observe(&mut self, source: TaskId, fields: &HashMap<String, Value>) {
         let stats = self
             .sources
-            .entry(source.to_string())
+            .entry(source)
             .or_insert_with(|| SourceStats {
                 total_entries: 0,
                 fields: HashMap::new(),
@@ -85,8 +87,8 @@ impl FieldStats {
     ///
     /// Returns a map of field name to score in `0.0..=1.0`.
     /// Returns an empty map if insufficient data (fewer than `MIN_SAMPLE` entries).
-    pub fn field_scores(&self, source: &str) -> HashMap<&str, f64> {
-        let Some(stats) = self.sources.get(source) else {
+    pub fn field_scores(&self, source: TaskId) -> HashMap<&str, f64> {
+        let Some(stats) = self.sources.get(&source) else {
             return HashMap::new();
         };
         if stats.total_entries < MIN_SAMPLE {
@@ -163,9 +165,9 @@ mod tests {
     fn constant_field_scores_low() {
         let mut stats = FieldStats::new();
         for _ in 0..50 {
-            stats.observe("src", &make_fields(&[("pid", num(1234))]));
+            stats.observe(TaskId(1), &make_fields(&[("pid", num(1234))]));
         }
-        let scores = stats.field_scores("src");
+        let scores = stats.field_scores(TaskId(1));
         assert!(scores["pid"] < 0.1, "constant field should score low: {}", scores["pid"]);
     }
 
@@ -173,9 +175,9 @@ mod tests {
     fn unique_per_line_scores_low() {
         let mut stats = FieldStats::new();
         for i in 0..50 {
-            stats.observe("src", &make_fields(&[("line_number", num(i))]));
+            stats.observe(TaskId(1), &make_fields(&[("line_number", num(i))]));
         }
-        let scores = stats.field_scores("src");
+        let scores = stats.field_scores(TaskId(1));
         assert!(
             scores["line_number"] < 0.15,
             "unique-per-line field should score low: {}",
@@ -189,14 +191,14 @@ mod tests {
         for i in 0..50 {
             if i < 3 {
                 stats.observe(
-                    "src",
+                    TaskId(1),
                     &make_fields(&[("common", val("x")), ("error", val("oh no"))]),
                 );
             } else {
-                stats.observe("src", &make_fields(&[("common", val("x"))]));
+                stats.observe(TaskId(1), &make_fields(&[("common", val("x"))]));
             }
         }
-        let scores = stats.field_scores("src");
+        let scores = stats.field_scores(TaskId(1));
         assert!(
             scores["error"] > 0.9,
             "rare field should score high: {}",
@@ -210,11 +212,11 @@ mod tests {
         let statuses = ["ok", "error", "timeout"];
         for i in 0..60 {
             stats.observe(
-                "src",
+                TaskId(1),
                 &make_fields(&[("status", val(statuses[i % 3]))]),
             );
         }
-        let scores = stats.field_scores("src");
+        let scores = stats.field_scores(TaskId(1));
         // 3 distinct values over 60 appearances → variance ≈ 0.05 → quality ≈ 0.19
         // frequency = 1.0 → selectivity = 0
         // Hmm, 3/60 = 0.05 → 4 * 0.05 * 0.95 = 0.19
@@ -233,11 +235,11 @@ mod tests {
         // 10 distinct values across 50 entries → variance = 0.2 → quality = 0.64
         for i in 0..50 {
             stats.observe(
-                "src",
+                TaskId(1),
                 &make_fields(&[("endpoint", val(&format!("/api/v{}", i % 10)))]),
             );
         }
-        let scores = stats.field_scores("src");
+        let scores = stats.field_scores(TaskId(1));
         assert!(
             scores["endpoint"] > 0.5,
             "moderate variance should score well: {}",
@@ -249,28 +251,29 @@ mod tests {
     fn insufficient_data_returns_empty() {
         let mut stats = FieldStats::new();
         for i in 0..5 {
-            stats.observe("src", &make_fields(&[("x", num(i))]));
+            stats.observe(TaskId(1), &make_fields(&[("x", num(i))]));
         }
-        let scores = stats.field_scores("src");
+        let scores = stats.field_scores(TaskId(1));
         assert!(scores.is_empty(), "should return empty with < MIN_SAMPLE entries");
     }
 
     #[test]
     fn unknown_source_returns_empty() {
         let stats = FieldStats::new();
-        assert!(stats.field_scores("nonexistent").is_empty());
+        assert!(stats.field_scores(TaskId(99999)).is_empty());
     }
 
     #[test]
     fn multiple_sources_independent() {
         let mut stats = FieldStats::new();
+        let a = TaskId(10);
+        let b = TaskId(11);
         for _ in 0..20 {
-            stats.observe("a", &make_fields(&[("pid", num(1))]));
-            stats.observe("b", &make_fields(&[("pid", num(1)), ("error", val("x"))]));
+            stats.observe(a, &make_fields(&[("pid", num(1))]));
+            stats.observe(b, &make_fields(&[("pid", num(1)), ("error", val("x"))]));
         }
-        let a_scores = stats.field_scores("a");
-        let b_scores = stats.field_scores("b");
-        // "error" should only exist in source "b"
+        let a_scores = stats.field_scores(a);
+        let b_scores = stats.field_scores(b);
         assert!(!a_scores.contains_key("error"));
         assert!(b_scores.contains_key("error"));
     }
@@ -280,11 +283,11 @@ mod tests {
         let mut stats = FieldStats::new();
         for i in 0..200 {
             stats.observe(
-                "src",
+                TaskId(1),
                 &make_fields(&[("request_id", val(&format!("req-{}", i)))]),
             );
         }
-        let scores = stats.field_scores("src");
+        let scores = stats.field_scores(TaskId(1));
         assert!(
             scores["request_id"] < 0.1,
             "overflowed high-cardinality field should score low: {}",

@@ -169,14 +169,50 @@ fn test_init_hook_runs_and_sets_group_name() {
 // ============================================================
 
 /// Task A invokes task B (the "succeed" fixture) via ctx.run().
-/// Verify B runs successfully.
+/// Verify B runs successfully through the engine.
 #[tokio::test]
 async fn test_cross_task_invocation() {
+    use rnme::execution::{Engine, TaskStatus};
+
     let reg = Arc::new(Registry::from_inventory());
-    let result = reg
-        .run_with_registry("invoke_other", &[], &reg)
-        .await;
-    assert!(result.is_ok(), "invoke_other should succeed (it calls succeed)");
+    let task = reg.get("invoke_other").unwrap();
+    let (engine, handle) = Engine::start(reg.clone());
+    let id = handle
+        .spawn_task(task, vec![])
+        .await
+        .expect("spawn invoke_other");
+    // Wait for terminal status.
+    let status = wait_terminal(&handle, id).await;
+    assert!(matches!(status, TaskStatus::Done));
+    let _ = handle.quit().await;
+    engine.shutdown().await;
+}
+
+async fn wait_terminal(
+    handle: &rnme::execution::EngineHandle,
+    id: rnme::execution::TaskId,
+) -> rnme::execution::TaskStatus {
+    use rnme::execution::TaskStatus;
+    let mut graph = handle.graph.clone();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snap = graph.borrow().clone();
+        if let Some(node) = snap.tasks.get(&id) {
+            match &node.status {
+                TaskStatus::Done
+                | TaskStatus::Failed(_)
+                | TaskStatus::Cancelled
+                | TaskStatus::Timeout => return node.status.clone(),
+                _ => {}
+            }
+        }
+        tokio::select! {
+            _ = graph.changed() => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                panic!("task {id} did not reach terminal status before deadline");
+            }
+        }
+    }
 }
 
 /// Cross-task invocation where inner task fails should propagate the error.
@@ -189,13 +225,24 @@ async fn invoke_failing(ctx: &TaskContext) -> TaskResult {
 
 #[tokio::test]
 async fn test_cross_task_error_propagation() {
+    use rnme::execution::{Engine, TaskStatus};
+
     let reg = Arc::new(Registry::from_inventory());
-    let result = reg
-        .run_with_registry("invoke_failing", &[], &reg)
-        .await;
-    assert!(result.is_err(), "invoke_failing should propagate fail_default's error");
-    let err = result.unwrap_err();
-    assert_eq!(err.to_string(), "task failed");
+    let task = reg.get("invoke_failing").unwrap();
+    let (engine, handle) = Engine::start(reg.clone());
+    let id = handle
+        .spawn_task(task, vec![])
+        .await
+        .expect("spawn invoke_failing");
+    let status = wait_terminal(&handle, id).await;
+    match status {
+        TaskStatus::Failed(failure) => {
+            assert_eq!(failure.message, "task failed");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    let _ = handle.quit().await;
+    engine.shutdown().await;
 }
 
 // ============================================================
@@ -203,30 +250,30 @@ async fn test_cross_task_error_propagation() {
 // ============================================================
 
 /// Run the spawn_echo fixture which calls ctx.exec("echo hello from spawn_echo").
-/// Verify the output appears in the LogStore (exec now goes through spawn, so
-/// output flows via SpawnEvent → monitor_spawns → LogStore).
+/// Verify the output appears in the engine's LogStore.
 #[tokio::test]
 async fn test_output_capture_from_exec() {
-    use rnme::execution::{TaskExecution, TaskId};
-    use rnme::log::store::LogStore;
-    use std::sync::Arc as StdArc;
-    use tokio::sync::Mutex as TokioMutex;
+    use rnme::execution::Engine;
 
     let reg = Arc::new(Registry::from_inventory());
     let task = reg.get("spawn_echo").unwrap();
-    let log_store = StdArc::new(TokioMutex::new(LogStore::new()));
-    let mut exec = TaskExecution::with_log_store(TaskId::next(), log_store);
-    exec.set_registry(reg);
-    exec.launch(task, vec![]);
-    exec.wait().await;
+    let (engine, handle) = Engine::start(reg.clone());
+    let id = handle
+        .spawn_task(task, vec![])
+        .await
+        .expect("spawn spawn_echo");
+    let _ = wait_terminal(&handle, id).await;
+    // Give the monitor_spawns forwarder a moment to drain.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // Give the monitor_spawns forwarder a moment to process
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-    let store = exec.log_store().lock().await;
+    let store = handle.log_store.lock().await;
     let entries = store.compose_owned();
     let found = entries.iter().any(|e| e.raw.contains("hello from spawn_echo"));
-    assert!(found, "LogStore should contain 'hello from spawn_echo'");
+    assert!(found, "engine LogStore should contain 'hello from spawn_echo'");
+    drop(store);
+
+    let _ = handle.quit().await;
+    engine.shutdown().await;
 }
 
 // ============================================================
@@ -332,11 +379,18 @@ async fn run_discovered_steps(ctx: &TaskContext) -> TaskResult {
 
 #[tokio::test]
 async fn test_discover_and_run_tasks() {
+    use rnme::execution::{Engine, TaskStatus};
     let reg = Arc::new(Registry::from_inventory());
-    let result = reg
-        .run_with_registry("run_discovered_steps", &[], &reg)
-        .await;
-    assert!(result.is_ok(), "coordinator should succeed: {:?}", result);
+    let task = reg.get("run_discovered_steps").unwrap();
+    let (engine, handle) = Engine::start(reg.clone());
+    let id = handle.spawn_task(task, vec![]).await.expect("spawn coord");
+    let status = wait_terminal(&handle, id).await;
+    assert!(
+        matches!(status, TaskStatus::Done),
+        "coordinator should succeed: {status:?}"
+    );
+    let _ = handle.quit().await;
+    engine.shutdown().await;
 }
 
 /// Discovers tasks matching a pattern and runs only the ones that match.
@@ -356,11 +410,18 @@ async fn run_matching_steps(ctx: &TaskContext) -> TaskResult {
 
 #[tokio::test]
 async fn test_discover_and_run_matching_tasks() {
+    use rnme::execution::{Engine, TaskStatus};
     let reg = Arc::new(Registry::from_inventory());
-    let result = reg
-        .run_with_registry("run_matching_steps", &[], &reg)
-        .await;
-    assert!(result.is_ok(), "selective run should succeed: {:?}", result);
+    let task = reg.get("run_matching_steps").unwrap();
+    let (engine, handle) = Engine::start(reg.clone());
+    let id = handle.spawn_task(task, vec![]).await.expect("spawn match");
+    let status = wait_terminal(&handle, id).await;
+    assert!(
+        matches!(status, TaskStatus::Done),
+        "selective run should succeed: {status:?}"
+    );
+    let _ = handle.quit().await;
+    engine.shutdown().await;
 }
 
 // ============================================================

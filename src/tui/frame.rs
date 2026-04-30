@@ -15,7 +15,6 @@ use super::app::{AppMode, AppState};
 use super::filter::{filter_status_spans, render_filter_input};
 use super::picker;
 use super::render::DisplayMode;
-use super::runner::ProcessStatus;
 use super::search::{render_search_input, search_status_spans};
 use super::sidebar::{self, SIDEBAR_WIDTH};
 use super::viewport::{self, ScrollState, new_entries_since_pin};
@@ -63,8 +62,10 @@ pub fn render_frame(
         let input_bar_area = vert_chunks[1];
         let status_bar_area = vert_chunks[2];
 
-        // Horizontal layout: sidebar (fixed width) + log viewer (fills)
-        let has_task = state.task_name.is_some();
+        // Horizontal layout: sidebar (fixed width) + log viewer (fills).
+        // We render the sidebar whenever the engine has any non-root task —
+        // i.e. whenever there's something to show.
+        let has_task = !state.sidebar_entries.is_empty();
         let show_sidebar = has_task && state.sidebar_visible;
         let horiz_chunks = if show_sidebar {
             Layout::default()
@@ -102,7 +103,7 @@ pub fn render_frame(
         let visible_entries: Vec<&LogEntry> = state.visible_log_lines();
 
         let lines: Vec<Line> = if visible_entries.is_empty() {
-            if state.task_name.is_some() {
+            if has_task {
                 if state.log_lines.is_empty() {
                     vec![Line::from(Span::styled(
                         "  Waiting for output...",
@@ -222,11 +223,11 @@ pub fn render_frame(
                 ),
             ];
 
-            // Add task name if running
-            if let Some(name) = &state.task_name {
+            // Add task name from the current task definition (last launched).
+            if let Some(task) = state.current_task {
                 spans.push(Span::raw(" "));
                 spans.push(Span::styled(
-                    format!(" {} ", name),
+                    format!(" {} ", task.name),
                     Style::default().fg(Color::White).bg(THEME.dim),
                 ));
             }
@@ -570,7 +571,7 @@ fn render_entry_detail(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
         ]),
         Line::from(vec![
             Span::styled("source:    ", label),
-            Span::raw(entry.source.clone()),
+            Span::raw(entry.source.to_string()),
         ]),
         Line::from(vec![
             Span::styled("message:   ", label),
@@ -696,7 +697,7 @@ fn render_process_detail(
 
     detail_lines.push(Line::from(vec![
         Span::styled("Source:   ", label),
-        Span::raw(entry.source.clone()),
+        Span::raw(entry.source.to_string()),
     ]));
 
     detail_lines.push(Line::from(vec![
@@ -707,49 +708,26 @@ fn render_process_detail(
         ),
     ]));
 
-    // Try to get PID/PGID from the actual process info
-    if let Some(procs_arc) = &state.processes
-        && let Ok(procs) = procs_arc.try_lock()
-    {
-        // Map sidebar index to process vec index
-        // Sidebar index 0 = task, so process offset = sidebar_idx - 1
-        // Then map through running/completed ordering
-        let proc_idx = if state.task_name.is_some() {
-            sidebar_idx.checked_sub(1)
-        } else {
-            Some(sidebar_idx)
-        };
-
-        if let Some(idx) = proc_idx {
-            let mut running_indices: Vec<usize> = Vec::new();
-            let mut completed_indices: Vec<usize> = Vec::new();
-            for (i, p) in procs.iter().enumerate() {
-                if p.status == ProcessStatus::Running {
-                    running_indices.push(i);
-                } else {
-                    completed_indices.push(i);
-                }
-            }
-            let ordered: Vec<usize> = running_indices
-                .into_iter()
-                .chain(completed_indices)
-                .collect();
-
-            if let Some(&proc_vec_idx) = ordered.get(idx) {
-                let proc = &procs[proc_vec_idx];
-
-                if let Some(pid) = proc.pid {
-                    detail_lines.push(Line::from(vec![
-                        Span::styled("PID:      ", label),
-                        Span::raw(pid.to_string()),
-                    ]));
-                }
-
-                if let Some(pgid) = proc.pgid {
-                    detail_lines.push(Line::from(vec![
-                        Span::styled("PGID:     ", label),
-                        Span::raw(pgid.to_string()),
-                    ]));
+    // Look up PID/PGID via the engine's graph snapshot, matched by the
+    // sidebar entry's source TaskId (which is the process id).
+    if let Some(handle) = state.engine.as_ref() {
+        let snapshot = handle.graph.borrow().clone();
+        'find_proc: for node in snapshot.tasks.values() {
+            for proc in &node.processes {
+                if proc.id == entry.source {
+                    if let Some(pid) = proc.pid {
+                        detail_lines.push(Line::from(vec![
+                            Span::styled("PID:      ", label),
+                            Span::raw(pid.to_string()),
+                        ]));
+                    }
+                    if let Some(pgid) = proc.pgid {
+                        detail_lines.push(Line::from(vec![
+                            Span::styled("PGID:     ", label),
+                            Span::raw(pgid.to_string()),
+                        ]));
+                    }
+                    break 'find_proc;
                 }
             }
         }

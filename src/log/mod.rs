@@ -12,6 +12,8 @@ use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 
+use crate::execution::TaskId;
+
 /// Which output stream a log entry originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Stream {
@@ -60,8 +62,9 @@ pub struct LogEntry {
     pub raw: String,
     /// How the record was parsed.
     pub parsed: ParsedContent,
-    /// Which task/command produced this entry.
-    pub source: String,
+    /// Which task/command produced this entry. Tasks and processes share an
+    /// ID namespace — see `docs/plans/notes/architecture.md` §9.
+    pub source: TaskId,
     /// Sequence number (monotonic within a source).
     pub seq: u64,
     /// When this entry was received/created (wall clock).
@@ -87,7 +90,7 @@ impl LogEntry {
     pub fn new(
         raw: String,
         parsed: ParsedContent,
-        source: String,
+        source: TaskId,
         seq: u64,
         timestamp: Option<String>,
         level: Option<String>,
@@ -112,11 +115,11 @@ impl LogEntry {
     ///
     /// Used by `TaskContext::println()` for plain text output that should
     /// appear without log decoration in any UI mode.
-    pub fn raw(text: &str, source: &str) -> Self {
+    pub fn raw(text: &str, source: TaskId) -> Self {
         Self {
             raw: text.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source,
             seq: 0,
             received_at: Utc::now(),
             timestamp: None,

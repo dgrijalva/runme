@@ -14,27 +14,45 @@ use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
+use crate::execution::TaskId;
 use crate::log::buffer::OutputBuffer;
 use crate::log::{LogEntry, ParsedContent};
 
+tokio::task_local! {
+    /// Per-task context populated by the engine before invoking a task's
+    /// async function. The global `LogEntryLayer` reads this to route
+    /// tracing events (`info!`/`error!`/etc.) into the right task's
+    /// output buffer with the right source `TaskId`.
+    pub static TASK_TRACING_CTX: TaskTracingCtx;
+}
+
+/// Per-task context plumbed to the global tracing layer.
+#[derive(Clone)]
+pub struct TaskTracingCtx {
+    pub buffer: Arc<Mutex<OutputBuffer>>,
+    pub source_label: String,
+    pub source_id: TaskId,
+}
+
 /// A `tracing::Layer` that converts events into `LogEntry`s and pushes them
-/// into an `OutputBuffer`.
+/// into the per-task `OutputBuffer` selected by `TASK_TRACING_CTX`. When
+/// no task-local context is set (events emitted outside any task body),
+/// the event is silently dropped.
 pub struct LogEntryLayer {
-    buffer: Arc<Mutex<OutputBuffer>>,
-    source: String,
     seq: AtomicU64,
 }
 
 impl LogEntryLayer {
-    /// Create a new layer that pushes entries into the given buffer.
-    ///
-    /// `source` is the value written to `LogEntry.source` (typically `"task"`).
-    pub fn new(buffer: Arc<Mutex<OutputBuffer>>, source: impl Into<String>) -> Self {
+    pub fn new() -> Self {
         Self {
-            buffer,
-            source: source.into(),
             seq: AtomicU64::new(0),
         }
+    }
+}
+
+impl Default for LogEntryLayer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -116,9 +134,16 @@ impl Visit for FieldCollector {
 
 impl<S: Subscriber> Layer<S> for LogEntryLayer {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        let metadata = event.metadata();
+        // Resolve the per-task tracing context. If unset (event outside
+        // any task body), drop silently — this is the correct behavior
+        // for engine bootstrap traces and tests using `tracing` without
+        // an `Engine` wrapper.
+        let task_ctx = match TASK_TRACING_CTX.try_with(|c| c.clone()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
 
-        // Map tracing level to string
+        let metadata = event.metadata();
         let level = match *metadata.level() {
             tracing::Level::ERROR => "error",
             tracing::Level::WARN => "warn",
@@ -127,15 +152,13 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
             tracing::Level::TRACE => "trace",
         };
 
-        // Collect message and fields
         let mut collector = FieldCollector::new();
         event.record(&mut collector);
 
         let message = collector.message.clone().unwrap_or_default();
 
-        // Build a reasonable raw representation
         let raw = if collector.fields.is_empty() {
-            format!("{} {}: {}", level.to_uppercase(), self.source, message)
+            format!("{} {}: {}", level.to_uppercase(), task_ctx.source_label, message)
         } else {
             let fields_str: Vec<String> = collector
                 .fields
@@ -145,7 +168,7 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
             format!(
                 "{} {}: {} {{ {} }}",
                 level.to_uppercase(),
-                self.source,
+                task_ctx.source_label,
                 message,
                 fields_str.join(", ")
             )
@@ -156,7 +179,7 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
         let entry = LogEntry::new(
             raw,
             ParsedContent::PlainText,
-            self.source.clone(),
+            task_ctx.source_id,
             seq,
             None,
             Some(level.to_string()),
@@ -164,15 +187,10 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
             collector.fields,
         );
 
-        // Push to buffer. We need to block on the async mutex since
-        // tracing's Layer::on_event is synchronous. Use try_lock to avoid
-        // blocking the tracing internals; if the lock is contended we
-        // spawn a task to push asynchronously.
-        let buffer = self.buffer.clone();
+        let buffer = task_ctx.buffer.clone();
         if let Ok(mut buf) = buffer.try_lock() {
             buf.push(entry);
         } else {
-            // Lock contended; push asynchronously to avoid blocking
             tokio::spawn(async move {
                 let mut buf = buffer.lock().await;
                 buf.push(entry);
@@ -186,63 +204,64 @@ mod tests {
     use super::*;
     use tracing_subscriber::layer::SubscriberExt;
 
+    fn ctx(buf: Arc<Mutex<OutputBuffer>>, label: &str, id: TaskId) -> TaskTracingCtx {
+        TaskTracingCtx {
+            buffer: buf,
+            source_label: label.to_string(),
+            source_id: id,
+        }
+    }
+
     #[tokio::test]
     async fn test_tracing_layer_captures_info_with_fields() {
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(100)));
-        let layer = LogEntryLayer::new(buffer.clone(), "task");
-
-        // Install as a scoped subscriber so we don't pollute other tests
-        let subscriber = tracing_subscriber::registry().with(layer);
+        let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        tracing::info!(key = "val", "hello");
-
-        // Give async push a moment if it went through the spawn path
-        tokio::task::yield_now().await;
+        TASK_TRACING_CTX
+            .scope(ctx(buffer.clone(), "task", TaskId(99)), async {
+                tracing::info!(key = "val", "hello");
+                tokio::task::yield_now().await;
+            })
+            .await;
 
         let buf = buffer.lock().await;
-        assert_eq!(buf.len(), 1, "expected exactly one log entry");
-
+        assert_eq!(buf.len(), 1);
         let entry = &buf.lines()[0];
-        assert_eq!(entry.source, "task");
+        assert_eq!(entry.source, TaskId(99));
         assert_eq!(entry.level.as_deref(), Some("info"));
         assert_eq!(entry.message.as_deref(), Some("hello"));
         assert!(matches!(entry.parsed, ParsedContent::PlainText));
         assert_eq!(entry.seq, 0);
-
-        // Check the structured field
         assert_eq!(
             entry.fields.get("key"),
-            Some(&serde_json::Value::String("val".to_string())),
-            "expected field key='val'"
+            Some(&serde_json::Value::String("val".to_string()))
         );
     }
 
     #[tokio::test]
     async fn test_tracing_layer_multiple_levels() {
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(100)));
-        let layer = LogEntryLayer::new(buffer.clone(), "test_source");
-
-        let subscriber = tracing_subscriber::registry().with(layer);
+        let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        tracing::error!("err msg");
-        tracing::warn!("warn msg");
-        tracing::debug!("debug msg");
-        tracing::trace!("trace msg");
-
-        tokio::task::yield_now().await;
+        TASK_TRACING_CTX
+            .scope(ctx(buffer.clone(), "test_source", TaskId(100)), async {
+                tracing::error!("err msg");
+                tracing::warn!("warn msg");
+                tracing::debug!("debug msg");
+                tracing::trace!("trace msg");
+                tokio::task::yield_now().await;
+            })
+            .await;
 
         let buf = buffer.lock().await;
         assert_eq!(buf.len(), 4);
-
         let entries: Vec<_> = buf.lines().iter().collect();
         assert_eq!(entries[0].level.as_deref(), Some("error"));
         assert_eq!(entries[1].level.as_deref(), Some("warn"));
         assert_eq!(entries[2].level.as_deref(), Some("debug"));
         assert_eq!(entries[3].level.as_deref(), Some("trace"));
-
-        // Verify monotonic seq
         assert_eq!(entries[0].seq, 0);
         assert_eq!(entries[1].seq, 1);
         assert_eq!(entries[2].seq, 2);
@@ -252,18 +271,18 @@ mod tests {
     #[tokio::test]
     async fn test_tracing_layer_numeric_fields() {
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(100)));
-        let layer = LogEntryLayer::new(buffer.clone(), "task");
-
-        let subscriber = tracing_subscriber::registry().with(layer);
+        let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        tracing::info!(count = 42_i64, ratio = 2.72_f64, active = true, "metrics");
-
-        tokio::task::yield_now().await;
+        TASK_TRACING_CTX
+            .scope(ctx(buffer.clone(), "task", TaskId(99)), async {
+                tracing::info!(count = 42_i64, ratio = 2.72_f64, active = true, "metrics");
+                tokio::task::yield_now().await;
+            })
+            .await;
 
         let buf = buffer.lock().await;
         assert_eq!(buf.len(), 1);
-
         let entry = &buf.lines()[0];
         assert_eq!(entry.fields.get("count"), Some(&serde_json::json!(42)));
         assert_eq!(entry.fields.get("ratio"), Some(&serde_json::json!(2.72)));
@@ -273,19 +292,18 @@ mod tests {
     #[tokio::test]
     async fn test_tracing_layer_raw_format() {
         let buffer = Arc::new(Mutex::new(OutputBuffer::new(100)));
-        let layer = LogEntryLayer::new(buffer.clone(), "task");
-
-        let subscriber = tracing_subscriber::registry().with(layer);
+        let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        tracing::info!("simple message");
-
-        tokio::task::yield_now().await;
+        TASK_TRACING_CTX
+            .scope(ctx(buffer.clone(), "task", TaskId(99)), async {
+                tracing::info!("simple message");
+                tokio::task::yield_now().await;
+            })
+            .await;
 
         let buf = buffer.lock().await;
         let entry = &buf.lines()[0];
-
-        // Raw should contain the level, source, and message
         assert!(entry.raw.contains("INFO"));
         assert!(entry.raw.contains("task"));
         assert!(entry.raw.contains("simple message"));

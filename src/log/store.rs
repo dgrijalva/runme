@@ -4,6 +4,7 @@ use tokio::sync::broadcast;
 
 use super::LogEntry;
 use super::field_stats::FieldStats;
+use crate::execution::TaskId;
 
 /// A composition layer for log entries from multiple sources.
 ///
@@ -15,8 +16,8 @@ use super::field_stats::FieldStats;
 /// Individual `OutputBuffer`s remain the per-process storage mechanism; LogStore
 /// composes across them.
 pub struct LogStore {
-    /// Entries grouped by source name.
-    sources: HashMap<String, Vec<LogEntry>>,
+    /// Entries grouped by source `TaskId`.
+    sources: HashMap<TaskId, Vec<LogEntry>>,
     /// Maximum total entries across all sources. When exceeded, oldest entries
     /// (by seq within each source) are dropped from the largest source.
     capacity: Option<usize>,
@@ -55,8 +56,8 @@ impl LogStore {
         // Broadcast to live subscribers (ignore errors -- no receivers is OK)
         let _ = self.tx.send(entry.clone());
 
-        self.field_stats.observe(&entry.source, &entry.fields);
-        let source = entry.source.clone();
+        self.field_stats.observe(entry.source, &entry.fields);
+        let source = entry.source;
         self.sources.entry(source).or_default().push(entry);
 
         // Enforce capacity if set
@@ -86,7 +87,7 @@ impl LogStore {
     /// are ordered by source name for determinism.
     pub fn compose(&self) -> Vec<&LogEntry> {
         let mut all: Vec<&LogEntry> = self.sources.values().flat_map(|v| v.iter()).collect();
-        all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.cmp(&b.source)));
+        all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
         all
     }
 
@@ -97,7 +98,7 @@ impl LogStore {
             .values()
             .flat_map(|v| v.iter().cloned())
             .collect();
-        all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.cmp(&b.source)));
+        all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
         all
     }
 
@@ -113,25 +114,25 @@ impl LogStore {
             .flat_map(|v| v.iter())
             .filter(|e| filter(e))
             .collect();
-        all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.cmp(&b.source)));
+        all.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
         all
     }
 
     /// Get entries for a single source.
-    pub fn source_entries(&self, source: &str) -> Option<&[LogEntry]> {
-        self.sources.get(source).map(|v| v.as_slice())
+    pub fn source_entries(&self, source: TaskId) -> Option<&[LogEntry]> {
+        self.sources.get(&source).map(|v| v.as_slice())
     }
 
-    /// List all source names.
-    pub fn source_names(&self) -> Vec<&str> {
-        self.sources.keys().map(|s| s.as_str()).collect()
+    /// List all source ids.
+    pub fn source_ids(&self) -> Vec<TaskId> {
+        self.sources.keys().copied().collect()
     }
 
-    /// Group entries by source name.
-    pub fn group_by_source(&self) -> HashMap<&str, Vec<&LogEntry>> {
-        let mut groups: HashMap<&str, Vec<&LogEntry>> = HashMap::new();
+    /// Group entries by source id.
+    pub fn group_by_source(&self) -> HashMap<TaskId, Vec<&LogEntry>> {
+        let mut groups: HashMap<TaskId, Vec<&LogEntry>> = HashMap::new();
         for (source, entries) in &self.sources {
-            groups.insert(source.as_str(), entries.iter().collect());
+            groups.insert(*source, entries.iter().collect());
         }
         groups
     }
@@ -213,7 +214,7 @@ impl LogStore {
                 .sources
                 .iter()
                 .max_by_key(|(_, v)| v.len())
-                .map(|(k, _)| k.clone())
+                .map(|(k, _)| *k)
             {
                 if let Some(entries) = self.sources.get_mut(&largest_source) {
                     if !entries.is_empty() {
@@ -266,27 +267,39 @@ impl LogStore {
     ///
     /// The returned `Output` contains existing entries from the named source
     /// and will receive new entries for that source as they arrive.
-    pub fn output_for(&self, source: &str) -> crate::process::Output {
-        let source_entries = self.source_entries(source);
-        let count = source_entries.map_or(0, |e| e.len());
-        let mut buffer = super::buffer::OutputBuffer::new(count.max(1024));
-        if let Some(entries) = source_entries {
-            for entry in entries {
-                buffer.push(entry.clone());
-            }
+    pub fn output_for(&self, source: TaskId) -> crate::process::Output {
+        self.output_for_many(&[source])
+    }
+
+    /// Create an `Output` handle filtered to entries from any of the supplied
+    /// sources (logical OR). Used by the TUI when focusing a non-leaf task to
+    /// render its descendants' logs.
+    pub fn output_for_many(&self, sources: &[TaskId]) -> crate::process::Output {
+        use std::collections::HashSet;
+
+        let want: HashSet<TaskId> = sources.iter().copied().collect();
+        let mut existing: Vec<LogEntry> = self
+            .sources
+            .iter()
+            .filter(|(id, _)| want.contains(*id))
+            .flat_map(|(_, v)| v.iter().cloned())
+            .collect();
+        existing.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
+
+        let mut buffer = super::buffer::OutputBuffer::new(existing.len().max(1024));
+        for entry in existing {
+            buffer.push(entry);
         }
 
         let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(buffer));
 
-        // Forward new entries matching the source
         let mut rx = self.subscribe();
         let buf = buffer.clone();
-        let source_name = source.to_string();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(entry) => {
-                        if entry.source == source_name {
+                        if want.contains(&entry.source) {
                             buf.lock().await.push(entry);
                         }
                     }
@@ -339,13 +352,19 @@ mod tests {
     use crate::log::ParsedContent;
     use crate::log::buffer::OutputBuffer;
 
+    /// Stable test TaskIds (numbers chosen to be reasonably distinct from
+    /// `TaskId::next` allocations done elsewhere in the same test process).
+    const TID_A: TaskId = TaskId(1001);
+    const TID_B: TaskId = TaskId(1002);
+    const TID_C: TaskId = TaskId(1003);
+
     /// Helper to create a LogEntry for testing.
-    fn make_entry(source: &str, seq: u64, raw: &str) -> LogEntry {
+    fn make_entry(source: TaskId, seq: u64, raw: &str) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source,
             seq,
             timestamp: None,
             level: None,
@@ -356,12 +375,12 @@ mod tests {
     }
 
     /// Helper to create a LogEntry with a level.
-    fn make_entry_with_level(source: &str, seq: u64, raw: &str, level: &str) -> LogEntry {
+    fn make_entry_with_level(source: TaskId, seq: u64, raw: &str, level: &str) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source,
             seq,
             timestamp: None,
             level: Some(level.to_string()),
@@ -378,9 +397,9 @@ mod tests {
     #[test]
     fn test_compose_single_source() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "line1"));
-        store.push(make_entry("task_a", 1, "line2"));
-        store.push(make_entry("task_a", 2, "line3"));
+        store.push(make_entry(TID_A, 0, "line1"));
+        store.push(make_entry(TID_A, 1, "line2"));
+        store.push(make_entry(TID_A, 2, "line3"));
 
         let composed = store.compose();
         assert_eq!(composed.len(), 3);
@@ -393,10 +412,10 @@ mod tests {
     fn test_compose_multi_source_interleaved() {
         let mut store = LogStore::new();
         // Two sources with interleaved seq numbers
-        store.push(make_entry("task_a", 0, "a0"));
-        store.push(make_entry("task_b", 1, "b1"));
-        store.push(make_entry("task_a", 2, "a2"));
-        store.push(make_entry("task_b", 3, "b3"));
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b1"));
+        store.push(make_entry(TID_A, 2, "a2"));
+        store.push(make_entry(TID_B, 3, "b3"));
 
         let composed = store.compose();
         assert_eq!(composed.len(), 4);
@@ -410,21 +429,21 @@ mod tests {
     fn test_compose_same_seq_deterministic() {
         let mut store = LogStore::new();
         // Two entries with the same seq from different sources
-        store.push(make_entry("task_b", 0, "b0"));
-        store.push(make_entry("task_a", 0, "a0"));
+        store.push(make_entry(TID_B, 0, "b0"));
+        store.push(make_entry(TID_A, 0, "a0"));
 
         let composed = store.compose();
         assert_eq!(composed.len(), 2);
-        // Should be sorted by source name when seq is equal
-        assert_eq!(composed[0].raw, "a0"); // "task_a" < "task_b"
+        // Sorted by TaskId.0 numeric when seq is equal: TID_A=1001 < TID_B=1002
+        assert_eq!(composed[0].raw, "a0");
         assert_eq!(composed[1].raw, "b0");
     }
 
     #[test]
     fn test_compose_owned() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "a0"));
-        store.push(make_entry("task_b", 1, "b1"));
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b1"));
 
         let composed = store.compose_owned();
         assert_eq!(composed.len(), 2);
@@ -447,12 +466,12 @@ mod tests {
     #[test]
     fn test_compose_filtered_by_source() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "a0"));
-        store.push(make_entry("task_b", 1, "b1"));
-        store.push(make_entry("task_a", 2, "a2"));
-        store.push(make_entry("task_b", 3, "b3"));
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b1"));
+        store.push(make_entry(TID_A, 2, "a2"));
+        store.push(make_entry(TID_B, 3, "b3"));
 
-        let filtered = store.compose_filtered(|e| e.source == "task_a");
+        let filtered = store.compose_filtered(|e| e.source == TID_A);
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].raw, "a0");
         assert_eq!(filtered[1].raw, "a2");
@@ -461,10 +480,10 @@ mod tests {
     #[test]
     fn test_compose_filtered_by_level() {
         let mut store = LogStore::new();
-        store.push(make_entry_with_level("app", 0, "info msg", "info"));
-        store.push(make_entry_with_level("app", 1, "error msg", "error"));
-        store.push(make_entry_with_level("app", 2, "debug msg", "debug"));
-        store.push(make_entry_with_level("app", 3, "error msg 2", "error"));
+        store.push(make_entry_with_level(TID_A, 0, "info msg", "info"));
+        store.push(make_entry_with_level(TID_A, 1, "error msg", "error"));
+        store.push(make_entry_with_level(TID_A, 2, "debug msg", "debug"));
+        store.push(make_entry_with_level(TID_A, 3, "error msg 2", "error"));
 
         let errors = store.compose_filtered(|e| e.level.as_deref() == Some("error"));
         assert_eq!(errors.len(), 2);
@@ -475,7 +494,7 @@ mod tests {
     #[test]
     fn test_compose_filtered_no_matches() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "hello"));
+        store.push(make_entry(TID_A, 0, "hello"));
 
         let filtered = store.compose_filtered(|_| false);
         assert!(filtered.is_empty());
@@ -484,8 +503,8 @@ mod tests {
     #[test]
     fn test_compose_filtered_all_match() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "a"));
-        store.push(make_entry("task_b", 1, "b"));
+        store.push(make_entry(TID_A, 0, "a"));
+        store.push(make_entry(TID_B, 1, "b"));
 
         let filtered = store.compose_filtered(|_| true);
         assert_eq!(filtered.len(), 2);
@@ -494,14 +513,13 @@ mod tests {
     #[test]
     fn test_compose_filtered_preserves_order() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "a0"));
-        store.push(make_entry("task_b", 1, "b1"));
-        store.push(make_entry("task_a", 2, "a2"));
-        store.push(make_entry("task_b", 3, "b3"));
-        store.push(make_entry("task_a", 4, "a4"));
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b1"));
+        store.push(make_entry(TID_A, 2, "a2"));
+        store.push(make_entry(TID_B, 3, "b3"));
+        store.push(make_entry(TID_A, 4, "a4"));
 
-        // Filter to task_b only, verify order is preserved
-        let filtered = store.compose_filtered(|e| e.source == "task_b");
+        let filtered = store.compose_filtered(|e| e.source == TID_B);
         assert_eq!(filtered.len(), 2);
         assert!(filtered[0].seq < filtered[1].seq);
     }
@@ -513,23 +531,23 @@ mod tests {
     #[test]
     fn test_group_by_source() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "a0"));
-        store.push(make_entry("task_b", 1, "b1"));
-        store.push(make_entry("task_a", 2, "a2"));
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b1"));
+        store.push(make_entry(TID_A, 2, "a2"));
 
         let groups = store.group_by_source();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups["task_a"].len(), 2);
-        assert_eq!(groups["task_b"].len(), 1);
+        assert_eq!(groups[&TID_A].len(), 2);
+        assert_eq!(groups[&TID_B].len(), 1);
     }
 
     #[test]
     fn test_group_by_level() {
         let mut store = LogStore::new();
-        store.push(make_entry_with_level("app", 0, "info1", "info"));
-        store.push(make_entry_with_level("app", 1, "error1", "error"));
-        store.push(make_entry_with_level("app", 2, "info2", "info"));
-        store.push(make_entry("app", 3, "no_level")); // No level -> "(none)"
+        store.push(make_entry_with_level(TID_A, 0, "info1", "info"));
+        store.push(make_entry_with_level(TID_A, 1, "error1", "error"));
+        store.push(make_entry_with_level(TID_A, 2, "info2", "info"));
+        store.push(make_entry(TID_A, 3, "no_level")); // No level -> "(none)"
 
         let groups = store.group_by_level();
         assert_eq!(groups["info"].len(), 2);
@@ -540,12 +558,11 @@ mod tests {
     #[test]
     fn test_group_by_arbitrary() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "short"));
-        store.push(make_entry("task_b", 1, "this is a longer line"));
-        store.push(make_entry("task_a", 2, "tiny"));
-        store.push(make_entry("task_b", 3, "also quite long enough"));
+        store.push(make_entry(TID_A, 0, "short"));
+        store.push(make_entry(TID_B, 1, "this is a longer line"));
+        store.push(make_entry(TID_A, 2, "tiny"));
+        store.push(make_entry(TID_B, 3, "also quite long enough"));
 
-        // Group by line length bucket
         let groups = store.group_by(|entry| {
             if entry.raw.len() > 10 {
                 "long".to_string()
@@ -566,11 +583,11 @@ mod tests {
         let mut store = LogStore::new();
         let mut rx = store.subscribe();
 
-        store.push(make_entry("task_a", 0, "hello"));
+        store.push(make_entry(TID_A, 0, "hello"));
 
         let received = rx.recv().await.unwrap();
         assert_eq!(received.raw, "hello");
-        assert_eq!(received.source, "task_a");
+        assert_eq!(received.source, TID_A);
     }
 
     #[tokio::test]
@@ -578,9 +595,9 @@ mod tests {
         let mut store = LogStore::new();
         let mut rx = store.subscribe();
 
-        store.push(make_entry("a", 0, "first"));
-        store.push(make_entry("b", 1, "second"));
-        store.push(make_entry("a", 2, "third"));
+        store.push(make_entry(TID_A, 0, "first"));
+        store.push(make_entry(TID_B, 1, "second"));
+        store.push(make_entry(TID_A, 2, "third"));
 
         let e1 = rx.recv().await.unwrap();
         let e2 = rx.recv().await.unwrap();
@@ -593,15 +610,15 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_filtered() {
         let mut store = LogStore::new();
-        let mut filtered_rx = store.subscribe_filtered(|e| e.source == "important");
+        let mut filtered_rx = store.subscribe_filtered(|e| e.source == TID_A);
 
-        store.push(make_entry("noise", 0, "ignore me"));
-        store.push(make_entry("important", 1, "pay attention"));
-        store.push(make_entry("noise", 2, "also ignore"));
+        store.push(make_entry(TID_B, 0, "ignore me"));
+        store.push(make_entry(TID_A, 1, "pay attention"));
+        store.push(make_entry(TID_B, 2, "also ignore"));
 
         let received = filtered_rx.recv().await.unwrap();
         assert_eq!(received.raw, "pay attention");
-        assert_eq!(received.source, "important");
+        assert_eq!(received.source, TID_A);
     }
 
     #[tokio::test]
@@ -609,9 +626,9 @@ mod tests {
         let mut store = LogStore::new();
         let mut errors_rx = store.subscribe_filtered(|e| e.level.as_deref() == Some("error"));
 
-        store.push(make_entry_with_level("app", 0, "info msg", "info"));
-        store.push(make_entry_with_level("app", 1, "error msg", "error"));
-        store.push(make_entry_with_level("app", 2, "debug msg", "debug"));
+        store.push(make_entry_with_level(TID_A, 0, "info msg", "info"));
+        store.push(make_entry_with_level(TID_A, 1, "error msg", "error"));
+        store.push(make_entry_with_level(TID_A, 2, "debug msg", "debug"));
 
         let received = errors_rx.recv().await.unwrap();
         assert_eq!(received.raw, "error msg");
@@ -624,13 +641,13 @@ mod tests {
     #[test]
     fn test_capacity_bounded() {
         let mut store = LogStore::with_capacity(3);
-        store.push(make_entry("a", 0, "line0"));
-        store.push(make_entry("a", 1, "line1"));
-        store.push(make_entry("a", 2, "line2"));
+        store.push(make_entry(TID_A, 0, "line0"));
+        store.push(make_entry(TID_A, 1, "line1"));
+        store.push(make_entry(TID_A, 2, "line2"));
         assert_eq!(store.len(), 3);
 
         // Push one more, should drop oldest
-        store.push(make_entry("a", 3, "line3"));
+        store.push(make_entry(TID_A, 3, "line3"));
         assert_eq!(store.len(), 3);
 
         let composed = store.compose();
@@ -642,19 +659,17 @@ mod tests {
     #[test]
     fn test_capacity_multi_source() {
         let mut store = LogStore::with_capacity(4);
-        store.push(make_entry("a", 0, "a0"));
-        store.push(make_entry("a", 1, "a1"));
-        store.push(make_entry("b", 2, "b0"));
-        store.push(make_entry("b", 3, "b1"));
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_A, 1, "a1"));
+        store.push(make_entry(TID_B, 2, "b0"));
+        store.push(make_entry(TID_B, 3, "b1"));
         assert_eq!(store.len(), 4);
 
-        // Push one more; should drop oldest from the largest source
-        store.push(make_entry("a", 4, "a2"));
+        store.push(make_entry(TID_A, 4, "a2"));
         assert_eq!(store.len(), 4);
 
-        // Source "a" had 2 entries (now 3 after push), source "b" had 2.
-        // Largest source is "a" (3 entries after push, before enforce), so a0 gets dropped.
-        let a_entries = store.source_entries("a").unwrap();
+        // Largest source is A (3 entries before enforce), so a0 gets dropped.
+        let a_entries = store.source_entries(TID_A).unwrap();
         assert!(!a_entries.iter().any(|e| e.raw == "a0"));
     }
 
@@ -672,28 +687,28 @@ mod tests {
     #[test]
     fn test_source_entries() {
         let mut store = LogStore::new();
-        store.push(make_entry("task_a", 0, "a0"));
-        store.push(make_entry("task_b", 1, "b0"));
-        store.push(make_entry("task_a", 2, "a1"));
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b0"));
+        store.push(make_entry(TID_A, 2, "a1"));
 
-        let a_entries = store.source_entries("task_a").unwrap();
+        let a_entries = store.source_entries(TID_A).unwrap();
         assert_eq!(a_entries.len(), 2);
         assert_eq!(a_entries[0].raw, "a0");
         assert_eq!(a_entries[1].raw, "a1");
 
-        assert!(store.source_entries("nonexistent").is_none());
+        assert!(store.source_entries(TaskId(99999)).is_none());
     }
 
     #[test]
-    fn test_source_names() {
+    fn test_source_ids() {
         let mut store = LogStore::new();
-        store.push(make_entry("alpha", 0, "a"));
-        store.push(make_entry("beta", 1, "b"));
-        store.push(make_entry("alpha", 2, "c"));
+        store.push(make_entry(TID_A, 0, "a"));
+        store.push(make_entry(TID_B, 1, "b"));
+        store.push(make_entry(TID_A, 2, "c"));
 
-        let mut names = store.source_names();
-        names.sort();
-        assert_eq!(names, vec!["alpha", "beta"]);
+        let mut ids = store.source_ids();
+        ids.sort_by_key(|t| t.0);
+        assert_eq!(ids, vec![TID_A, TID_B]);
     }
 
     // ---------------------------------------------------------------
@@ -704,22 +719,22 @@ mod tests {
     fn test_extend() {
         let mut store = LogStore::new();
         let entries = vec![
-            make_entry("src", 0, "line0"),
-            make_entry("src", 1, "line1"),
-            make_entry("other", 2, "other0"),
+            make_entry(TID_A, 0, "line0"),
+            make_entry(TID_A, 1, "line1"),
+            make_entry(TID_B, 2, "other0"),
         ];
         store.extend(entries);
 
         assert_eq!(store.len(), 3);
-        assert_eq!(store.source_entries("src").unwrap().len(), 2);
-        assert_eq!(store.source_entries("other").unwrap().len(), 1);
+        assert_eq!(store.source_entries(TID_A).unwrap().len(), 2);
+        assert_eq!(store.source_entries(TID_B).unwrap().len(), 1);
     }
 
     #[test]
     fn test_ingest_buffer() {
         let mut buffer = OutputBuffer::new(100);
-        buffer.push(make_entry("task", 0, "from_buffer_0"));
-        buffer.push(make_entry("task", 1, "from_buffer_1"));
+        buffer.push(make_entry(TID_A, 0, "from_buffer_0"));
+        buffer.push(make_entry(TID_A, 1, "from_buffer_1"));
 
         let mut store = LogStore::new();
         store.ingest_buffer(&buffer);
@@ -728,6 +743,26 @@ mod tests {
         let composed = store.compose();
         assert_eq!(composed[0].raw, "from_buffer_0");
         assert_eq!(composed[1].raw, "from_buffer_1");
+    }
+
+    #[tokio::test]
+    async fn test_output_for_many() {
+        let mut store = LogStore::new();
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b0"));
+        store.push(make_entry(TID_C, 2, "c0"));
+        store.push(make_entry(TID_A, 3, "a1"));
+
+        let output = store.output_for_many(&[TID_A, TID_C]);
+        // Drain the synchronous snapshot; live forwarding is exercised
+        // implicitly elsewhere (compose / subscribe tests).
+        // The Output's buffer is populated synchronously in output_for_many.
+        let buf = output.0.try_lock().expect("uncontended");
+        let lines: Vec<&str> = buf.lines().iter().map(|e| e.raw.as_str()).collect();
+        assert!(lines.contains(&"a0"));
+        assert!(lines.contains(&"a1"));
+        assert!(lines.contains(&"c0"));
+        assert!(!lines.contains(&"b0"));
     }
 
     // ---------------------------------------------------------------

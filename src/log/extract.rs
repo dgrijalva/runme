@@ -661,12 +661,13 @@ mod tests {
     #[test]
     fn log_entry_construction() {
         use super::super::LogEntry;
+        use crate::execution::TaskId;
 
         let entry = LogEntry {
             received_at: chrono::Utc::now(),
             raw: "test line".to_string(),
             parsed: ParsedContent::PlainText,
-            source: "test_task".to_string(),
+            source: TaskId(7),
             seq: 0,
             timestamp: None,
             level: Some("info".to_string()),
@@ -676,12 +677,11 @@ mod tests {
         };
 
         assert_eq!(entry.raw, "test line");
-        assert_eq!(entry.source, "test_task");
+        assert_eq!(entry.source, TaskId(7));
         assert_eq!(entry.seq, 0);
         assert_eq!(entry.level.as_deref(), Some("info"));
         assert_eq!(entry.as_str(), "test line");
 
-        // Clone works (required by broadcast)
         let cloned = entry.clone();
         assert_eq!(cloned.raw, entry.raw);
     }

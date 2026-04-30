@@ -10,22 +10,20 @@
 //! provided so the eventual `Engine` (slice 4) can own a single store
 //! shared across the whole graph.
 
-use std::sync::{Arc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use nix::sys::signal;
 use nix::unistd::Pid;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::layer::SubscriberExt;
 
 use crate::error::TaskResult;
 use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
 use crate::log::store::LogStore;
 use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef};
-use crate::tracing_layer::LogEntryLayer;
+use crate::tracing_layer::{TASK_TRACING_CTX, TaskTracingCtx};
 
 use super::engine::EngineInternals;
 use super::task_id::TaskId;
@@ -91,6 +89,10 @@ pub enum ProcessStatus {
 /// Tracks process identity (pid, pgid), lifecycle status, output buffer,
 /// and display metadata. Owned by the execution layer; read by UI for display.
 pub struct ProcessInfo {
+    /// Unique id in the unified TaskId space (arch.md decision 22).
+    /// Allocated when the process is spawned and used as the
+    /// `LogEntry.source` for every entry produced by this process.
+    pub id: TaskId,
     pub task_name: String,
     pub command_label: String,
     pub buffer: Arc<Mutex<OutputBuffer>>,
@@ -216,9 +218,12 @@ pub struct TaskExecution {
     /// slot.
     pub abort_handle: Option<AbortHandle>,
     /// Abort handle for the per-task timeout watchdog tokio task. `None`
-    /// when no timeout is configured. Aborted by the cancel ladder
-    /// (slice 4) to prevent Cancel→Timeout races.
-    pub watchdog_abort: Mutex<Option<AbortHandle>>,
+    /// when no timeout is configured. Aborted by the cancel ladder to
+    /// prevent Cancel→Timeout races. Stored under a `std::sync::Mutex`
+    /// so `spawn_child` can populate it synchronously before returning
+    /// the handle (eliminates the race where a cancel arriving
+    /// immediately after spawn could miss the watchdog).
+    pub watchdog_abort: StdMutex<Option<AbortHandle>>,
 
     // ── Process tracking ───────────────────────────────────────────
     /// Spawned processes tracked by this execution.
@@ -238,12 +243,10 @@ pub struct TaskExecution {
     /// task runtime — callers always supply this.
     log_store: Arc<Mutex<LogStore>>,
     /// The task's tracing output buffer (info!/error!/etc from the task
-    /// function).
+    /// function). The global `LogEntryLayer` (installed once in
+    /// `Engine::start`) writes here when the body runs inside the
+    /// task's `TASK_TRACING_CTX` scope.
     tracing_buffer: Arc<Mutex<OutputBuffer>>,
-    /// Whether the global tracing subscriber has been installed. Hoisted
-    /// to the engine in slice 4; held here as an `Arc<AtomicBool>` so
-    /// callers can share a single flag across multiple executions today.
-    tracing_installed: Arc<AtomicBool>,
 
     // ── Registry ───────────────────────────────────────────────────
     /// Optional shared registry for task discovery and cross-invocation.
@@ -251,19 +254,11 @@ pub struct TaskExecution {
 }
 
 impl TaskExecution {
-    /// Create a new `TaskExecution` that shares an existing `LogStore`.
+    /// Create a new `TaskExecution` wired to an engine.
     ///
-    /// `id` is the caller's responsibility — for fresh top-level tasks
-    /// pass `TaskId::next()`. The execution starts with `parent: None`
-    /// and an empty `children` list; slice 3 wires those up when child
-    /// invocations materialise as graph nodes.
-    pub fn with_log_store(id: TaskId, log_store: Arc<Mutex<LogStore>>) -> Self {
-        Self::with_log_store_and_engine(id, log_store, Weak::new())
-    }
-
-    /// Like `with_log_store`, but with a `Weak<EngineInternals>` so
-    /// `monitor_spawns` can publish snapshot updates on process events
-    /// (slice 4). Pass `Weak::new()` for the legacy single-task path.
+    /// `id` is the caller's responsibility — `EngineInternals::spawn_child`
+    /// allocates one via `TaskId::next()`. The execution starts with
+    /// `parent: None` (the engine sets it) and an empty `children` list.
     pub fn with_log_store_and_engine(
         id: TaskId,
         log_store: Arc<Mutex<LogStore>>,
@@ -294,13 +289,12 @@ impl TaskExecution {
             task_status: Arc::new(Mutex::new(TaskStatus::Setup)),
             task_handle: Mutex::new(None),
             abort_handle: None,
-            watchdog_abort: Mutex::new(None),
+            watchdog_abort: StdMutex::new(None),
             processes,
             spawn_tx,
             task_ctx: Mutex::new(None),
             log_store,
             tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
-            tracing_installed: Arc::new(AtomicBool::new(false)),
             registry: None,
         }
     }
@@ -310,63 +304,11 @@ impl TaskExecution {
         self.registry = Some(registry);
     }
 
-    /// Share a `tracing_installed` flag across multiple executions.
-    ///
-    /// `set_global_default` can only succeed once per process. When
-    /// launching multiple executions (e.g. TUI picker), they should
-    /// share this flag. Slice 4 hoists this to the engine.
-    pub fn set_tracing_installed(&mut self, flag: Arc<AtomicBool>) {
-        self.tracing_installed = flag;
-    }
-
-    /// Launch a task. Creates the `TaskContext`, installs tracing,
-    /// subscribes to all output buffers, and spawns the task function.
-    ///
-    /// Legacy single-task entry point (used by the TUI's `TaskRunner`
-    /// today). The engine path uses [`spawn_body`](Self::spawn_body)
-    /// instead, which threads a `Weak<EngineInternals>` through into the
-    /// `TaskContext` so `ctx.run` and `TaskHandle::Drop` can reach the
-    /// engine.
-    pub fn launch(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
-        self.launch_with_self_weak(Weak::new(), task, task_args);
-    }
-
-    /// Launch with a `Weak<TaskExecution>` reference to this very node.
-    ///
-    /// Slice 3 wires the weak ref into the `TaskContext` so that
-    /// `ctx.run` can attach children to the parent's `children` list.
-    /// Pass `Weak::new()` (or call `launch`) when no self-reference is
-    /// needed — e.g. top-level test launches with no graph parent.
-    ///
-    /// Engine-aware launches go through [`spawn_body`](Self::spawn_body)
-    /// instead of this method.
-    pub fn launch_with_self_weak(
-        &mut self,
-        self_weak: Weak<TaskExecution>,
-        task: &'static TaskDef,
-        task_args: Vec<String>,
-    ) {
-        self.spawn_body_inner(self_weak, Weak::new(), task, task_args);
-    }
-
-    /// Engine-aware launch core (slice 4).
-    ///
-    /// Same as `launch_with_self_weak` but additionally wires a
-    /// `Weak<EngineInternals>` into the `TaskContext` (so `ctx.run` and
-    /// `TaskHandle::Drop` can reach the engine) and stores the
-    /// `Arc<TaskContext>` on the execution (so the cancel ladder can
-    /// call `ctx.stop_all` per arch.md §7).
+    /// Engine-aware launch core. Builds the `TaskContext`, wires the
+    /// engine weak into it, and spawns the body inside the task's
+    /// `TASK_TRACING_CTX` scope so the global tracing layer routes
+    /// events from inside the body to this task's buffer.
     pub fn spawn_body(
-        &mut self,
-        self_weak: Weak<TaskExecution>,
-        engine: Weak<EngineInternals>,
-        task: &'static TaskDef,
-        task_args: Vec<String>,
-    ) {
-        self.spawn_body_inner(self_weak, engine, task, task_args);
-    }
-
-    fn spawn_body_inner(
         &mut self,
         self_weak: Weak<TaskExecution>,
         engine: Weak<EngineInternals>,
@@ -379,11 +321,6 @@ impl TaskExecution {
         let log_store = self.log_store.clone();
         let spawn_tx = self.spawn_tx.clone();
 
-        // Install the LogEntryLayer as the tracing subscriber for this task.
-        let layer = LogEntryLayer::new(tracing_buffer.clone(), task.name);
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        // Create the TaskContext and wire everything up.
         let mut ctx = TaskContext::new(task.name);
         ctx.set_spawn_notifier(spawn_tx);
         ctx.set_task_status(self.task_status.clone());
@@ -391,23 +328,16 @@ impl TaskExecution {
             ctx.set_registry(registry.clone());
         }
         ctx.set_tracing_output(tracing_buffer.clone());
-
-        // Slice 3: wire identity + cancellation + self-weak so `ctx.run`
-        // can attach children to this node's `children` list and
-        // expose `ctx.cancelled()` / `ctx.cancellation()` to the body.
         ctx.set_task_identity(self.id, self.cancellation.clone(), self_weak);
         ctx.set_log_store(self.log_store.clone());
-        // Slice 4: thread the engine weak in so `ctx.run` can reach
-        // `EngineInternals::spawn_child` and `TaskHandle::Drop` can run
-        // the cancel ladder. Empty (`Weak::new()`) for legacy callers.
         let body_engine = engine.clone();
         ctx.set_engine(engine);
 
         // Forward exec() output to LogStore.
         start_buffer_forwarder(ctx.output_buffer(), log_store.clone());
 
-        // Subscribe to tracing buffer BEFORE installing the subscriber
-        // and spawning the task, so we don't miss early entries.
+        // Subscribe to tracing buffer BEFORE the body runs so we don't
+        // miss early entries.
         let tracing_rx = {
             let buf = tracing_buffer
                 .try_lock()
@@ -416,30 +346,28 @@ impl TaskExecution {
         };
         start_tracing_forwarder(tracing_rx, log_store.clone());
 
-        // Install the global default tracing subscriber only once.
-        if !self.tracing_installed.swap(true, Ordering::SeqCst) {
-            let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
-            let _ = tracing::dispatcher::set_global_default(dispatch);
-        }
-
-        // Slice 4: hold an `Arc<TaskContext>` so the cancel ladder can
-        // call `ctx.stop_all`. Both this Arc and the spawned body share
-        // the same context — the body uses `&*ctx_arc` to satisfy the
-        // `&TaskContext` argument of `task.func.call`.
         let ctx_arc = Arc::new(ctx);
         if let Ok(mut slot) = self.task_ctx.try_lock() {
             *slot = Some(ctx_arc.clone());
         }
 
-        // Spawn the task function. The JoinHandle now carries the body's
-        // `TaskResult` so the awaited TaskHandle (slice 3) can return it.
-        // Status writes are still done here against the shared Arc so
-        // observers see the in-flight transition.
         let task_status = self.task_status.clone();
         let body_ctx = ctx_arc.clone();
-        let _exec_id = self.id;
+        let task_name_owned = task.name.to_string();
+        let task_id = self.id;
+        let tracing_buf_for_body = tracing_buffer.clone();
+
         let handle: JoinHandle<TaskResult> = tokio::spawn(async move {
-            let result = task.func.call(&body_ctx, &task_args).await;
+            let tracing_ctx = TaskTracingCtx {
+                buffer: tracing_buf_for_body,
+                source_label: task_name_owned,
+                source_id: task_id,
+            };
+            let result = TASK_TRACING_CTX
+                .scope(tracing_ctx, async move {
+                    task.func.call(&body_ctx, &task_args).await
+                })
+                .await;
 
             {
                 let mut s = task_status.lock().await;
@@ -459,8 +387,6 @@ impl TaskExecution {
                 }
             }
 
-            // Snapshot publish on terminal status (slice 4). Best-effort;
-            // ignore if engine is gone.
             if let Some(eng) = body_engine.upgrade() {
                 eng.publish_snapshot().await;
             }
@@ -599,6 +525,7 @@ impl TaskExecution {
             let ready = !has_readiness_condition; // Ready by default if no condition
 
             let process_info = ProcessInfo {
+                id: event.process_id,
                 task_name: event.task_name.clone(),
                 command_label: event.command_label.clone(),
                 buffer: event.buffer.clone(),

@@ -86,10 +86,12 @@ fn render_preview(
         Style::default().fg(level_color),
     );
 
-    // Source column
-    let source_color = source_colors.color_for(&entry.source);
+    // Source column. Storage uses TaskId; display uses its `t<N>` form
+    // (sidebar maps id → human name on the side).
+    let source_color = source_colors.color_for(entry.source);
+    let source_str = entry.source.to_string();
     let source_span = Span::styled(
-        pad_or_truncate(&entry.source, SOURCE_WIDTH),
+        pad_or_truncate(&source_str, SOURCE_WIDTH),
         Style::default().fg(source_color),
     );
 
@@ -112,7 +114,7 @@ fn render_preview(
         let fields_width = msg_width.saturating_sub(msg_len + 1);
         let fields_span = if show_fields && !entry.fields.is_empty() && fields_width > 3 {
             let scores = field_stats
-                .map(|fs| fs.field_scores(&entry.source))
+                .map(|fs| fs.field_scores(entry.source))
                 .unwrap_or_default();
             let fields_str = if scores.is_empty() {
                 format_fields_inline(&entry.fields, fields_width)
@@ -203,7 +205,7 @@ fn render_preview(
         // wrapped to fit within the message column.
         if show_fields && !entry.fields.is_empty() {
             let scores = field_stats
-                .map(|fs| fs.field_scores(&entry.source))
+                .map(|fs| fs.field_scores(entry.source))
                 .unwrap_or_default();
             let fields_str = if scores.is_empty() {
                 log_fmt::format_fields_inline(&entry.fields)
@@ -339,6 +341,14 @@ mod tests {
     use ratatui::style::Color;
     use std::collections::HashMap;
 
+    fn tid(name: &str) -> crate::execution::TaskId {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        crate::execution::TaskId(h.finish())
+    }
+
     fn make_entry(
         raw: &str,
         source: &str,
@@ -350,7 +360,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: crate::log::ParsedContent::PlainText,
-            source: source.to_string(),
+            source: tid(source),
             seq: 0,
             timestamp: timestamp.map(|s| s.to_string()),
             level: level.map(|s| s.to_string()),
@@ -365,9 +375,9 @@ mod tests {
     #[test]
     fn source_colors_assigns_consistent_colors() {
         let mut sc = SourceColors::new();
-        let c1 = sc.color_for("api");
-        let c2 = sc.color_for("worker");
-        let c3 = sc.color_for("api");
+        let c1 = sc.color_for(tid("api"));
+        let c2 = sc.color_for(tid("worker"));
+        let c3 = sc.color_for(tid("api"));
         assert_eq!(c1, c3, "same source should get same color");
         assert_ne!(c1, c2, "different sources should get different colors");
     }
@@ -376,13 +386,11 @@ mod tests {
     fn source_colors_cycles_palette() {
         let mut sc = SourceColors::new();
         let palette_len = THEME.source_palette.len();
-        // Assign more sources than palette colors
         for i in 0..palette_len + 2 {
-            sc.color_for(&format!("source{}", i));
+            sc.color_for(tid(&format!("source{}", i)));
         }
-        // The (palette_len)th source should cycle back to the first color
-        let first_color = sc.color_for("source0");
-        let cycled_color = sc.color_for(&format!("source{}", palette_len));
+        let first_color = sc.color_for(tid("source0"));
+        let cycled_color = sc.color_for(tid(&format!("source{}", palette_len)));
         assert_eq!(first_color, cycled_color);
     }
 

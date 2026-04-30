@@ -295,13 +295,23 @@ mod tests {
     use crate::log::{LogEntry, ParsedContent};
     use std::collections::HashMap;
 
+    use crate::execution::TaskId;
+
+    fn tid(name: &str) -> TaskId {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        name.hash(&mut h);
+        TaskId(h.finish())
+    }
+
     /// Helper to build a minimal LogEntry for testing.
     fn entry(raw: &str, message: Option<&str>) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: "test".to_string(),
+            source: tid("test"),
             seq: 0,
             timestamp: None,
             level: None,
@@ -316,7 +326,7 @@ mod tests {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
-            source: source.to_string(),
+            source: tid(source),
             seq,
             timestamp: None,
             level: None,
@@ -538,8 +548,8 @@ mod tests {
         ];
         let result = Search::new("ERROR").execute(&entries);
         assert_eq!(result.matches.len(), 2);
-        assert_eq!(result.matches[0].entry.source, "auth-service");
-        assert_eq!(result.matches[1].entry.source, "api-service");
+        assert_eq!(result.matches[0].entry.source, tid("auth-service"));
+        assert_eq!(result.matches[1].entry.source, tid("api-service"));
     }
 
     #[test]
