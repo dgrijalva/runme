@@ -219,7 +219,10 @@ pub fn render_frame(
 
             // Build status line with task info
             let mut spans = vec![
-                Span::styled(" runme ", Style::default().fg(Color::Black).bg(THEME.accent)),
+                Span::styled(
+                    " runme ",
+                    Style::default().fg(Color::Black).bg(THEME.accent),
+                ),
                 Span::raw(" "),
                 Span::styled(
                     format!(" {} ", focus_text),
@@ -291,8 +294,8 @@ pub fn render_frame(
 
             let status_line = Line::from(spans);
 
-            let status_bar = Paragraph::new(status_line)
-                .style(Style::default().bg(THEME.dim).fg(Color::White));
+            let status_bar =
+                Paragraph::new(status_line).style(Style::default().bg(THEME.dim).fg(Color::White));
 
             frame.render_widget(status_bar, status_bar_area);
         }
@@ -632,12 +635,8 @@ fn render_picker_overlay(
 
     let x = area.width.saturating_sub(picker_width) / 2;
     let y = area.height.saturating_sub(picker_height) / 2;
-    let popup_area = ratatui::layout::Rect::new(
-        area.x + x,
-        area.y + y,
-        picker_width,
-        picker_height,
-    );
+    let popup_area =
+        ratatui::layout::Rect::new(area.x + x, area.y + y, picker_width, picker_height);
 
     frame.render_widget(Clear, popup_area);
     picker::render_picker(frame, popup_area, picker);
@@ -987,7 +986,10 @@ fn render_notifications(
 
     frame.render_widget(Clear, notif_area);
     let line = Line::from(vec![
-        Span::styled(" ! ", Style::default().fg(Color::Black).bg(THEME.level_warn)),
+        Span::styled(
+            " ! ",
+            Style::default().fg(Color::Black).bg(THEME.level_warn),
+        ),
         Span::raw(" "),
         Span::styled(text.clone(), Style::default().fg(THEME.level_warn)),
     ]);

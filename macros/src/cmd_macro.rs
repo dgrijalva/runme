@@ -201,10 +201,7 @@ mod tests {
 
     #[test]
     fn numeric_arg() {
-        assert_eq!(
-            parse_arg_strings("echo 42"),
-            vec!["lit:echo", "lit:42"]
-        );
+        assert_eq!(parse_arg_strings("echo 42"), vec!["lit:echo", "lit:42"]);
     }
 
     #[test]

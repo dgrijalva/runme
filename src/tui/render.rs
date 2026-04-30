@@ -60,6 +60,7 @@ pub fn render_entry(
 }
 
 /// Render a single log entry with explicit control over field display.
+#[allow(clippy::too_many_arguments)]
 pub fn render_entry_opts(
     entry: &LogEntry,
     width: u16,
@@ -144,17 +145,17 @@ fn render_preview(
             let fields_str = if scores.is_empty() {
                 format_fields_inline(&entry.fields, fields_width)
             } else {
-                let full =
-                    log_fmt::format_fields_scored(&entry.fields, &scores, field_stats::DEFAULT_THRESHOLD);
+                let full = log_fmt::format_fields_scored(
+                    &entry.fields,
+                    &scores,
+                    field_stats::DEFAULT_THRESHOLD,
+                );
                 truncate_fields_str(&full, fields_width)
             };
             if fields_str.is_empty() {
                 Span::raw("")
             } else {
-                Span::styled(
-                    format!(" {}", fields_str),
-                    Style::default().fg(THEME.dim),
-                )
+                Span::styled(format!(" {}", fields_str), Style::default().fg(THEME.dim))
             }
         } else {
             Span::raw("")
@@ -432,8 +433,15 @@ mod tests {
         );
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let (lines, height) =
-            render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc, None, &labels);
+        let (lines, height) = render_entry(
+            &entry,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+            None,
+            &labels,
+        );
         assert_eq!(height, 1, "truncated mode should produce exactly 1 line");
         assert_eq!(lines.len(), 1);
     }
@@ -444,8 +452,15 @@ mod tests {
         let entry = make_entry("raw", "api", Some("info"), Some(&long_msg), None);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let (lines, height) =
-            render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc, None, &labels);
+        let (lines, height) = render_entry(
+            &entry,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+            None,
+            &labels,
+        );
         assert_eq!(height, 1);
         // The combined width should not exceed terminal width
         let total_width: usize = lines[0].spans.iter().map(|s| s.content.len()).sum();
@@ -520,8 +535,15 @@ mod tests {
         let entry = make_entry("raw", "api", None, Some("msg"), None);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let (lines, height) =
-            render_entry(&entry, 80, DisplayMode::Preview, false, &mut sc, None, &labels);
+        let (lines, height) = render_entry(
+            &entry,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+            None,
+            &labels,
+        );
         assert_eq!(height, 1);
         // Level span should show "---"
         let level_span = &lines[0].spans[2];
@@ -606,15 +628,8 @@ mod tests {
         );
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let (lines, height) = render_entry(
-            &entry,
-            80,
-            DisplayMode::Raw,
-            false,
-            &mut sc,
-            None,
-            &labels,
-        );
+        let (lines, height) =
+            render_entry(&entry, 80, DisplayMode::Raw, false, &mut sc, None, &labels);
         assert_eq!(height, 1);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0]
@@ -631,15 +646,8 @@ mod tests {
         let entry = make_entry(&raw, "api", None, None, None);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let (lines, height) = render_entry(
-            &entry,
-            50,
-            DisplayMode::Raw,
-            false,
-            &mut sc,
-            None,
-            &labels,
-        );
+        let (lines, height) =
+            render_entry(&entry, 50, DisplayMode::Raw, false, &mut sc, None, &labels);
         assert_eq!(height, 1);
         let text: String = lines[0]
             .spans
@@ -657,15 +665,8 @@ mod tests {
         let entry = make_entry(&raw, "api", None, None, None);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let (lines, height) = render_entry(
-            &entry,
-            40,
-            DisplayMode::Raw,
-            true,
-            &mut sc,
-            None,
-            &labels,
-        );
+        let (lines, height) =
+            render_entry(&entry, 40, DisplayMode::Raw, true, &mut sc, None, &labels);
         assert_eq!(height, 3, "100 chars at width 40 should be 3 lines");
         assert_eq!(lines.len(), 3);
     }
@@ -676,15 +677,8 @@ mod tests {
         let entry = make_entry(raw, "api", None, None, None);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let (_lines, height) = render_entry(
-            &entry,
-            80,
-            DisplayMode::Raw,
-            true,
-            &mut sc,
-            None,
-            &labels,
-        );
+        let (_lines, height) =
+            render_entry(&entry, 80, DisplayMode::Raw, true, &mut sc, None, &labels);
         assert_eq!(height, 3);
     }
 

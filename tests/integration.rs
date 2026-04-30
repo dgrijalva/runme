@@ -5,10 +5,10 @@
 
 use std::sync::Arc;
 
-use rnme::cli::{resolve_ui_mode, UiMode};
-use rnme::prelude::*;
 use nix::sys::signal;
 use nix::unistd::Pid;
+use rnme::cli::{UiMode, resolve_ui_mode};
+use rnme::prelude::*;
 
 mod common;
 #[path = "fixtures.rs"]
@@ -150,13 +150,11 @@ fn test_init_hook_runs_and_sets_group_name() {
     let inits: Vec<&InitDef> = inventory::iter::<InitDef>.into_iter().collect();
 
     // Find our init hook (group == "" since __RNME_GROUP is "")
-    let our_init = inits
-        .iter()
-        .find(|init| {
-            let mut ctx = InitContext::new("default");
-            (init.func)(&mut ctx);
-            ctx.group_name() == "Integration Test Group"
-        });
+    let our_init = inits.iter().find(|init| {
+        let mut ctx = InitContext::new("default");
+        (init.func)(&mut ctx);
+        ctx.group_name() == "Integration Test Group"
+    });
 
     assert!(
         our_init.is_some(),
@@ -268,8 +266,13 @@ async fn test_output_capture_from_exec() {
 
     let store = handle.log_store.lock().await;
     let entries = store.compose_owned();
-    let found = entries.iter().any(|e| e.raw.contains("hello from spawn_echo"));
-    assert!(found, "engine LogStore should contain 'hello from spawn_echo'");
+    let found = entries
+        .iter()
+        .any(|e| e.raw.contains("hello from spawn_echo"));
+    assert!(
+        found,
+        "engine LogStore should contain 'hello from spawn_echo'"
+    );
     drop(store);
 
     let _ = handle.quit().await;
@@ -450,7 +453,11 @@ async fn test_stop_all_kills_spawned_processes() {
     // Verify the process group is alive (signal 0 = existence check)
     for &pgid in &pgids {
         let alive = signal::killpg(Pid::from_raw(pgid), None);
-        assert!(alive.is_ok(), "PGID {} should be alive before stop_all", pgid);
+        assert!(
+            alive.is_ok(),
+            "PGID {} should be alive before stop_all",
+            pgid
+        );
     }
 
     // Stop all spawned processes

@@ -90,7 +90,8 @@ impl CliOutput {
         assert!(
             self.stdout.contains(pattern),
             "expected stdout to contain '{}'\nstdout: {}",
-            pattern, self.stdout
+            pattern,
+            self.stdout
         );
     }
 
@@ -99,7 +100,8 @@ impl CliOutput {
         assert!(
             self.stderr.contains(pattern),
             "expected stderr to contain '{}'\nstderr: {}",
-            pattern, self.stderr
+            pattern,
+            self.stderr
         );
     }
 }

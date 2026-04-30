@@ -159,7 +159,11 @@ pub struct EngineInternals {
 impl EngineInternals {
     /// Look up a task by id. Includes the synthetic root at `TaskId::ROOT`.
     pub fn lookup(&self, id: TaskId) -> Option<Arc<TaskExecution>> {
-        self.table.lock().expect("engine table poisoned").get(&id).cloned()
+        self.table
+            .lock()
+            .expect("engine table poisoned")
+            .get(&id)
+            .cloned()
     }
 
     /// Walk `table` and broadcast a fresh `GraphSnapshot`. Best-effort —
@@ -173,13 +177,7 @@ impl EngineInternals {
         let mut tasks = HashMap::with_capacity(snapshot_entries.len());
         for (id, exec) in snapshot_entries {
             let status = exec.task_status().lock().await.clone();
-            let kids: Vec<TaskId> = exec
-                .children
-                .lock()
-                .await
-                .iter()
-                .map(|c| c.id)
-                .collect();
+            let kids: Vec<TaskId> = exec.children.lock().await.iter().map(|c| c.id).collect();
             let procs: Vec<ProcessNodeInfo> = exec
                 .processes()
                 .lock()
@@ -234,11 +232,8 @@ impl EngineInternals {
         // TaskContext holds a Weak<TaskExecution> back to its own node
         // (for `ctx.run` → parent.children attachment).
         let exec_arc = {
-            let mut e = TaskExecution::with_log_store_and_engine(
-                id,
-                log_store,
-                engine_weak.clone(),
-            );
+            let mut e =
+                TaskExecution::with_log_store_and_engine(id, log_store, engine_weak.clone());
             e.parent = Some(parent_id);
             e.set_registry(self.registry.clone());
             Arc::new_cyclic(|self_weak| {
@@ -314,11 +309,7 @@ impl EngineInternals {
         self.cancel_task_with(id, CANCEL_TIMEOUT).await;
     }
 
-    pub async fn cancel_task_with(
-        self: &Arc<Self>,
-        id: TaskId,
-        kill_timeout: Duration,
-    ) {
+    pub async fn cancel_task_with(self: &Arc<Self>, id: TaskId, kill_timeout: Duration) {
         let Some(exec) = self.lookup(id) else {
             return;
         };
@@ -346,12 +337,12 @@ impl EngineInternals {
         // 3. Wait `CANCEL_TIMEOUT` for the body's tokio task to exit.
         let join = exec.task_handle.lock().await.take();
         let abort_handle = exec.abort_handle.clone();
-        if let Some(handle) = join {
-            if tokio::time::timeout(CANCEL_TIMEOUT, handle).await.is_err() {
-                // 4. Still alive — abort the tokio task.
-                if let Some(ah) = abort_handle {
-                    ah.abort();
-                }
+        if let Some(handle) = join
+            && tokio::time::timeout(CANCEL_TIMEOUT, handle).await.is_err()
+        {
+            // 4. Still alive — abort the tokio task.
+            if let Some(ah) = abort_handle {
+                ah.abort();
             }
         }
 
@@ -372,17 +363,12 @@ impl EngineInternals {
         self.cancel_subtree_with(root, CANCEL_TIMEOUT).await;
     }
 
-    pub async fn cancel_subtree_with(
-        self: &Arc<Self>,
-        root: TaskId,
-        kill_timeout: Duration,
-    ) {
+    pub async fn cancel_subtree_with(self: &Arc<Self>, root: TaskId, kill_timeout: Duration) {
         // Walk the subtree parent-first via BFS, recording each node in
         // visit order. Cancel in that same parent-first order so
         // subscribers observe the parent transition to `Cancelled`
         // before any of its children — matching arch.md §7 semantics.
-        let mut queue: std::collections::VecDeque<TaskId> =
-            std::collections::VecDeque::new();
+        let mut queue: std::collections::VecDeque<TaskId> = std::collections::VecDeque::new();
         queue.push_back(root);
         let mut visited: Vec<TaskId> = Vec::new();
         while let Some(id) = queue.pop_front() {
@@ -425,12 +411,11 @@ impl EngineInternals {
         }
         let join = exec.task_handle.lock().await.take();
         let abort_handle = exec.abort_handle.clone();
-        if let Some(handle) = join {
-            if tokio::time::timeout(CANCEL_TIMEOUT, handle).await.is_err() {
-                if let Some(ah) = abort_handle {
-                    ah.abort();
-                }
-            }
+        if let Some(handle) = join
+            && tokio::time::timeout(CANCEL_TIMEOUT, handle).await.is_err()
+            && let Some(ah) = abort_handle
+        {
+            ah.abort();
         }
         {
             let mut s = exec.task_status().lock().await;
@@ -545,11 +530,7 @@ pub struct EngineHandle {
 impl EngineHandle {
     /// Configure a spawn. Returns a builder; `.timeout(d)`, `.spawn()`,
     /// or `.await` to fire it.
-    pub fn spawn_task(
-        &self,
-        def: &'static TaskDef,
-        args: Vec<String>,
-    ) -> EngineSpawnBuilder {
+    pub fn spawn_task(&self, def: &'static TaskDef, args: Vec<String>) -> EngineSpawnBuilder {
         EngineSpawnBuilder {
             handle: self.clone(),
             def,
@@ -559,11 +540,7 @@ impl EngineHandle {
     }
 
     /// Cancel one task and its subtree (engine-walked, arch.md §7).
-    pub async fn kill_task(
-        &self,
-        id: TaskId,
-        signal: KillSignal,
-    ) -> Result<(), EngineError> {
+    pub async fn kill_task(&self, id: TaskId, signal: KillSignal) -> Result<(), EngineError> {
         let (tx, rx) = oneshot::channel();
         self.internals
             .control_tx

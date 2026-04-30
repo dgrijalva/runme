@@ -24,7 +24,7 @@ use super::handle::TaskHandle;
 ///
 /// Lazy: calling `.timeout(d)` mutates configuration; `.spawn()` registers
 /// + launches the task and returns a [`TaskHandle`]; `.await` (via
-/// `IntoFuture`) does both and waits for completion.
+///   `IntoFuture`) does both and waits for completion.
 pub struct TaskBuilder {
     inner: Result<TaskBuilderInner, TaskError>,
 }

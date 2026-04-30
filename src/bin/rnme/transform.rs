@@ -95,8 +95,7 @@ mod tests {
 
     #[test]
     fn test_frontmatter_stripped() {
-        let source =
-            "//! [dependencies]\n//! tokio = \"1\"\n\nfn work() {}\n";
+        let source = "//! [dependencies]\n//! tokio = \"1\"\n\nfn work() {}\n";
         let result = transform_source(source, "infra");
         assert!(result.starts_with("const __RNME_GROUP: &str = \"infra\";\n"));
         assert!(!result.contains("//! [dependencies]"));

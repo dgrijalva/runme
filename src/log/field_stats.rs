@@ -54,13 +54,10 @@ impl FieldStats {
 
     /// Record field presence and values from a log entry.
     pub fn observe(&mut self, source: TaskId, fields: &HashMap<String, Value>) {
-        let stats = self
-            .sources
-            .entry(source)
-            .or_insert_with(|| SourceStats {
-                total_entries: 0,
-                fields: HashMap::new(),
-            });
+        let stats = self.sources.entry(source).or_insert_with(|| SourceStats {
+            total_entries: 0,
+            fields: HashMap::new(),
+        });
         stats.total_entries += 1;
 
         for (key, value) in fields {
@@ -168,7 +165,11 @@ mod tests {
             stats.observe(TaskId(1), &make_fields(&[("pid", num(1234))]));
         }
         let scores = stats.field_scores(TaskId(1));
-        assert!(scores["pid"] < 0.1, "constant field should score low: {}", scores["pid"]);
+        assert!(
+            scores["pid"] < 0.1,
+            "constant field should score low: {}",
+            scores["pid"]
+        );
     }
 
     #[test]
@@ -211,10 +212,7 @@ mod tests {
         let mut stats = FieldStats::new();
         let statuses = ["ok", "error", "timeout"];
         for i in 0..60 {
-            stats.observe(
-                TaskId(1),
-                &make_fields(&[("status", val(statuses[i % 3]))]),
-            );
+            stats.observe(TaskId(1), &make_fields(&[("status", val(statuses[i % 3]))]));
         }
         let scores = stats.field_scores(TaskId(1));
         // 3 distinct values over 60 appearances → variance ≈ 0.05 → quality ≈ 0.19
@@ -254,7 +252,10 @@ mod tests {
             stats.observe(TaskId(1), &make_fields(&[("x", num(i))]));
         }
         let scores = stats.field_scores(TaskId(1));
-        assert!(scores.is_empty(), "should return empty with < MIN_SAMPLE entries");
+        assert!(
+            scores.is_empty(),
+            "should return empty with < MIN_SAMPLE entries"
+        );
     }
 
     #[test]

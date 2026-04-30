@@ -35,9 +35,14 @@ async fn fmt(ctx: &TaskContext) -> TaskResult {
     if files.is_empty() {
         return Err(TaskError::from("no RUNME.rs files found"));
     }
-    ctx.exec(Cmd::new("rustfmt").arg("--edition").arg("2024").args(&files))
-        .await?
-        .ok()?;
+    ctx.exec(
+        Cmd::new("rustfmt")
+            .arg("--edition")
+            .arg("2024")
+            .args(&files),
+    )
+    .await?
+    .ok()?;
     Ok(())
 }
 

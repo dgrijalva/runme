@@ -427,10 +427,7 @@ mod tests {
     #[test]
     fn test_cmd_macro_string_literal() {
         let cmd = rnme::cmd!(curl -H "Content-Type: application/json");
-        assert_eq!(
-            cmd.to_string(),
-            "curl -H Content-Type: application/json"
-        );
+        assert_eq!(cmd.to_string(), "curl -H Content-Type: application/json");
     }
 
     #[test]

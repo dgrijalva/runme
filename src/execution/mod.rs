@@ -9,6 +9,7 @@
 
 pub(crate) mod control;
 pub(crate) mod engine;
+#[allow(clippy::module_inception)]
 pub(crate) mod execution;
 mod root;
 mod task_id;

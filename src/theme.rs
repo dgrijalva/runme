@@ -6,9 +6,9 @@
 //! `SourceColors` lives here because it reads from `THEME.source_palette`
 //! and is used by both TUI and CLI rendering.
 
+use ratatui::style::Color;
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use ratatui::style::Color;
 
 use crate::execution::TaskId;
 

@@ -209,10 +209,7 @@ pub struct CancellationSignal<'a> {
 impl<'a> Future for CancellationSignal<'a> {
     type Output = ();
 
-    fn poll(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<()> {
+    fn poll(self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
         // SAFETY: structural pinning of `inner`. `CancellationSignal`
         // never moves the inner future out of the `Option` after
         // construction; the only mutation here is polling it.
@@ -334,10 +331,7 @@ impl TaskContext {
         let source = self.task_id.unwrap_or(TaskId::ROOT);
         let entry = LogEntry::raw(&text, source);
         // Push to the tracing buffer if available (TUI mode), otherwise exec buffer
-        let buffer = self
-            .tracing_output
-            .as_ref()
-            .unwrap_or(&self.output);
+        let buffer = self.tracing_output.as_ref().unwrap_or(&self.output);
         buffer.lock().await.push(entry);
     }
 
@@ -423,10 +417,10 @@ impl TaskContext {
                 if let Ok(mut pgids) = spawned_pgids.try_lock() {
                     pgids.push(pgid);
                 }
-            } else if let Some(pid) = handle.pid() {
-                if let Ok(mut pgids) = spawned_pgids.try_lock() {
-                    pgids.push(pid as i32);
-                }
+            } else if let Some(pid) = handle.pid()
+                && let Ok(mut pgids) = spawned_pgids.try_lock()
+            {
+                pgids.push(pid as i32);
             }
 
             // Notify the engine (if connected) about the new process
@@ -657,10 +651,7 @@ impl TaskContext {
 
     /// Inject the engine weak reference (slice 4). Called by
     /// `EngineInternals::spawn_child` before the body runs.
-    pub fn set_engine(
-        &mut self,
-        engine: Weak<crate::execution::engine::EngineInternals>,
-    ) {
+    pub fn set_engine(&mut self, engine: Weak<crate::execution::engine::EngineInternals>) {
         self.engine = Some(engine);
     }
 
@@ -668,12 +659,9 @@ impl TaskContext {
     ///
     /// Returns `None` outside the engine (e.g. tests using
     /// `TaskContext::new` directly), or after the engine has been dropped.
-    pub fn engine_internals(
-        &self,
-    ) -> Option<Arc<crate::execution::engine::EngineInternals>> {
+    pub fn engine_internals(&self) -> Option<Arc<crate::execution::engine::EngineInternals>> {
         self.engine.as_ref().and_then(|w| w.upgrade())
     }
-
 
     /// Identity of the running task (`None` outside the engine, e.g.
     /// tests that build a `TaskContext` directly).
@@ -687,9 +675,7 @@ impl TaskContext {
     /// using `TaskContext::new` directly without going through
     /// `TaskExecution::spawn_body`).
     pub fn cancelled(&self) -> bool {
-        self.cancellation
-            .as_ref()
-            .is_some_and(|t| t.is_cancelled())
+        self.cancellation.as_ref().is_some_and(|t| t.is_cancelled())
     }
 
     /// Future form for `tokio::select!` integration. Returns a future
@@ -709,9 +695,7 @@ impl TaskContext {
     /// Returns a fresh standalone token when none is wired so callers
     /// in test contexts don't need a special branch.
     pub fn cancellation(&self) -> CancellationToken {
-        self.cancellation
-            .clone()
-            .unwrap_or_else(CancellationToken::new)
+        self.cancellation.clone().unwrap_or_default()
     }
 
     /// Bind this task's readiness to a process handle's readiness.
@@ -763,9 +747,7 @@ impl TaskContext {
             } else {
                 false
             };
-            if transitioned
-                && let Some(weak) = self.engine.clone()
-            {
+            if transitioned && let Some(weak) = self.engine.clone() {
                 tokio::spawn(async move {
                     if let Some(eng) = weak.upgrade() {
                         eng.publish_snapshot().await;
@@ -800,9 +782,7 @@ impl TaskContext {
         let registry = match self.registry.as_ref() {
             Some(r) => r.clone(),
             None => {
-                return TaskBuilder::failed(TaskError::from_display(
-                    "no registry available",
-                ));
+                return TaskBuilder::failed(TaskError::from_display("no registry available"));
             }
         };
 
@@ -887,7 +867,11 @@ pub struct TaskQuery {
 impl TaskQuery {
     /// Return info for all registered tasks.
     pub fn all(&self) -> Vec<TaskInfo> {
-        self.registry.list().iter().map(|def| TaskInfo::from_def(def)).collect()
+        self.registry
+            .list()
+            .iter()
+            .map(|def| TaskInfo::from_def(def))
+            .collect()
     }
 
     /// Return tasks whose qualified name matches a glob pattern.
@@ -897,10 +881,7 @@ impl TaskQuery {
     ///
     /// Examples: `"*:test"`, `"services/*:deploy"`, `"build"`.
     pub fn matching(&self, pattern: &str) -> Vec<TaskInfo> {
-        let glob = match GlobBuilder::new(pattern)
-            .literal_separator(false)
-            .build()
-        {
+        let glob = match GlobBuilder::new(pattern).literal_separator(false).build() {
             Ok(g) => g.compile_matcher(),
             Err(_) => return Vec::new(),
         };

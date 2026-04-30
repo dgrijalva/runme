@@ -75,20 +75,14 @@ fn agent_json_specific_exit_code() {
 
 #[test]
 fn cli_mode_output() {
-    let out = harness::run_rnme(
-        KITCHEN_SINK.path(),
-        &["--ui", "cli", "produce_output"],
-    );
+    let out = harness::run_rnme(KITCHEN_SINK.path(), &["--ui", "cli", "produce_output"]);
     out.assert_success();
     out.assert_stdout_contains("hello-from-produce-output");
 }
 
 #[test]
 fn cli_mode_failure() {
-    let out = harness::run_rnme(
-        KITCHEN_SINK.path(),
-        &["--ui", "cli", "fail_default"],
-    );
+    let out = harness::run_rnme(KITCHEN_SINK.path(), &["--ui", "cli", "fail_default"]);
     assert_ne!(out.exit_code, 0, "expected non-zero exit for failing task");
     out.assert_stderr_contains("Error:");
 }
@@ -111,10 +105,7 @@ fn task_not_found() {
         KITCHEN_SINK.path(),
         &["--ui", "agent", "--format", "json", "nonexistent_task_xyz"],
     );
-    assert_ne!(
-        out.exit_code, 0,
-        "expected non-zero exit for unknown task"
-    );
+    assert_ne!(out.exit_code, 0, "expected non-zero exit for unknown task");
     // The error is printed to stderr by cli::run() before process::exit(1),
     // and the agent JSON path is never reached because resolve() fails first.
     out.assert_stderr_contains("unknown task");
@@ -145,7 +136,15 @@ fn nested_group_resolution() {
 fn arguments_forwarded_to_task() {
     let out = harness::run_rnme(
         KITCHEN_SINK.path(),
-        &["--ui", "agent", "--format", "json", "echo_args", "--message", "hello-world"],
+        &[
+            "--ui",
+            "agent",
+            "--format",
+            "json",
+            "echo_args",
+            "--message",
+            "hello-world",
+        ],
     );
     out.assert_success();
     out.assert_json_ok("echo_args");

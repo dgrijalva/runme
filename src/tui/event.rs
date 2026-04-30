@@ -225,21 +225,15 @@ async fn refresh_sidebar_state(state: &mut AppState) {
             .collect()
     };
 
-    state.sidebar_entries = sidebar::build_sidebar_entries_from_graph(
-        &snapshot,
-        &effective,
-        &mut state.source_colors,
-    );
+    state.sidebar_entries =
+        sidebar::build_sidebar_entries_from_graph(&snapshot, &effective, &mut state.source_colors);
     state.sidebar.clamp_selection(state.sidebar_entries.len());
 }
 
 /// Detect newly-failed processes from the latest graph snapshot and post a
 /// crash notification when the failure is hidden by the active filter or
 /// the user has scrolled away from the tail.
-fn check_for_crashes(
-    state: &mut AppState,
-    prev_statuses: &mut Vec<(TaskId, ProcessStatus)>,
-) {
+fn check_for_crashes(state: &mut AppState, prev_statuses: &mut Vec<(TaskId, ProcessStatus)>) {
     let Some(handle) = state.engine.as_ref() else {
         return;
     };
@@ -308,8 +302,7 @@ fn handle_key(
     };
     let viewport_width = term_size.width.saturating_sub(sidebar_width);
 
-    let filtered_entries: Vec<LogEntry> =
-        state.visible_log_lines().into_iter().cloned().collect();
+    let filtered_entries: Vec<LogEntry> = state.visible_log_lines().into_iter().cloned().collect();
 
     let source_labels = state
         .engine

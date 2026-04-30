@@ -12,10 +12,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::Parser;
 use crate::log::{LogEntry, Stream};
 use crate::task::Registry;
 use crate::tui::App;
+use clap::Parser;
 
 /// UI mode for task execution.
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -137,8 +137,7 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
     match ui {
         UiMode::Tui => {
             let (engine, handle) = crate::execution::Engine::start(registry.clone());
-            let mut app =
-                App::with_task(task, task_args, registry.clone(), handle.clone()).await;
+            let mut app = App::with_task(task, task_args, registry.clone(), handle.clone()).await;
             let result = app.run().await;
             let _ = handle.quit().await;
             engine.shutdown().await;
@@ -165,8 +164,7 @@ fn parse_timeout(s: &str) -> Result<Duration, String> {
     if let Ok(secs) = s.parse::<u64>() {
         return Ok(Duration::from_secs(secs));
     }
-    Err("expected a humantime duration like '30s' or '5m', or a bare number of seconds"
-        .to_string())
+    Err("expected a humantime duration like '30s' or '5m', or a bare number of seconds".to_string())
 }
 
 /// Run a task in CLI mode: direct execution with stdio output, no TUI.
@@ -227,9 +225,10 @@ async fn run_cli(
                     | TaskStatus::Timeout
             );
             if body_done {
-                let any_running = node.processes.iter().any(|p| {
-                    matches!(p.status, crate::execution::ProcessStatus::Running)
-                });
+                let any_running = node
+                    .processes
+                    .iter()
+                    .any(|p| matches!(p.status, crate::execution::ProcessStatus::Running));
                 if !any_running {
                     break node.status.clone();
                 }
@@ -353,7 +352,9 @@ async fn run_agent(
         let snap = graph.borrow().clone();
         if let Some(node) = snap.tasks.get(&task_id) {
             match &node.status {
-                TaskStatus::Done | TaskStatus::Failed(_) | TaskStatus::Cancelled
+                TaskStatus::Done
+                | TaskStatus::Failed(_)
+                | TaskStatus::Cancelled
                 | TaskStatus::Timeout => break node.status.clone(),
                 _ => {}
             }
@@ -374,14 +375,12 @@ async fn run_agent(
     engine.shutdown().await;
 
     match status {
-        TaskStatus::Done => {
-            match format {
-                OutputFormat::Json => {
-                    println!("{}", serde_json::json!({"status": "ok", "task": task.name}));
-                }
-                OutputFormat::Text | OutputFormat::Raw => {}
+        TaskStatus::Done => match format {
+            OutputFormat::Json => {
+                println!("{}", serde_json::json!({"status": "ok", "task": task.name}));
             }
-        }
+            OutputFormat::Text | OutputFormat::Raw => {}
+        },
         TaskStatus::Failed(failure) => {
             match format {
                 OutputFormat::Json => {
@@ -451,5 +450,9 @@ pub fn resolve_ui_mode(
     }
 
     // Default: TUI if terminal available, CLI otherwise
-    if has_terminal { UiMode::Tui } else { UiMode::Cli }
+    if has_terminal {
+        UiMode::Tui
+    } else {
+        UiMode::Cli
+    }
 }

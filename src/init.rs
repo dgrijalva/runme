@@ -119,23 +119,20 @@ impl InitContext {
         F: for<'a> Fn(
                 &'a crate::task::TaskContext,
                 &[String],
-            )
-                -> std::pin::Pin<
-                    Box<
-                        dyn std::future::Future<
-                                Output = Result<(), crate::error::TaskError>,
-                            > + Send
-                            + 'a,
-                    >,
-                > + Send
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), crate::error::TaskError>>
+                        + Send
+                        + 'a,
+                >,
+            > + Send
             + Sync
             + 'static,
     {
         let leaked_name: &'static str = Box::leak(name.to_string().into_boxed_str());
         let leaked_desc: Option<&'static str> =
             description.map(|d| &*Box::leak(d.to_string().into_boxed_str()));
-        let leaked_group: &'static str =
-            Box::leak(self.group_name.clone().into_boxed_str());
+        let leaked_group: &'static str = Box::leak(self.group_name.clone().into_boxed_str());
 
         let task_def = Box::leak(Box::new(crate::task::TaskDef {
             name: leaked_name,

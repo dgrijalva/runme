@@ -227,8 +227,7 @@ pub fn render_filter_input(frame: &mut Frame, area: Rect, filter_state: &FilterI
     }
 
     let line = Line::from(spans);
-    let paragraph =
-        Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
+    let paragraph = Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
     frame.render_widget(paragraph, area);
 }
 

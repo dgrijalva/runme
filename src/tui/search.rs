@@ -243,10 +243,7 @@ pub fn render_search_input(frame: &mut Frame, area: Rect, search_state: &SearchS
 
     if search_state.text.is_empty() {
         // Placeholder
-        spans.push(Span::styled(
-            "search...",
-            Style::default().fg(THEME.dim),
-        ));
+        spans.push(Span::styled("search...", Style::default().fg(THEME.dim)));
     } else {
         // Split text at cursor position for rendering
         let before = &search_state.text[..search_state.cursor];
@@ -278,8 +275,7 @@ pub fn render_search_input(frame: &mut Frame, area: Rect, search_state: &SearchS
     }
 
     let line = Line::from(spans);
-    let paragraph =
-        Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
+    let paragraph = Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
     frame.render_widget(paragraph, area);
 }
 
@@ -315,7 +311,9 @@ pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
 
 /// Style for highlighting search matches (non-current).
 pub fn match_highlight_style() -> Style {
-    Style::default().bg(THEME.search_match_bg).fg(THEME.search_match_fg)
+    Style::default()
+        .bg(THEME.search_match_bg)
+        .fg(THEME.search_match_fg)
 }
 
 /// Style for highlighting the current search match (where n/N is focused).

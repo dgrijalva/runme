@@ -158,7 +158,12 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
         let message = collector.message.clone().unwrap_or_default();
 
         let raw = if collector.fields.is_empty() {
-            format!("{} {}: {}", level.to_uppercase(), task_ctx.source_label, message)
+            format!(
+                "{} {}: {}",
+                level.to_uppercase(),
+                task_ctx.source_label,
+                message
+            )
         } else {
             let fields_str: Vec<String> = collector
                 .fields

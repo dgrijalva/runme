@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use super::LogEntry;
 use crate::ansi;
 use crate::execution::TaskId;
-use crate::theme::{THEME, SourceColors};
+use crate::theme::{SourceColors, THEME};
 
 /// Build the source-column display string `[N] label` for a log entry.
 ///
@@ -49,10 +49,7 @@ pub fn format_entry(entry: &LogEntry, labels: &HashMap<TaskId, String>) -> Strin
     let fields_str = format_fields_inline(&entry.fields);
 
     if fields_str.is_empty() {
-        format!(
-            "{}{}{}{}{}{}{}",
-            ts, gap, level, gap, source, gap, message
-        )
+        format!("{}{}{}{}{}{}{}", ts, gap, level, gap, source, gap, message)
     } else {
         format!(
             "{}{}{}{}{}{}{} {}",
@@ -242,10 +239,7 @@ mod tests {
     fn test_format_entry_with_fields() {
         use crate::execution::TaskId;
         let mut fields = HashMap::new();
-        fields.insert(
-            "latency".to_string(),
-            serde_json::Value::Number(42.into()),
-        );
+        fields.insert("latency".to_string(), serde_json::Value::Number(42.into()));
         let entry = LogEntry::new(
             r#"{"msg":"heartbeat","latency":42}"#.to_string(),
             ParsedContent::PlainText,

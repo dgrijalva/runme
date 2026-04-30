@@ -11,8 +11,8 @@ use syn::{
 /// If a single remaining parameter has one of these types, it's Form 2 (simple args).
 /// If it has a non-primitive type, it's Form 3 (parser struct).
 const KNOWN_PRIMITIVES: &[&str] = &[
-    "String", "bool", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128",
-    "f32", "f64", "usize", "isize",
+    "String", "bool", "u8", "u16", "u32", "u64", "u128", "i8", "i16", "i32", "i64", "i128", "f32",
+    "f64", "usize", "isize",
 ];
 
 /// Describes which argument form a task function uses.

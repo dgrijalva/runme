@@ -838,7 +838,9 @@ pub enum ReadinessCondition {
     /// Process is ready when this URL returns an HTTP 2xx response.
     Http(String),
     /// Process is ready when this async closure returns.
-    Custom(Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>),
+    Custom(
+        Box<dyn FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send>,
+    ),
 }
 
 impl std::fmt::Debug for ReadinessCondition {
@@ -904,11 +906,13 @@ async fn run_readiness_probe(condition: ReadinessCondition) {
 /// // Wait for completion (like exec)
 /// let result = ctx.spawn("cargo build").complete().await?;
 /// ```
+type OnSpawnCallback = Box<dyn FnOnce(&ProcessHandle) + Send>;
+
 pub struct SpawnBuilder {
     cmd: Cmd,
     task_name: String,
     buffer: std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
-    on_spawn: Option<Box<dyn FnOnce(&ProcessHandle) + Send>>,
+    on_spawn: Option<OnSpawnCallback>,
     readiness: Option<ReadinessCondition>,
     ready_timeout: Option<Duration>,
     timeout: Option<Duration>,
@@ -1055,7 +1059,9 @@ impl std::future::IntoFuture for SpawnBuilder {
 ///
 /// Returned by `SpawnBuilder::complete()`.
 pub struct CompletionFuture {
-    inner: std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessResult, ProcessError>> + Send>>,
+    inner: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ProcessResult, ProcessError>> + Send>,
+    >,
 }
 
 impl std::future::Future for CompletionFuture {
@@ -1217,7 +1223,9 @@ mod tests {
         // the handle correctly clears `armed` so the OS doesn't get
         // a redundant SIGTERM on an already-reaped pid.
         let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
-        let handle = spawn("sh -c 'echo done; exit 0'", "test", buffer).await.unwrap();
+        let handle = spawn("sh -c 'echo done; exit 0'", "test", buffer)
+            .await
+            .unwrap();
         let _result = handle.complete().await;
         // No assertion needed beyond "no panic / no UB"; if armed
         // remained true, killpg on an already-reaped pgid would still

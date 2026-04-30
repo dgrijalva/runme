@@ -109,9 +109,9 @@ impl IntoFuture for TaskHandle {
                     }
                     TaskStatus::Cancelled => Err(TaskError::cancelled()),
                     TaskStatus::Timeout => Err(TaskError::timeout()),
-                    TaskStatus::Setup | TaskStatus::Ready => Err(TaskError::from_display(
-                        "task handle already consumed",
-                    )),
+                    TaskStatus::Setup | TaskStatus::Ready => {
+                        Err(TaskError::from_display("task handle already consumed"))
+                    }
                 },
             }
         })
@@ -225,10 +225,7 @@ mod tests {
         Arc::new(r)
     }
 
-    async fn wait_terminal(
-        handle: &crate::execution::EngineHandle,
-        id: TaskId,
-    ) -> TaskStatus {
+    async fn wait_terminal(handle: &crate::execution::EngineHandle, id: TaskId) -> TaskStatus {
         let mut graph = handle.graph.clone();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -338,4 +335,3 @@ mod tests {
         assert_eq!(result.unwrap_err().to_string(), "no engine context");
     }
 }
-

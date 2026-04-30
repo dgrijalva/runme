@@ -296,11 +296,7 @@ impl AppState {
 
     /// Launch a task through the engine. Called from the event loop when a
     /// task is selected from the picker or `r` is used to restart.
-    pub async fn launch_picked_task(
-        &mut self,
-        task: &'static TaskDef,
-        task_args: Vec<String>,
-    ) {
+    pub async fn launch_picked_task(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
         self.current_task = Some(task);
         self.current_task_args = task_args.clone();
 
@@ -308,10 +304,8 @@ impl AppState {
             match handle.spawn_task(task, task_args).await {
                 Ok(id) => self.current_task_id = Some(id),
                 Err(e) => {
-                    self.notifications.push((
-                        format!("spawn failed: {e}"),
-                        std::time::Instant::now(),
-                    ));
+                    self.notifications
+                        .push((format!("spawn failed: {e}"), std::time::Instant::now()));
                 }
             }
         }
@@ -616,10 +610,7 @@ mod tests {
     fn close_picker_clears_state() {
         let mut state = AppState::new();
         state.picker_open = true;
-        state.picker = Some(super::super::picker::PickerState::new(
-            &[],
-            &HashMap::new(),
-        ));
+        state.picker = Some(super::super::picker::PickerState::new(&[], &HashMap::new()));
         state.close_picker();
         assert!(!state.picker_open);
         assert!(state.picker.is_none());

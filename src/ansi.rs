@@ -45,17 +45,17 @@ pub fn strip(s: &str) -> String {
     let mut chars = s.chars();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
-            // Consume the escape sequence
-            if let Some(next) = chars.next() {
-                if next == '[' {
-                    // CSI sequence: consume parameters until a terminal letter
-                    for c in chars.by_ref() {
-                        if c.is_ascii_alphabetic() {
-                            break;
-                        }
+            // Consume the escape sequence. Non-CSI sequences are skipped as
+            // ESC + one char (the `chars.next()` below).
+            if let Some(next) = chars.next()
+                && next == '['
+            {
+                // CSI sequence: consume parameters until a terminal letter
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
                     }
                 }
-                // Non-CSI: just skip ESC + the one char
             }
         } else {
             result.push(ch);

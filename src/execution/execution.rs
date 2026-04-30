@@ -417,10 +417,7 @@ impl TaskExecution {
             slot.take()
         };
         match handle {
-            Some(h) => match h.await {
-                Ok(res) => Some(res),
-                Err(_) => None, // panic / abort — status was already set
-            },
+            Some(h) => h.await.ok(),
             None => None,
         }
     }

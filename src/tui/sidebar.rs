@@ -14,9 +14,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::execution::{
-    GraphSnapshot, ProcessStatus, TaskId, TaskNode, TaskStatus,
-};
+use crate::execution::{GraphSnapshot, ProcessStatus, TaskId, TaskNode, TaskStatus};
 use crate::theme::{SourceColors, THEME};
 
 /// Fixed sidebar width in columns.
@@ -123,7 +121,14 @@ pub fn build_sidebar_entries_from_graph(
     // the visual nesting is purely a sidebar choice. Descendant tasks
     // (`ctx.run` children) and their processes nest at depth+1.
     for &child_id in &root.children {
-        push_task_subtree(snapshot, child_id, 0, visible_sources, source_colors, &mut entries);
+        push_task_subtree(
+            snapshot,
+            child_id,
+            0,
+            visible_sources,
+            source_colors,
+            &mut entries,
+        );
     }
 
     entries
@@ -143,7 +148,14 @@ fn push_task_subtree(
     push_task_entry(node, depth, visible_sources, source_colors, out);
     push_process_entries(node, depth + 1, visible_sources, source_colors, out);
     for &child in &node.children {
-        push_task_subtree(snapshot, child, depth + 1, visible_sources, source_colors, out);
+        push_task_subtree(
+            snapshot,
+            child,
+            depth + 1,
+            visible_sources,
+            source_colors,
+            out,
+        );
     }
 }
 
@@ -293,8 +305,10 @@ pub fn render_sidebar(
 
         let indent_width = entry.depth * 2;
         let indent = " ".repeat(indent_width);
-        let max_name_width =
-            inner.width.saturating_sub(base_overhead + indent_width as u16) as usize;
+        let max_name_width = inner
+            .width
+            .saturating_sub(base_overhead + indent_width as u16)
+            as usize;
         let prefix = if is_marked { "> " } else { "  " };
         let name_color = source_colors.color_for(entry.source);
         let name_style = if !entry.visible {
@@ -344,7 +358,10 @@ pub fn render_sidebar(
         if indent_width > 0 {
             spans.push(Span::raw(indent));
         }
-        spans.push(Span::styled(format!("{} ", visibility_marker), marker_style));
+        spans.push(Span::styled(
+            format!("{} ", visibility_marker),
+            marker_style,
+        ));
         spans.push(Span::styled(display_name, name_style));
         spans.push(Span::raw(padding));
         spans.push(Span::styled(tag, tag_style));
@@ -474,8 +491,7 @@ mod tests {
     fn build_entries_empty_when_no_root() {
         let mut sc = SourceColors::new();
         let snap = GraphSnapshot::default();
-        let entries =
-            build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
+        let entries = build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
         // Default snapshot has no root entry => no entries at all.
         assert!(entries.is_empty());
     }
@@ -549,13 +565,12 @@ mod tests {
             task_status_display(&TaskStatus::Done),
             ("DONE".to_string(), Color::DarkGray)
         );
-        let (tag, color) = task_status_display(&TaskStatus::Failed(
-            crate::execution::TaskFailure {
+        let (tag, color) =
+            task_status_display(&TaskStatus::Failed(crate::execution::TaskFailure {
                 message: "err".to_string(),
                 exit_code: 1,
                 output_json: "{}".to_string(),
-            },
-        ));
+            }));
         assert_eq!(tag, "FAIL");
         assert_eq!(color, Color::Red);
     }
@@ -584,17 +599,15 @@ mod tests {
     #[test]
     fn source_for_index_valid() {
         let id = TaskId(7);
-        let entries = vec![
-            SidebarEntry {
-                name: "task".to_string(),
-                source: id,
-                status_tag: "SETUP".to_string(),
-                status_color: Color::Yellow,
-                visible: true,
-                is_task: true,
-                depth: 0,
-            },
-        ];
+        let entries = vec![SidebarEntry {
+            name: "task".to_string(),
+            source: id,
+            status_tag: "SETUP".to_string(),
+            status_color: Color::Yellow,
+            visible: true,
+            is_task: true,
+            depth: 0,
+        }];
         assert_eq!(source_for_index(&entries, 0), Some(id));
         assert_eq!(source_for_index(&entries, 1), None);
     }

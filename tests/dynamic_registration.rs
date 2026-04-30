@@ -18,9 +18,7 @@ use rnme::task::Registry;
 #[tokio::test]
 async fn test_dynamic_task_runs_successfully() {
     let mut ctx = InitContext::new("test");
-    ctx.register_task("hello", None, |_ctx, _args| {
-        Box::pin(async { Ok(()) })
-    });
+    ctx.register_task("hello", None, |_ctx, _args| Box::pin(async { Ok(()) }));
 
     let mut reg = Registry::new();
     for task in ctx.drain_tasks() {
@@ -45,7 +43,10 @@ async fn test_dynamic_task_with_captured_state() {
             move |_ctx, _args| {
                 let cmd_name = cmd_name.clone();
                 Box::pin(async move {
-                    assert!(!cmd_name.is_empty(), "captured command name should be present");
+                    assert!(
+                        !cmd_name.is_empty(),
+                        "captured command name should be present"
+                    );
                     Ok(())
                 })
             },
@@ -77,7 +78,12 @@ async fn test_dynamic_task_can_return_error() {
 
     let result = reg.run("failing").await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("something went wrong"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("something went wrong")
+    );
 }
 
 #[tokio::test]
@@ -154,9 +160,7 @@ async fn test_dynamic_task_metadata() {
 #[tokio::test]
 async fn test_dynamic_task_rerunnable() {
     let mut ctx = InitContext::new("");
-    ctx.register_task("rerun_me", None, |_ctx, _args| {
-        Box::pin(async { Ok(()) })
-    });
+    ctx.register_task("rerun_me", None, |_ctx, _args| Box::pin(async { Ok(()) }));
 
     let mut reg = Registry::new();
     for task in ctx.drain_tasks() {

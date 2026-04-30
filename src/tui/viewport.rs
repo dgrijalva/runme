@@ -456,15 +456,7 @@ fn adjust_top_for_cursor(
             if i == cursor {
                 break;
             }
-            let (_, h) = render_entry(
-                entry,
-                width,
-                mode,
-                wrap,
-                source_colors,
-                None,
-                source_labels,
-            );
+            let (_, h) = render_entry(entry, width, mode, wrap, source_colors, None, source_labels);
             y += h;
         }
 

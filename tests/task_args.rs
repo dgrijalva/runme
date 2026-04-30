@@ -41,12 +41,7 @@ async fn test_zero_arg_metadata_is_none() {
 // ============================================================
 
 #[rnme::task(desc = "A task with simple args")]
-async fn simple_args_task(
-    ctx: &TaskContext,
-    env: String,
-    port: u16,
-    verbose: bool,
-) -> TaskResult {
+async fn simple_args_task(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
     info!(
         "simple_args_task: env={}, port={}, verbose={}",
         env, port, verbose
@@ -74,7 +69,10 @@ async fn test_simple_args_missing_required() {
     // Missing --env and --port
     let args: Vec<String> = vec!["--verbose".into()];
     let result = reg.run_with_args("simple_args_task", &args).await;
-    assert!(result.is_err(), "should fail when required args are missing");
+    assert!(
+        result.is_err(),
+        "should fail when required args are missing"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("required"),
@@ -132,7 +130,9 @@ async fn single_string_task(ctx: &TaskContext, name: String) -> TaskResult {
 async fn test_single_string_is_form2() {
     let reg = Registry::from_inventory();
     let args: Vec<String> = vec!["--name".into(), "hello".into()];
-    reg.run_with_args("single_string_task", &args).await.unwrap();
+    reg.run_with_args("single_string_task", &args)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -192,7 +192,10 @@ async fn test_optional_absent() {
 
 #[rnme::task(desc = "A task with underscored param names")]
 async fn underscore_task(ctx: &TaskContext, my_flag: bool, my_value: String) -> TaskResult {
-    info!("underscore_task: my_flag={}, my_value={}", my_flag, my_value);
+    info!(
+        "underscore_task: my_flag={}, my_value={}",
+        my_flag, my_value
+    );
     let _ = ctx;
     Ok(())
 }
@@ -200,11 +203,7 @@ async fn underscore_task(ctx: &TaskContext, my_flag: bool, my_value: String) -> 
 #[tokio::test]
 async fn test_underscore_to_dash_in_flags() {
     let reg = Registry::from_inventory();
-    let args: Vec<String> = vec![
-        "--my-flag".into(),
-        "--my-value".into(),
-        "hello".into(),
-    ];
+    let args: Vec<String> = vec!["--my-flag".into(), "--my-value".into(), "hello".into()];
     reg.run_with_args("underscore_task", &args).await.unwrap();
 }
 
@@ -225,10 +224,7 @@ struct DeployArgs {
 
 #[rnme::task(desc = "A task with a parser struct")]
 async fn parser_struct_task(ctx: &TaskContext, args: DeployArgs) -> TaskResult {
-    info!(
-        "parser_struct_task: env={}, port={}",
-        args.env, args.port
-    );
+    info!("parser_struct_task: env={}, port={}", args.env, args.port);
     let _ = ctx;
     Ok(())
 }
@@ -236,8 +232,15 @@ async fn parser_struct_task(ctx: &TaskContext, args: DeployArgs) -> TaskResult {
 #[tokio::test]
 async fn test_parser_struct_runs() {
     let reg = Registry::from_inventory();
-    let args: Vec<String> = vec!["--env".into(), "staging".into(), "--port".into(), "9090".into()];
-    reg.run_with_args("parser_struct_task", &args).await.unwrap();
+    let args: Vec<String> = vec![
+        "--env".into(),
+        "staging".into(),
+        "--port".into(),
+        "9090".into(),
+    ];
+    reg.run_with_args("parser_struct_task", &args)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -245,7 +248,9 @@ async fn test_parser_struct_default_values() {
     let reg = Registry::from_inventory();
     // port has a default_value in the derive, so omitting it should work
     let args: Vec<String> = vec!["--env".into(), "dev".into()];
-    reg.run_with_args("parser_struct_task", &args).await.unwrap();
+    reg.run_with_args("parser_struct_task", &args)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -268,10 +273,7 @@ async fn test_parser_struct_metadata_returns_command() {
     let reg = Registry::from_inventory();
     let task = reg.get("parser_struct_task").unwrap();
     let cmd = (task.arg_metadata)();
-    assert!(
-        cmd.is_some(),
-        "parser struct task should have arg metadata"
-    );
+    assert!(cmd.is_some(), "parser struct task should have arg metadata");
     let cmd = cmd.unwrap();
     // The command should have the args defined in DeployArgs
     let arg_names: Vec<&str> = cmd.get_arguments().map(|a| a.get_id().as_str()).collect();

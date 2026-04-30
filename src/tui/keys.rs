@@ -911,10 +911,9 @@ pub(super) fn handle_kill_menu_key(key: KeyEvent, state: &mut AppState) {
                 tokio::spawn(async move {
                     let _ = handle.kill_all().await;
                 });
-                state.notifications.push((
-                    "Killed all tasks".to_string(),
-                    std::time::Instant::now(),
-                ));
+                state
+                    .notifications
+                    .push(("Killed all tasks".to_string(), std::time::Instant::now()));
             }
             state.mode = AppMode::Normal;
         }
@@ -1227,10 +1226,7 @@ mod tests {
         );
         assert_eq!(state.sidebar.selection, 2);
         // Move back up
-        handle_sidebar_key(
-            make_key_event(KeyCode::Up, KeyModifiers::NONE),
-            &mut state,
-        );
+        handle_sidebar_key(make_key_event(KeyCode::Up, KeyModifiers::NONE), &mut state);
         assert_eq!(state.sidebar.selection, 1);
     }
 
@@ -1769,10 +1765,7 @@ mod tests {
     fn picker_esc_closes_overlay_keeps_running() {
         let mut state = AppState::new();
         state.picker_open = true;
-        state.picker = Some(super::super::picker::PickerState::new(
-            &[],
-            &HashMap::new(),
-        ));
+        state.picker = Some(super::super::picker::PickerState::new(&[], &HashMap::new()));
         assert!(state.running);
 
         handle_picker_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
@@ -1785,10 +1778,7 @@ mod tests {
     fn picker_q_does_not_quit() {
         let mut state = AppState::new();
         state.picker_open = true;
-        state.picker = Some(super::super::picker::PickerState::new(
-            &[],
-            &HashMap::new(),
-        ));
+        state.picker = Some(super::super::picker::PickerState::new(&[], &HashMap::new()));
 
         // 'q' in the picker is just an input character, not a quit.
         handle_picker_key(
@@ -1803,10 +1793,7 @@ mod tests {
     fn picker_ctrl_c_quits() {
         let mut state = AppState::new();
         state.picker_open = true;
-        state.picker = Some(super::super::picker::PickerState::new(
-            &[],
-            &HashMap::new(),
-        ));
+        state.picker = Some(super::super::picker::PickerState::new(&[], &HashMap::new()));
 
         handle_picker_key(
             make_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL),
