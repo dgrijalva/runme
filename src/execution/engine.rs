@@ -71,6 +71,28 @@ impl Default for GraphSnapshot {
     }
 }
 
+impl GraphSnapshot {
+    /// Returns a map from every TaskId in the graph (tasks + processes)
+    /// to its display label. For tasks, the label is the task name.
+    /// For processes, the label is the command_label (falling back to
+    /// task_name if empty).
+    pub fn source_labels(&self) -> HashMap<TaskId, String> {
+        let mut m = HashMap::new();
+        for (id, node) in self.tasks.iter() {
+            m.insert(*id, node.name.clone());
+            for proc in &node.processes {
+                let label = if proc.command_label.is_empty() {
+                    proc.task_name.clone()
+                } else {
+                    proc.command_label.clone()
+                };
+                m.insert(proc.id, label);
+            }
+        }
+        m
+    }
+}
+
 /// Snapshot of a single task in the graph.
 #[derive(Clone)]
 pub struct TaskNode {

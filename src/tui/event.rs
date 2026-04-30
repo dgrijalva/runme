@@ -296,6 +296,12 @@ fn handle_key(
     let filtered_entries: Vec<LogEntry> =
         state.visible_log_lines().into_iter().cloned().collect();
 
+    let source_labels = state
+        .engine
+        .as_ref()
+        .map(|h| h.graph.borrow().source_labels())
+        .unwrap_or_default();
+
     if state.mode == AppMode::TaskPicker {
         keys::handle_picker_key(key, state);
         state.dirty = true;
@@ -327,6 +333,7 @@ fn handle_key(
             &filtered_entries,
             viewport_height,
             viewport_width,
+            &source_labels,
         );
         state.dirty = true;
         return;
@@ -388,6 +395,7 @@ fn handle_key(
             &filtered_entries,
             viewport_height,
             viewport_width,
+            &source_labels,
         );
     }
 
@@ -418,6 +426,12 @@ fn handle_mouse(
         0
     };
 
+    let source_labels = state
+        .engine
+        .as_ref()
+        .map(|h| h.graph.borrow().source_labels())
+        .unwrap_or_default();
+
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             if mouse.column >= sidebar_width {
@@ -434,6 +448,7 @@ fn handle_mouse(
                         state.display_mode,
                         state.wrap,
                         &mut state.source_colors,
+                        &source_labels,
                     );
                 }
                 state.dirty = true;
@@ -454,6 +469,7 @@ fn handle_mouse(
                         state.display_mode,
                         state.wrap,
                         &mut state.source_colors,
+                        &source_labels,
                     );
                 }
                 state.dirty = true;
@@ -485,6 +501,7 @@ fn handle_mouse(
                         &mut state.source_colors,
                         Some(&state.field_stats),
                         state.show_fields,
+                        &source_labels,
                     );
 
                     for ve in &vp_layout.entries {
@@ -640,6 +657,7 @@ mod tests {
 
         assert_eq!(state.scroll, ScrollState::Tail);
 
+        let labels = HashMap::new();
         let new_scroll = super::scroll_up(
             &state.scroll,
             &state.log_lines,
@@ -648,6 +666,7 @@ mod tests {
             state.display_mode,
             state.wrap,
             &mut state.source_colors,
+            &labels,
         );
         state.scroll = new_scroll;
         assert!(matches!(state.scroll, ScrollState::Pinned { .. }));

@@ -130,6 +130,14 @@ pub fn render_frame(
             // Convert filtered entries to a contiguous slice for viewport
             let owned_entries: Vec<LogEntry> = visible_entries.into_iter().cloned().collect();
 
+            // Build the per-frame source labels map from the latest graph
+            // snapshot (or empty if no engine yet — fallback `[N] tN`).
+            let source_labels = state
+                .engine
+                .as_ref()
+                .map(|h| h.graph.borrow().source_labels())
+                .unwrap_or_default();
+
             // Use the viewport to compute which entries are visible
             let vp_layout = viewport::layout(
                 &state.scroll,
@@ -141,6 +149,7 @@ pub fn render_frame(
                 &mut state.source_colors,
                 Some(&state.field_stats),
                 state.show_fields,
+                &source_labels,
             );
 
             // Build a line buffer for the entire viewport, initialized to empty

@@ -1,6 +1,7 @@
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-#[allow(unused_imports)]
 use crate::execution::TaskId;
 use crate::log::LogEntry;
 
@@ -76,12 +77,14 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
 }
 
 /// Handle keys when log viewer is focused.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_log_viewer_key(
     key: KeyEvent,
     state: &mut AppState,
     filtered_entries: &[LogEntry],
     viewport_height: u16,
     viewport_width: u16,
+    source_labels: &HashMap<TaskId, String>,
 ) {
     match key.code {
         // j / Down: move cursor to next entry
@@ -94,6 +97,7 @@ pub(super) fn handle_log_viewer_key(
                 state.display_mode,
                 state.wrap,
                 &mut state.source_colors,
+                source_labels,
             );
         }
 
@@ -107,6 +111,7 @@ pub(super) fn handle_log_viewer_key(
                 state.display_mode,
                 state.wrap,
                 &mut state.source_colors,
+                source_labels,
             );
         }
 
@@ -120,6 +125,7 @@ pub(super) fn handle_log_viewer_key(
                 state.display_mode,
                 state.wrap,
                 &mut state.source_colors,
+                source_labels,
             );
         }
         KeyCode::PageDown | KeyCode::Char(']') => {
@@ -131,6 +137,7 @@ pub(super) fn handle_log_viewer_key(
                 state.display_mode,
                 state.wrap,
                 &mut state.source_colors,
+                source_labels,
             );
         }
 
@@ -144,6 +151,7 @@ pub(super) fn handle_log_viewer_key(
                 state.display_mode,
                 state.wrap,
                 &mut state.source_colors,
+                source_labels,
             );
         }
         KeyCode::PageUp | KeyCode::Char('[') => {
@@ -155,6 +163,7 @@ pub(super) fn handle_log_viewer_key(
                 state.display_mode,
                 state.wrap,
                 &mut state.source_colors,
+                source_labels,
             );
         }
 
@@ -540,12 +549,14 @@ pub(super) fn handle_search_input_key(
 }
 
 /// Handle keys when in entry detail mode.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_detail_key(
     key: KeyEvent,
     state: &mut AppState,
     filtered_entries: &[LogEntry],
     viewport_height: u16,
     viewport_width: u16,
+    source_labels: &HashMap<TaskId, String>,
 ) {
     match key.code {
         // Esc or q: close detail view, return to Normal mode
@@ -586,6 +597,7 @@ pub(super) fn handle_detail_key(
                     state.display_mode,
                     state.wrap,
                     &mut state.source_colors,
+                    source_labels,
                 );
             }
         }
@@ -613,6 +625,7 @@ pub(super) fn handle_detail_key(
                     state.display_mode,
                     state.wrap,
                     &mut state.source_colors,
+                    source_labels,
                 );
             }
         }
@@ -1083,12 +1096,14 @@ mod tests {
             },
         ];
 
+        let labels = HashMap::new();
         handle_log_viewer_key(
             make_key_event(KeyCode::Char('2'), KeyModifiers::NONE),
             &mut state,
             &[],
             24,
             80,
+            &labels,
         );
         assert!(state.source_filter.contains(&task_id));
         assert!(!state.source_filter.contains(&api_id));
@@ -1100,12 +1115,14 @@ mod tests {
         state.source_filter.insert(TaskId(2));
         assert!(!state.source_filter.is_empty());
 
+        let labels = HashMap::new();
         handle_log_viewer_key(
             make_key_event(KeyCode::Char('a'), KeyModifiers::NONE),
             &mut state,
             &[],
             24,
             80,
+            &labels,
         );
         assert!(state.source_filter.is_empty());
     }
@@ -1121,12 +1138,14 @@ mod tests {
 
         let entries = state.log_lines.clone();
         assert_eq!(state.mode, AppMode::Normal);
+        let labels = HashMap::new();
         handle_log_viewer_key(
             make_key_event(KeyCode::Enter, KeyModifiers::NONE),
             &mut state,
             &entries,
             24,
             80,
+            &labels,
         );
         assert_eq!(state.mode, AppMode::EntryDetail);
         assert_eq!(state.detail_scroll, 0);
@@ -1136,12 +1155,14 @@ mod tests {
     fn enter_does_nothing_with_no_entries() {
         let mut state = AppState::new();
         assert_eq!(state.mode, AppMode::Normal);
+        let labels = HashMap::new();
         handle_log_viewer_key(
             make_key_event(KeyCode::Enter, KeyModifiers::NONE),
             &mut state,
             &[],
             24,
             80,
+            &labels,
         );
         // Should stay in Normal mode since there are no visible entries
         assert_eq!(state.mode, AppMode::Normal);
@@ -1153,12 +1174,14 @@ mod tests {
         state.log_lines.push(make_log_entry("hello", TaskId(1)));
         state.mode = AppMode::EntryDetail;
 
+        let labels = HashMap::new();
         handle_detail_key(
             make_key_event(KeyCode::Esc, KeyModifiers::NONE),
             &mut state,
             &[],
             24,
             80,
+            &labels,
         );
         assert_eq!(state.mode, AppMode::Normal);
     }
@@ -1168,12 +1191,14 @@ mod tests {
         let mut state = AppState::new();
         state.mode = AppMode::EntryDetail;
 
+        let labels = HashMap::new();
         handle_detail_key(
             make_key_event(KeyCode::Char('q'), KeyModifiers::NONE),
             &mut state,
             &[],
             24,
             80,
+            &labels,
         );
         assert_eq!(state.mode, AppMode::Normal);
     }
@@ -1183,6 +1208,7 @@ mod tests {
         let mut state = AppState::new();
         state.mode = AppMode::EntryDetail;
         state.detail_scroll = 0;
+        let labels = HashMap::new();
 
         // j scrolls down
         handle_detail_key(
@@ -1191,6 +1217,7 @@ mod tests {
             &[],
             24,
             80,
+            &labels,
         );
         assert_eq!(state.detail_scroll, 1);
 
@@ -1200,6 +1227,7 @@ mod tests {
             &[],
             24,
             80,
+            &labels,
         );
         assert_eq!(state.detail_scroll, 2);
 
@@ -1210,6 +1238,7 @@ mod tests {
             &[],
             24,
             80,
+            &labels,
         );
         assert_eq!(state.detail_scroll, 1);
 
@@ -1221,6 +1250,7 @@ mod tests {
             &[],
             24,
             80,
+            &labels,
         );
         assert_eq!(state.detail_scroll, 0);
     }
@@ -1237,12 +1267,14 @@ mod tests {
         state.mode = AppMode::EntryDetail;
 
         let entries = state.log_lines.clone();
+        let labels = HashMap::new();
         handle_detail_key(
             make_key_event(KeyCode::Char('n'), KeyModifiers::NONE),
             &mut state,
             &entries,
             24,
             80,
+            &labels,
         );
         assert_eq!(state.mode, AppMode::Normal);
         // Should have moved cursor down (from 2 to 3)
@@ -1264,12 +1296,14 @@ mod tests {
         state.mode = AppMode::EntryDetail;
 
         let entries = state.log_lines.clone();
+        let labels = HashMap::new();
         handle_detail_key(
             make_key_event(KeyCode::Char('N'), KeyModifiers::NONE),
             &mut state,
             &entries,
             24,
             80,
+            &labels,
         );
         assert_eq!(state.mode, AppMode::Normal);
         // Should have moved cursor up (from 2 to 1)
@@ -1470,6 +1504,7 @@ mod tests {
     fn backslash_toggles_sidebar() {
         let mut state = AppState::new();
         assert!(state.sidebar_visible);
+        let labels = HashMap::new();
 
         handle_log_viewer_key(
             make_key_event(KeyCode::Char('\\'), KeyModifiers::NONE),
@@ -1477,6 +1512,7 @@ mod tests {
             &[],
             24,
             80,
+            &labels,
         );
         assert!(!state.sidebar_visible);
 
@@ -1486,6 +1522,7 @@ mod tests {
             &[],
             24,
             80,
+            &labels,
         );
         assert!(state.sidebar_visible);
     }

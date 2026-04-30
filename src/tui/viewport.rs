@@ -3,6 +3,9 @@
 //! Uses a vim-style scrolling model: the cursor moves freely through entries,
 //! and the viewport scrolls to keep the cursor within a margin of the edges.
 
+use std::collections::HashMap;
+
+use crate::execution::TaskId;
 use crate::log::LogEntry;
 use crate::log::field_stats::FieldStats;
 
@@ -49,6 +52,7 @@ pub struct ViewportEntry {
 }
 
 /// Compute the visible entries for the viewport.
+#[allow(clippy::too_many_arguments)]
 pub fn layout(
     scroll: &ScrollState,
     entries: &[LogEntry],
@@ -59,6 +63,7 @@ pub fn layout(
     source_colors: &mut SourceColors,
     field_stats: Option<&FieldStats>,
     show_fields: bool,
+    source_labels: &HashMap<TaskId, String>,
 ) -> ViewportLayout {
     if entries.is_empty() || viewport_height == 0 {
         return ViewportLayout {
@@ -80,6 +85,7 @@ pub fn layout(
                 mode,
                 wrap,
                 source_colors,
+                source_labels,
             );
             (cursor, top)
         }
@@ -96,8 +102,16 @@ pub fn layout(
     let mut idx = top;
 
     while y < viewport_height && idx < entries.len() {
-        let (lines, height) =
-            render_entry_opts(&entries[idx], width, mode, wrap, source_colors, field_stats, show_fields);
+        let (lines, height) = render_entry_opts(
+            &entries[idx],
+            width,
+            mode,
+            wrap,
+            source_colors,
+            field_stats,
+            show_fields,
+            source_labels,
+        );
         result.push(ViewportEntry {
             entry_index: idx,
             y,
@@ -114,6 +128,7 @@ pub fn layout(
 
 /// Given that we want `bottom_entry` to be the last visible entry,
 /// compute the `top` index.
+#[allow(clippy::too_many_arguments)]
 fn compute_top_for_bottom(
     bottom_entry: usize,
     entries: &[LogEntry],
@@ -122,12 +137,21 @@ fn compute_top_for_bottom(
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    source_labels: &HashMap<TaskId, String>,
 ) -> usize {
     let mut consumed: u16 = 0;
     let mut idx = bottom_entry;
 
     loop {
-        let (_, height) = render_entry(&entries[idx], width, mode, wrap, source_colors, None);
+        let (_, height) = render_entry(
+            &entries[idx],
+            width,
+            mode,
+            wrap,
+            source_colors,
+            None,
+            source_labels,
+        );
         consumed += height as u16;
         if consumed >= viewport_height || idx == 0 {
             break;
@@ -139,6 +163,7 @@ fn compute_top_for_bottom(
 }
 
 /// Move cursor down one entry. Adjusts top if cursor would exceed margin.
+#[allow(clippy::too_many_arguments)]
 pub fn scroll_down(
     scroll: &ScrollState,
     entries: &[LogEntry],
@@ -147,6 +172,7 @@ pub fn scroll_down(
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    source_labels: &HashMap<TaskId, String>,
 ) -> ScrollState {
     if entries.is_empty() {
         return ScrollState::Tail;
@@ -168,6 +194,7 @@ pub fn scroll_down(
                 mode,
                 wrap,
                 source_colors,
+                source_labels,
             );
             ScrollState::Pinned {
                 cursor: new_cursor,
@@ -178,6 +205,7 @@ pub fn scroll_down(
 }
 
 /// Move cursor up one entry. Adjusts top if cursor would exceed margin.
+#[allow(clippy::too_many_arguments)]
 pub fn scroll_up(
     scroll: &ScrollState,
     entries: &[LogEntry],
@@ -186,6 +214,7 @@ pub fn scroll_up(
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    source_labels: &HashMap<TaskId, String>,
 ) -> ScrollState {
     if entries.is_empty() {
         return ScrollState::Tail;
@@ -205,6 +234,7 @@ pub fn scroll_up(
                 mode,
                 wrap,
                 source_colors,
+                source_labels,
             );
             let top = adjust_top_for_cursor(
                 cursor,
@@ -215,6 +245,7 @@ pub fn scroll_up(
                 mode,
                 wrap,
                 source_colors,
+                source_labels,
             );
             ScrollState::Pinned { cursor, top }
         }
@@ -232,6 +263,7 @@ pub fn scroll_up(
                 mode,
                 wrap,
                 source_colors,
+                source_labels,
             );
             ScrollState::Pinned {
                 cursor: new_cursor,
@@ -242,6 +274,7 @@ pub fn scroll_up(
 }
 
 /// Jump forward by half a viewport.
+#[allow(clippy::too_many_arguments)]
 pub fn scroll_down_half_page(
     scroll: &ScrollState,
     entries: &[LogEntry],
@@ -250,6 +283,7 @@ pub fn scroll_down_half_page(
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    source_labels: &HashMap<TaskId, String>,
 ) -> ScrollState {
     if entries.is_empty() {
         return ScrollState::Tail;
@@ -280,6 +314,7 @@ pub fn scroll_down_half_page(
         mode,
         wrap,
         source_colors,
+        source_labels,
     );
 
     ScrollState::Pinned {
@@ -289,6 +324,7 @@ pub fn scroll_down_half_page(
 }
 
 /// Jump backward by half a viewport.
+#[allow(clippy::too_many_arguments)]
 pub fn scroll_up_half_page(
     scroll: &ScrollState,
     entries: &[LogEntry],
@@ -297,6 +333,7 @@ pub fn scroll_up_half_page(
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    source_labels: &HashMap<TaskId, String>,
 ) -> ScrollState {
     if entries.is_empty() {
         return ScrollState::Tail;
@@ -320,6 +357,7 @@ pub fn scroll_up_half_page(
             mode,
             wrap,
             source_colors,
+            source_labels,
         ),
     };
     let new_top = adjust_top_for_cursor(
@@ -331,6 +369,7 @@ pub fn scroll_up_half_page(
         mode,
         wrap,
         source_colors,
+        source_labels,
     );
 
     ScrollState::Pinned {
@@ -375,6 +414,7 @@ fn adjust_top_for_cursor(
     mode: DisplayMode,
     wrap: bool,
     source_colors: &mut SourceColors,
+    source_labels: &HashMap<TaskId, String>,
 ) -> usize {
     let margin = SCROLL_MARGIN.min(viewport_height / 2) as usize;
     let vh = viewport_height as usize;
@@ -416,7 +456,15 @@ fn adjust_top_for_cursor(
             if i == cursor {
                 break;
             }
-            let (_, h) = render_entry(entry, width, mode, wrap, source_colors, None);
+            let (_, h) = render_entry(
+                entry,
+                width,
+                mode,
+                wrap,
+                source_colors,
+                None,
+                source_labels,
+            );
             y += h;
         }
 
@@ -433,6 +481,7 @@ fn adjust_top_for_cursor(
             wrap,
             source_colors,
             None,
+            source_labels,
         );
         if y + cursor_h + margin > vh {
             // Need to scroll down: recompute top
@@ -441,8 +490,15 @@ fn adjust_top_for_cursor(
             let mut new_top = cursor;
             while new_top > 0 && space < vh {
                 new_top -= 1;
-                let (_, h) =
-                    render_entry(&entries[new_top], width, mode, wrap, source_colors, None);
+                let (_, h) = render_entry(
+                    &entries[new_top],
+                    width,
+                    mode,
+                    wrap,
+                    source_colors,
+                    None,
+                    source_labels,
+                );
                 space += h;
             }
             top = new_top;
@@ -490,6 +546,7 @@ mod tests {
     #[test]
     fn layout_empty() {
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let result = layout(
             &ScrollState::Tail,
             &[],
@@ -500,6 +557,7 @@ mod tests {
             &mut sc,
             None,
             true,
+            &labels,
         );
         assert!(result.entries.is_empty());
     }
@@ -508,6 +566,7 @@ mod tests {
     fn layout_tail_single() {
         let entries = make_entries(1);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let result = layout(
             &ScrollState::Tail,
             &entries,
@@ -518,6 +577,7 @@ mod tests {
             &mut sc,
             None,
             true,
+            &labels,
         );
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].is_cursor);
@@ -527,6 +587,7 @@ mod tests {
     fn layout_tail_fills_viewport() {
         let entries = make_entries(30);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let result = layout(
             &ScrollState::Tail,
             &entries,
@@ -537,6 +598,7 @@ mod tests {
             &mut sc,
             None,
             true,
+            &labels,
         );
         // Should show ~10 entries (last ones)
         assert!(result.entries.len() <= 10);
@@ -550,6 +612,7 @@ mod tests {
     fn scroll_down_moves_cursor() {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let state = ScrollState::Pinned { cursor: 5, top: 0 };
         let next = scroll_down(
             &state,
@@ -559,6 +622,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            &labels,
         );
         match next {
             ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 6),
@@ -570,6 +634,7 @@ mod tests {
     fn scroll_down_at_end_goes_tail() {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let state = ScrollState::Pinned { cursor: 9, top: 0 };
         let next = scroll_down(
             &state,
@@ -579,6 +644,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            &labels,
         );
         assert_eq!(next, ScrollState::Tail);
     }
@@ -587,6 +653,7 @@ mod tests {
     fn scroll_up_moves_cursor() {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let state = ScrollState::Pinned { cursor: 10, top: 5 };
         let next = scroll_up(
             &state,
@@ -596,6 +663,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            &labels,
         );
         match next {
             ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 9),
@@ -607,6 +675,7 @@ mod tests {
     fn scroll_up_from_tail() {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let next = scroll_up(
             &ScrollState::Tail,
             &entries,
@@ -615,6 +684,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            &labels,
         );
         match next {
             ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 18),
@@ -626,6 +696,7 @@ mod tests {
     fn scroll_up_at_top_stays() {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let state = ScrollState::Pinned { cursor: 0, top: 0 };
         let next = scroll_up(
             &state,
@@ -635,6 +706,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            &labels,
         );
         assert_eq!(next, ScrollState::Pinned { cursor: 0, top: 0 });
     }
@@ -663,6 +735,7 @@ mod tests {
     fn cursor_highlight_in_layout() {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         let state = ScrollState::Pinned { cursor: 3, top: 0 };
         let result = layout(
             &state,
@@ -674,6 +747,7 @@ mod tests {
             &mut sc,
             None,
             true,
+            &labels,
         );
         // Entry 3 should be the cursor
         let cursor_entry = result.entries.iter().find(|e| e.entry_index == 3).unwrap();
@@ -690,6 +764,7 @@ mod tests {
     fn margin_adjusts_top() {
         let entries = make_entries(30);
         let mut sc = SourceColors::new();
+        let labels = HashMap::new();
         // Cursor at 15, viewport height 10, top at 0 — cursor is way below viewport
         let top = adjust_top_for_cursor(
             15,
@@ -700,6 +775,7 @@ mod tests {
             DisplayMode::Preview,
             false,
             &mut sc,
+            &labels,
         );
         // top should adjust so cursor is visible with margin
         assert!(top > 0);

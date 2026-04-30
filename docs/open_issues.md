@@ -72,6 +72,35 @@ Engine/state work first, UX layering on top:
 7. Quit-vs-terminate split (`Ctrl-q` quits runme; `k a` terminates all and stays in TUI).
 8. Source disambiguation (color-first, numbered fallback).
 
+## Task-authored output summaries (`ctx.summarize`)
+
+**Feature idea:** Let a task post-process its own output and publish a summary string via something like `ctx.summarize(s)`. When agent/MCP mode lands, an agent that runs a task could request the summary instead of pulling raw logs — far cheaper context-wise.
+
+- *Example:* A `cargo build` task post-processes the build output (errors, warnings counts, failing crate) into a useful summary to hand back to Claude
+- *Effort:* Moderate — needs a per-session summary slot on `TaskSession`/status, an API surface on `TaskContext`, and (eventually) an MCP tool that prefers summary over logs when present
+- *Assessment:* Fits naturally next to existing per-session state (`TaskStatus`, `processes`). The task is the right place to author this since only the task knows what's interesting in its own output. Summary is just a `String` (or maybe `Option<String>` + timestamp); no need for streaming/structure in v1
+- *Open questions:* Single summary or append-only stream? Overwrite semantics on re-run? Should summaries persist with completed tasks (probably yes, since logs do)? Does the TUI surface them anywhere, or are they purely for programmatic consumers?
+
+## MCP mode — rebuild-on-edit problem
+
+**Context:** Once the task graph / orchestration work settles, MCP mode is the next major direction. The shape of what it should *do* is getting clearer, but there's one architectural problem that doesn't have a good answer yet.
+
+**The problem:** Today `rnme` builds the user's RUNME.rs files into a binary at startup, then execs that binary. MCP servers, by contrast, are expected to live for the lifetime of the agent session. So if an agent edits a RUNME.rs file mid-session and then asks to run a task, the MCP process is still running the *pre-edit* compiled binary — the changes are invisible.
+
+**Why the obvious workarounds don't work:**
+- Quitting the MCP on file change and hoping the agent relaunches it is unreliable — many agents disable MCPs that crash/exit unexpectedly.
+- Restarting in-process means hot-swapping a compiled Rust binary, which isn't really a thing.
+
+**Candidate idea — engine-as-child-process:**
+- MCP mode becomes a thin supervisor: it owns the agent connection, but spawns the *real* engine (today's compiled RUNME.rs binary) as a child process.
+- On file change (or on demand), the supervisor rebuilds and restarts the child. MCP itself stays alive across rebuilds — the agent never sees a disconnect.
+- *Cost:* requires a control protocol between supervisor and engine — every operation the agent can drive (list tasks, spawn task, get summary, get logs, terminate, etc.) needs to be expressible over IPC. That's a non-trivial second API surface to design and maintain.
+
+**Things to figure out before committing:**
+- Check the MCP spec / community patterns — is there a sanctioned way to handle "the underlying tool got modified" that we're missing? Worth looking before inventing.
+- If we do go child-process, decide on the IPC shape early (stdin/stdout JSON-RPC? Unix socket? Shared memory for log streaming?) — this is the load-bearing decision.
+- Could the in-MCP "build" step just be `cargo build` + `dlopen`? Probably not worth the complexity vs. child process, but worth ruling out.
+
 ## Carriage return (`\r`) progress output corrupts log display
 
 Commands that use `\r` to update a progress line in-place (e.g., `aws s3 cp`, `curl` progress bars) produce garbled output in the TUI log viewer. The record parser splits on `\n` but `\r`-delimited progress chunks don't end with `\n`, resulting in partial line overwrites rendering as separate log entries that stomp on each other.

@@ -8,24 +8,41 @@ use std::collections::HashMap;
 
 use super::LogEntry;
 use crate::ansi;
+use crate::execution::TaskId;
 use crate::theme::{THEME, SourceColors};
+
+/// Build the source-column display string `[N] label` for a log entry.
+///
+/// Looks up the task/process label from `labels` (keyed by `TaskId`).
+/// When the id has no entry, falls back to `[N] tN` so the column still
+/// reflects the integer id.
+pub fn format_source_label(source: TaskId, labels: &HashMap<TaskId, String>) -> String {
+    let n = source.0;
+    match labels.get(&source) {
+        Some(name) if !name.is_empty() => format!("[{}] {}", n, name),
+        _ => format!("[{}] t{}", n, n),
+    }
+}
 
 /// Fixed column widths — shared between CLI formatter and TUI renderer.
 pub const TIMESTAMP_WIDTH: usize = 12;
 pub const LEVEL_WIDTH: usize = 5;
-pub const SOURCE_WIDTH: usize = 10;
+pub const SOURCE_WIDTH: usize = 16;
 pub const COLUMN_GAP_WIDTH: usize = 2;
 
 /// Format a LogEntry as a single structured line for CLI output.
 ///
 /// Layout: `{timestamp}  {LEVEL}  {source}  {message} {fields}`
 ///
+/// `labels` resolves source `TaskId`s to display labels (`[N] label`).
+/// Pass an empty map to fall back to `[N] tN`.
+///
 /// Uses the same column layout as the TUI's preview mode.
-pub fn format_entry(entry: &LogEntry) -> String {
+pub fn format_entry(entry: &LogEntry, labels: &HashMap<TaskId, String>) -> String {
     let gap = " ".repeat(COLUMN_GAP_WIDTH);
     let ts = pad_or_truncate(&entry.display_timestamp(), TIMESTAMP_WIDTH);
     let level = pad_or_truncate(&format_level(&entry.level), LEVEL_WIDTH);
-    let source_str = entry.source.to_string();
+    let source_str = format_source_label(entry.source, labels);
     let source = pad_or_truncate(&source_str, SOURCE_WIDTH);
     let message = entry.message.as_deref().unwrap_or(&entry.raw);
 
@@ -48,11 +65,15 @@ pub fn format_entry(entry: &LogEntry) -> String {
 ///
 /// Same column layout as `format_entry`, but with theme-derived ANSI colors
 /// on timestamp, level, source, and field columns.
-pub fn format_entry_colored(entry: &LogEntry, source_colors: &mut SourceColors) -> String {
+pub fn format_entry_colored(
+    entry: &LogEntry,
+    source_colors: &mut SourceColors,
+    labels: &HashMap<TaskId, String>,
+) -> String {
     let gap = " ".repeat(COLUMN_GAP_WIDTH);
     let ts = pad_or_truncate(&entry.display_timestamp(), TIMESTAMP_WIDTH);
     let level = pad_or_truncate(&format_level(&entry.level), LEVEL_WIDTH);
-    let source_str = entry.source.to_string();
+    let source_str = format_source_label(entry.source, labels);
     let source = pad_or_truncate(&source_str, SOURCE_WIDTH);
     let message = entry.message.as_deref().unwrap_or(&entry.raw);
 
@@ -190,10 +211,31 @@ mod tests {
             Some("hello world".to_string()),
             HashMap::new(),
         );
-        let line = format_entry(&entry);
+        let labels = HashMap::new();
+        let line = format_entry(&entry, &labels);
         assert!(line.contains("INFO"));
-        assert!(line.contains("t42"));
+        // Fallback form when no label is registered: `[N] tN`.
+        assert!(line.contains("[42] t42"), "got: {}", line);
         assert!(line.contains("hello world"));
+    }
+
+    #[test]
+    fn test_format_entry_with_label() {
+        use crate::execution::TaskId;
+        let entry = LogEntry::new(
+            "hi".to_string(),
+            ParsedContent::PlainText,
+            TaskId(3),
+            0,
+            None,
+            Some("info".to_string()),
+            Some("hi".to_string()),
+            HashMap::new(),
+        );
+        let mut labels = HashMap::new();
+        labels.insert(TaskId(3), "ticker".to_string());
+        let line = format_entry(&entry, &labels);
+        assert!(line.contains("[3] ticker"), "got: {}", line);
     }
 
     #[test]
@@ -214,7 +256,8 @@ mod tests {
             Some("heartbeat".to_string()),
             fields,
         );
-        let line = format_entry(&entry);
+        let labels = HashMap::new();
+        let line = format_entry(&entry, &labels);
         assert!(line.contains("heartbeat"));
         assert!(line.contains("latency=42"));
     }

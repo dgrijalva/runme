@@ -190,7 +190,8 @@ async fn run_cli(
     let rx = handle.subscribe_logs();
     let use_raw = matches!(format, OutputFormat::Raw);
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    tokio::spawn(forward_output_to_stdio(rx, use_raw, use_color));
+    let graph_rx = handle.graph.clone();
+    tokio::spawn(forward_output_to_stdio(rx, use_raw, use_color, graph_rx));
 
     // Spawn the task through the engine.
     let mut builder = handle.spawn_task(task, args.to_vec());
@@ -270,10 +271,15 @@ async fn run_cli(
 /// Color handling by mode:
 /// - Text (`raw=false`): colored columns if `color=true`, plain if not.
 /// - Raw (`raw=true`): ANSI passthrough if `color=true`, stripped if not.
+///
+/// `graph_rx` is read on every entry to resolve `TaskId -> [N] label` for
+/// the source column. The graph is updated in-place by the engine; this
+/// only borrows the latest snapshot.
 async fn forward_output_to_stdio(
     mut rx: tokio::sync::broadcast::Receiver<LogEntry>,
     raw: bool,
     color: bool,
+    graph_rx: tokio::sync::watch::Receiver<crate::execution::GraphSnapshot>,
 ) {
     use crate::log::format::{format_entry, format_entry_colored};
     use crate::theme::SourceColors;
@@ -282,6 +288,9 @@ async fn forward_output_to_stdio(
     let stderr = std::io::stderr();
     let mut source_colors = SourceColors::new();
     while let Ok(entry) = rx.recv().await {
+        // Build labels from the latest graph snapshot. Cheap — the
+        // snapshot Arc-clones the task table and we just walk it once.
+        let labels = graph_rx.borrow().source_labels();
         let formatted;
         let line: &str = if raw {
             if color {
@@ -291,10 +300,10 @@ async fn forward_output_to_stdio(
                 &formatted
             }
         } else if color {
-            formatted = format_entry_colored(&entry, &mut source_colors);
+            formatted = format_entry_colored(&entry, &mut source_colors, &labels);
             &formatted
         } else {
-            formatted = format_entry(&entry);
+            formatted = format_entry(&entry, &labels);
             &formatted
         };
         match entry.stream {
