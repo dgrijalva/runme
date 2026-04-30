@@ -8,6 +8,7 @@ rnme is a Rust-based task runner where tasks are defined in `RUNME.rs` files —
 
 ### Project Layout
 
+- **`docs/`** — Design documents, implementation plans, research, notes. This folder contains no code, but is a context gold mine. Start with `system_design.md`.
 - **`src/`** — Core library (`rnme` crate). Contains the task runtime, process management, log engine, TUI, and the prelude that RUNME.rs files import.
 - **`src/bin/rnme/`** — The `rnme` binary. Handles discovery of RUNME.rs files, workspace generation, compilation, and exec of the resulting binary.
 - **`macros/`** — Proc macros (`rnme-macros` crate): `#[rnme::task]`, `#[rnme::init]`, and `cmd!`. Generates `TaskDef`/`InitDef` registrations via `inventory`, and structured `Cmd` values from shell-like syntax.
