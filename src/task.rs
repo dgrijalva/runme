@@ -460,18 +460,32 @@ impl TaskContext {
     /// sends SIGKILL to any that are still alive.
     pub async fn stop_all(&self, timeout: std::time::Duration) {
         let pgids = self.spawned_pgids.lock().await;
+        if pgids.is_empty() {
+            return;
+        }
+
         for &pgid in pgids.iter() {
-            // Send SIGTERM to the process group
             let _ = nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(pgid),
                 Some(nix::sys::signal::Signal::SIGTERM),
             );
         }
 
-        // Wait for the grace period
-        tokio::time::sleep(timeout).await;
+        // Poll for early exit so we react as soon as every process is gone.
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let all_dead = pgids.iter().all(|&pgid| {
+                nix::sys::signal::killpg(nix::unistd::Pid::from_raw(pgid), None).is_err()
+            });
+            if all_dead {
+                return;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
 
-        // SIGKILL any survivors
         for &pgid in pgids.iter() {
             let _ = nix::sys::signal::killpg(
                 nix::unistd::Pid::from_raw(pgid),
