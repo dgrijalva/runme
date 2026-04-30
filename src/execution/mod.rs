@@ -1,29 +1,27 @@
 //! Engine layer for the multi-task runtime.
 //!
-//! `TaskExecution` is the unit of task execution. Slice 2 introduces the
-//! recursive node shape (id, parent, children, cancellation) and the
-//! engine-owned `LogStore`; later slices add `TaskHandle`, `TaskBuilder`,
-//! and the public `Engine` / `EngineHandle` surface.
+//! Slice 4 lands the public engine surface: `Engine::start(registry)`
+//! returns an `EngineHandle` which the headless CLI, the TUI, and
+//! future MCP frontends consume. The synthetic root, the cancel ladder,
+//! per-task timeouts, and the graph snapshot all live here.
 //!
 //! See `docs/03-multi-task-runtime.md` for the design and
 //! `docs/plans/notes/architecture.md` for the type-level spec.
 
+pub(crate) mod control;
+pub(crate) mod engine;
 pub(crate) mod execution;
+mod root;
 mod task_id;
 
-// Slice 1 scaffolding for the multi-task runtime. Most items are
-// allow(dead_code) until slices 2-4 wire them in.
-#[allow(dead_code)]
-pub(crate) mod control;
-#[allow(dead_code)]
-pub(crate) mod root;
-
-// Slice 3: TaskBuilder (returned by `ctx.run`) and TaskHandle
-// (drop-cancels lifetime token).
 pub mod builder;
 pub mod handle;
 
 pub use builder::TaskBuilder;
+pub use control::{EngineError, KillSignal, SpawnOptions};
+pub use engine::{
+    Engine, EngineHandle, EngineSpawnBuilder, GraphSnapshot, ProcessNodeInfo, TaskNode,
+};
 pub use execution::{ProcessInfo, ProcessStatus, TaskExecution, TaskFailure, TaskStatus};
 pub use handle::TaskHandle;
 pub use task_id::TaskId;

@@ -19,6 +19,8 @@ use crate::log::store::LogStore;
 use crate::task::{Registry, TaskDef};
 
 use super::TaskId;
+use super::control::SpawnOptions;
+use super::engine::EngineInternals;
 use super::execution::TaskExecution;
 use super::handle::TaskHandle;
 
@@ -39,9 +41,12 @@ struct TaskBuilderInner {
     /// pushed onto its `children` list. `None` for top-level/test paths
     /// where the caller's context has no execution attached.
     parent_exec: Option<Weak<TaskExecution>>,
-    /// Shared `LogStore` from the parent's `TaskExecution`. Slice 4 will
-    /// hoist this to the engine; slice 3 inherits the parent's so logs
-    /// land in the same store.
+    /// Weak ref to the engine. When present, `spawn` funnels through
+    /// `EngineInternals::spawn_child` (the canonical path). When
+    /// absent (out-of-engine test paths), falls back to inline launch.
+    engine: Option<Weak<EngineInternals>>,
+    /// Shared `LogStore` from the parent's `TaskExecution`. Used only
+    /// by the inline-launch fallback when no engine is available.
     log_store: Arc<Mutex<LogStore>>,
     /// Registry to pass to the child's context.
     registry: Arc<Registry>,
@@ -49,8 +54,7 @@ struct TaskBuilderInner {
     /// time so name errors surface synchronously.
     task_def: &'static TaskDef,
     args: Vec<String>,
-    /// Per-invocation timeout. Inert in slice 3 — flows into
-    /// `SpawnOptions::timeout` for the watchdog wired in slice 4.
+    /// Per-invocation timeout. Wired through `SpawnOptions::timeout`.
     timeout: Option<Duration>,
 }
 
@@ -67,6 +71,7 @@ impl TaskBuilder {
     pub(crate) fn new(
         parent_id: Option<TaskId>,
         parent_exec: Option<Weak<TaskExecution>>,
+        engine: Option<Weak<EngineInternals>>,
         log_store: Arc<Mutex<LogStore>>,
         registry: Arc<Registry>,
         task_def: &'static TaskDef,
@@ -76,6 +81,7 @@ impl TaskBuilder {
             inner: Ok(TaskBuilderInner {
                 parent_id,
                 parent_exec,
+                engine,
                 log_store,
                 registry,
                 task_def,
@@ -85,12 +91,8 @@ impl TaskBuilder {
         }
     }
 
-    /// Set a per-invocation timeout for the task.
-    ///
-    /// In slice 3 this only stores the value — the watchdog that fires
-    /// it lives on `EngineInternals::spawn_child` and lands in slice 4.
-    /// Tests verify the value flows through the builder; slice 4 verifies
-    /// the watchdog actually fires.
+    /// Set a per-invocation timeout for the task. The watchdog lives on
+    /// `EngineInternals::spawn_child` (slice 4).
     pub fn timeout(mut self, d: Duration) -> Self {
         if let Ok(ref mut inner) = self.inner {
             inner.timeout = Some(d);
@@ -100,34 +102,37 @@ impl TaskBuilder {
 
     /// Synchronously register and launch the child task. Returns a
     /// [`TaskHandle`] observing the new node.
+    ///
+    /// When an engine is wired (the production path), funnels through
+    /// `EngineInternals::spawn_child` so the child is registered in the
+    /// graph table, gets a snapshot publish, and (if a timeout was set)
+    /// gets a watchdog. Out-of-engine test paths fall back to a
+    /// minimal inline launch that just runs the task body.
     pub fn spawn(self) -> Result<TaskHandle, TaskError> {
         let inner = self.inner?;
 
-        // Slice 3 has no engine, so spawn_child lives here as a free
-        // function. Slice 4 will move the body onto `EngineInternals`
-        // and route both `TaskBuilder::spawn` and
-        // `EngineSpawnBuilder::spawn` through it.
-        let id = TaskId::next();
-        let mut exec =
-            TaskExecution::with_log_store(id, inner.log_store.clone());
-        exec.set_registry(inner.registry.clone());
+        // Production path: route through the engine.
+        if let Some(weak) = inner.engine.as_ref()
+            && let Some(engine) = weak.upgrade()
+        {
+            let parent_id = inner.parent_id.unwrap_or(TaskId::ROOT);
+            let opts = SpawnOptions {
+                timeout: inner.timeout,
+            };
+            return engine.spawn_child(parent_id, inner.task_def, inner.args, opts);
+        }
 
-        // Cancellation token is already minted (independent, via
-        // `CancellationToken::new()`) by `with_log_store`. Slice 4 will
-        // hand a `Weak<EngineInternals>` to the `TaskContext` so
-        // `ctx.run` and `TaskHandle::Drop` can reach the engine.
+        // Fallback (no-engine path, used only by tests built via
+        // `TaskContext::new` directly): inline launch with no graph
+        // registration. The handle still cancels via token-only on
+        // Drop. This branch exists to preserve test ergonomics; the
+        // real runtime always has an engine.
+        let id = TaskId::next();
+        let mut exec = TaskExecution::with_log_store(id, inner.log_store.clone());
+        exec.set_registry(inner.registry.clone());
         if let Some(parent_id) = inner.parent_id {
             exec.parent = Some(parent_id);
         }
-
-        // Use `Arc::new_cyclic` so the freshly-built `TaskExecution`
-        // can launch with a `Weak` to itself baked into the
-        // `TaskContext`. The weak ref doesn't bump the strong count,
-        // so `Arc::get_mut` (used by `launch_with_self_weak`) is fine
-        // — but `new_cyclic` inverts the order: launch happens inside
-        // the closure, before the Arc is fully constructed. The
-        // closure receives a `&Weak<Self>` that becomes valid once
-        // construction completes.
         let task_def = inner.task_def;
         let task_args = inner.args;
         let exec_arc = Arc::new_cyclic(|weak: &Weak<TaskExecution>| {
@@ -135,24 +140,14 @@ impl TaskBuilder {
             e.launch_with_self_weak(weak.clone(), task_def, task_args);
             e
         });
-
-        // Now safe to clone for the parent's children list and the
-        // handle. Use `try_lock` to keep `spawn()` synchronous; in
-        // slice 3 nothing else touches `children`, so contention is
-        // impossible. Slice 4 will revisit if graph-snapshot reads
-        // start to race.
         if let Some(weak) = inner.parent_exec.as_ref()
             && let Some(parent) = weak.upgrade()
             && let Ok(mut kids) = parent.children.try_lock()
         {
             kids.push(exec_arc.clone());
         }
-
-        // The timeout is stored but not consumed in slice 3 — keep the
-        // local alive for completeness so future readers see the wiring.
-        let _ = inner.timeout;
-
-        Ok(TaskHandle::new(exec_arc))
+        let _ = inner.timeout; // inert in fallback path
+        Ok(TaskHandle::new(exec_arc, Weak::new()))
     }
 }
 

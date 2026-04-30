@@ -19,14 +19,13 @@ use super::TaskId;
 
 /// Errors produced by the engine in response to control messages.
 ///
-/// Slice 1 introduces the type so `Control::*::reply` channels have the
-/// correct shape; only `ShuttingDown` is reachable today.
+/// Public because it surfaces through `EngineHandle::*` methods (slice 4).
 ///
 /// `TaskError` does not currently implement `std::error::Error`, so the
 /// `Task` variant carries it without `#[from]`. A future cleanup pass
 /// can flip that on once `TaskError` gains the impl.
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum EngineError {
+pub enum EngineError {
     #[error("engine is shutting down")]
     ShuttingDown,
     #[error("task not found: {0}")]
@@ -45,10 +44,8 @@ impl From<TaskError> for EngineError {
 ///
 /// Designed to grow: future fields (ready_when, env overlay, etc.) land
 /// here without churning call sites that only set what they need.
-/// `timeout` is plumbed through but not consulted until slice 4 wires the
-/// watchdog.
 #[derive(Default, Clone)]
-pub(crate) struct SpawnOptions {
+pub struct SpawnOptions {
     pub timeout: Option<Duration>,
 }
 

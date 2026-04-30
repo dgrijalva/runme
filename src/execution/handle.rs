@@ -12,13 +12,14 @@
 
 use std::future::IntoFuture;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{TaskError, TaskResult};
 
 use super::TaskId;
+use super::engine::EngineInternals;
 use super::execution::{TaskExecution, TaskStatus};
 
 /// Lifetime token returned by `TaskBuilder::spawn` (and, via `IntoFuture`,
@@ -35,17 +36,26 @@ use super::execution::{TaskExecution, TaskStatus};
 ///   not cancel the child.
 pub struct TaskHandle {
     /// The execution this handle observes. Held via `Arc`; the engine
-    /// (slice 4) keeps its own `Arc` in the task table, so dropping the
-    /// handle never removes the node from the graph.
+    /// keeps its own `Arc` in the task table, so dropping the handle
+    /// never removes the node from the graph.
     pub(crate) exec: Arc<TaskExecution>,
+    /// Weak ref to the engine. When present, `Drop` invokes the full
+    /// cancel ladder via `engine.cancel_task(id)`; when absent (engine
+    /// gone or out-of-engine test path), `Drop` falls back to a
+    /// signal-only `cancellation.cancel()`.
+    engine: Weak<EngineInternals>,
     /// Cleared by `IntoFuture` so `Drop` becomes a no-op once the future
     /// owns the wait.
     armed: bool,
 }
 
 impl TaskHandle {
-    pub(crate) fn new(exec: Arc<TaskExecution>) -> Self {
-        Self { exec, armed: true }
+    pub(crate) fn new(exec: Arc<TaskExecution>, engine: Weak<EngineInternals>) -> Self {
+        Self {
+            exec,
+            engine,
+            armed: true,
+        }
     }
 
     /// Identity of the running task.
@@ -113,12 +123,19 @@ impl Drop for TaskHandle {
         if !self.armed {
             return;
         }
-        // Slice 3 fallback: signal-only. The full cancel ladder
-        // (process stop → body wait → abort → status write) lands on
-        // `EngineInternals` in slice 4; once it does, `Drop` will route
-        // through `engine.cancel_task(id)`. Tests in slice 3 verify the
-        // token fires; slice 4 tests verify the ladder.
-        self.exec.cancellation.cancel();
+        // Slice 4: route through the engine's cancel ladder so the
+        // status transitions to `Cancelled` and the body's process
+        // groups get torn down. Engine gone (out-of-engine test path
+        // or runtime shutting down) falls back to a signal-only token
+        // cancel.
+        let id = self.exec.id;
+        if let Some(engine) = self.engine.upgrade() {
+            tokio::spawn(async move {
+                engine.cancel_task(id).await;
+            });
+        } else {
+            self.exec.cancellation.cancel();
+        }
     }
 }
 

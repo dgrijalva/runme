@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use crate::log::{LogEntry, Stream};
@@ -115,6 +116,19 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
         resolve_ui_mode(args.ui, task.ui_hint, has_terminal)
     };
 
+    // Parse `--timeout`. Accepts humantime strings ("30s", "5m", "1h30m")
+    // and falls back to bare seconds (e.g., "30").
+    let timeout = match args.timeout.as_deref() {
+        None => None,
+        Some(s) => match parse_timeout(s) {
+            Ok(d) => Some(d),
+            Err(e) => {
+                eprintln!("Error: invalid --timeout value '{s}': {e}");
+                std::process::exit(2);
+            }
+        },
+    };
+
     match ui {
         UiMode::Tui => {
             let mut app = App::with_task(task, task_args, registry.clone());
@@ -124,73 +138,120 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
             }
         }
         UiMode::Cli => {
-            run_cli(task, &task_args, &registry, &args.format).await;
+            run_cli(task, &task_args, &registry, &args.format, timeout).await;
         }
         UiMode::Agent => {
-            run_agent(task, &task_args, &registry, &args.format).await;
+            run_agent(task, &task_args, &registry, &args.format, timeout).await;
         }
     }
 }
 
+/// Parse a `--timeout` value. Tries `humantime::parse_duration` first, then
+/// falls back to `s.parse::<u64>()` interpreted as whole seconds.
+fn parse_timeout(s: &str) -> Result<Duration, String> {
+    if let Ok(d) = humantime::parse_duration(s) {
+        return Ok(d);
+    }
+    if let Ok(secs) = s.parse::<u64>() {
+        return Ok(Duration::from_secs(secs));
+    }
+    Err("expected a humantime duration like '30s' or '5m', or a bare number of seconds"
+        .to_string())
+}
+
 /// Run a task in CLI mode: direct execution with stdio output, no TUI.
 ///
-/// Uses the shared execution layer (`TaskExecution`). All output flows
-/// through the LogStore; we subscribe and forward entries to stdio.
+/// Slice 4: routes through `Engine` so the task graph, cancel ladder,
+/// and per-task timeouts all work end-to-end. The CLI subscribes to
+/// the engine's `LogStore` and forwards entries to stdio; a Ctrl-C
+/// handler calls `engine_handle.quit()` for clean teardown.
 async fn run_cli(
     task: &'static crate::task::TaskDef,
     args: &[String],
     registry: &Arc<Registry>,
     format: &OutputFormat,
+    timeout: Option<Duration>,
 ) {
-    use crate::execution::{TaskExecution, TaskId};
-    use crate::log::store::LogStore;
-    use tokio::sync::Mutex;
+    use crate::execution::{Engine, TaskStatus};
 
-    // Slice 2: callers own the LogStore. Slice 4 will hoist this into the
-    // engine; for now the CLI is the de-facto owner.
-    let log_store = Arc::new(Mutex::new(LogStore::new()));
-    let mut exec = TaskExecution::with_log_store(TaskId::next(), log_store);
-    exec.set_registry(registry.clone());
+    let (engine, handle) = Engine::start(registry.clone());
 
     // Subscribe to LogStore → stdio BEFORE launching the task.
-    let rx = exec.subscribe().await;
+    let rx = handle.subscribe_logs().await;
     let use_raw = matches!(format, OutputFormat::Raw);
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tokio::spawn(forward_output_to_stdio(rx, use_raw, use_color));
 
-    exec.launch(task, args.to_vec());
+    // Spawn the task through the engine.
+    let mut builder = handle.spawn_task(task, args.to_vec());
+    if let Some(d) = timeout {
+        builder = builder.timeout(d);
+    }
+    let task_id = match builder.await {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    // Wait for the task function to complete, or Ctrl-C.
+    // Watch graph snapshots for terminal status on `task_id`. Ctrl-C
+    // quits the engine cleanly (cancel subtree → root body returns).
+    //
+    // Two-phase wait, matching legacy CLI behavior:
+    //   1. Wait for the task body to reach a terminal status.
+    //   2. If Done/Failed and the task still has running processes,
+    //      keep waiting until they exit (or Ctrl-C).
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
-
-    tokio::select! {
-        _ = exec.wait() => {}
-        _ = &mut ctrl_c => {
-            exec.shutdown(std::time::Duration::from_secs(5)).await;
-            std::process::exit(130); // 128 + SIGINT
-        }
-    }
-
-    // Task function returned. Stay alive while spawned processes are
-    // still running — same as TUI staying open. Ctrl-C triggers shutdown.
-    loop {
-        if !exec.has_running_processes().await {
-            break;
+    let mut graph = handle.graph.clone();
+    let final_status: TaskStatus = loop {
+        let snap = graph.borrow().clone();
+        if let Some(node) = snap.tasks.get(&task_id) {
+            let body_done = matches!(
+                &node.status,
+                TaskStatus::Done
+                    | TaskStatus::Failed(_)
+                    | TaskStatus::Cancelled
+                    | TaskStatus::Timeout
+            );
+            if body_done {
+                let any_running = node.processes.iter().any(|p| {
+                    matches!(p.status, crate::execution::ProcessStatus::Running)
+                });
+                if !any_running {
+                    break node.status.clone();
+                }
+            }
         }
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+            res = graph.changed() => {
+                if res.is_err() { break TaskStatus::Done; }
+            }
             _ = &mut ctrl_c => {
-                exec.shutdown(std::time::Duration::from_secs(5)).await;
+                let _ = handle.quit().await;
+                engine.shutdown().await;
                 std::process::exit(130);
             }
         }
-    }
+    };
 
-    let status = exec.task_status().lock().await.clone();
-    if let crate::execution::TaskStatus::Failed(failure) = status {
-        eprintln!("Error: {}", failure.message);
-        std::process::exit(failure.exit_code);
+    // Task reached terminal status. Drain & shut down.
+    let _ = handle.quit().await;
+    engine.shutdown().await;
+
+    match final_status {
+        TaskStatus::Done => {}
+        TaskStatus::Failed(failure) => {
+            eprintln!("Error: {}", failure.message);
+            std::process::exit(failure.exit_code);
+        }
+        TaskStatus::Cancelled => std::process::exit(130),
+        TaskStatus::Timeout => {
+            eprintln!("Error: task timed out");
+            std::process::exit(124);
+        }
+        _ => {}
     }
 }
 
@@ -241,27 +302,58 @@ async fn forward_output_to_stdio(
 
 /// Run a task in Agent mode: structured output, minimal UI.
 ///
-/// Uses the shared execution layer. No output subscription — only
-/// the final result is reported.
+/// Slice 4: routes through `Engine` like `run_cli` but skips stdio
+/// forwarding. Only the final result is reported.
 async fn run_agent(
     task: &'static crate::task::TaskDef,
     args: &[String],
     registry: &Arc<Registry>,
     format: &OutputFormat,
+    timeout: Option<Duration>,
 ) {
-    use crate::execution::{TaskExecution, TaskId, TaskStatus};
-    use crate::log::store::LogStore;
-    use tokio::sync::Mutex;
+    use crate::execution::{Engine, TaskStatus};
 
-    let log_store = Arc::new(Mutex::new(LogStore::new()));
-    let mut exec = TaskExecution::with_log_store(TaskId::next(), log_store);
-    exec.set_registry(registry.clone());
+    let (engine, handle) = Engine::start(registry.clone());
 
-    exec.launch(task, args.to_vec());
-    exec.wait().await;
-    exec.shutdown(std::time::Duration::from_secs(5)).await;
+    let mut builder = handle.spawn_task(task, args.to_vec());
+    if let Some(d) = timeout {
+        builder = builder.timeout(d);
+    }
+    let task_id = match builder.await {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    let status = exec.task_status().lock().await.clone();
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut graph = handle.graph.clone();
+    let status: TaskStatus = loop {
+        let snap = graph.borrow().clone();
+        if let Some(node) = snap.tasks.get(&task_id) {
+            match &node.status {
+                TaskStatus::Done | TaskStatus::Failed(_) | TaskStatus::Cancelled
+                | TaskStatus::Timeout => break node.status.clone(),
+                _ => {}
+            }
+        }
+        tokio::select! {
+            res = graph.changed() => {
+                if res.is_err() { break TaskStatus::Done; }
+            }
+            _ = &mut ctrl_c => {
+                let _ = handle.quit().await;
+                engine.shutdown().await;
+                std::process::exit(130);
+            }
+        }
+    };
+
+    let _ = handle.quit().await;
+    engine.shutdown().await;
+
     match status {
         TaskStatus::Done => {
             match format {
@@ -274,7 +366,6 @@ async fn run_agent(
         TaskStatus::Failed(failure) => {
             match format {
                 OutputFormat::Json => {
-                    // Parse the stored JSON output back to a Value for structured output.
                     let error_output: serde_json::Value =
                         serde_json::from_str(&failure.output_json)
                             .unwrap_or_else(|_| serde_json::json!({"message": failure.message}));
@@ -290,6 +381,24 @@ async fn run_agent(
                 }
             }
             std::process::exit(failure.exit_code);
+        }
+        TaskStatus::Cancelled => std::process::exit(130),
+        TaskStatus::Timeout => {
+            match format {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "timeout",
+                            "task": task.name,
+                        })
+                    );
+                }
+                OutputFormat::Text | OutputFormat::Raw => {
+                    eprintln!("Error: task timed out");
+                }
+            }
+            std::process::exit(124);
         }
         _ => {}
     }

@@ -27,6 +27,7 @@ use crate::log::store::LogStore;
 use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef};
 use crate::tracing_layer::LogEntryLayer;
 
+use super::engine::EngineInternals;
 use super::task_id::TaskId;
 
 // ============================================================
@@ -225,6 +226,13 @@ pub struct TaskExecution {
     /// Sender for spawn events (given to the TaskContext).
     spawn_tx: mpsc::UnboundedSender<SpawnEvent>,
 
+    // ── Runtime context (slice 4) ──────────────────────────────────
+    /// `Arc<TaskContext>` shared with the running task body. Set inside
+    /// `spawn_body`. Used by the cancel ladder to invoke `ctx.stop_all`
+    /// per arch.md §7. `None` until `spawn_body` runs (i.e. for freshly
+    /// constructed nodes that haven't launched yet).
+    task_ctx: Mutex<Option<Arc<TaskContext>>>,
+
     // ── Logging ────────────────────────────────────────────────────
     /// Aggregated log store for all output. Engine-owned in the multi-
     /// task runtime — callers always supply this.
@@ -250,13 +258,31 @@ impl TaskExecution {
     /// and an empty `children` list; slice 3 wires those up when child
     /// invocations materialise as graph nodes.
     pub fn with_log_store(id: TaskId, log_store: Arc<Mutex<LogStore>>) -> Self {
+        Self::with_log_store_and_engine(id, log_store, Weak::new())
+    }
+
+    /// Like `with_log_store`, but with a `Weak<EngineInternals>` so
+    /// `monitor_spawns` can publish snapshot updates on process events
+    /// (slice 4). Pass `Weak::new()` for the legacy single-task path.
+    pub fn with_log_store_and_engine(
+        id: TaskId,
+        log_store: Arc<Mutex<LogStore>>,
+        engine: Weak<EngineInternals>,
+    ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
         let processes = Arc::new(Mutex::new(Vec::new()));
 
         let monitor_log_store = log_store.clone();
         let monitor_processes = processes.clone();
+        let monitor_engine = engine.clone();
         tokio::spawn(async move {
-            Self::monitor_spawns(spawn_rx, monitor_log_store, monitor_processes).await;
+            Self::monitor_spawns(
+                spawn_rx,
+                monitor_log_store,
+                monitor_processes,
+                monitor_engine,
+            )
+            .await;
         });
 
         Self {
@@ -271,6 +297,7 @@ impl TaskExecution {
             watchdog_abort: Mutex::new(None),
             processes,
             spawn_tx,
+            task_ctx: Mutex::new(None),
             log_store,
             tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             tracing_installed: Arc::new(AtomicBool::new(false)),
@@ -295,10 +322,11 @@ impl TaskExecution {
     /// Launch a task. Creates the `TaskContext`, installs tracing,
     /// subscribes to all output buffers, and spawns the task function.
     ///
-    /// The `JoinHandle<TaskResult>` is stored in `task_handle`. Slice 3's
-    /// `TaskHandle::IntoFuture` takes it to recover the body's result;
-    /// slice 4's cancel ladder uses the cached `abort_handle` to abort
-    /// without re-locking the slot.
+    /// Legacy single-task entry point (used by the TUI's `TaskRunner`
+    /// today). The engine path uses [`spawn_body`](Self::spawn_body)
+    /// instead, which threads a `Weak<EngineInternals>` through into the
+    /// `TaskContext` so `ctx.run` and `TaskHandle::Drop` can reach the
+    /// engine.
     pub fn launch(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
         self.launch_with_self_weak(Weak::new(), task, task_args);
     }
@@ -309,9 +337,39 @@ impl TaskExecution {
     /// `ctx.run` can attach children to the parent's `children` list.
     /// Pass `Weak::new()` (or call `launch`) when no self-reference is
     /// needed — e.g. top-level test launches with no graph parent.
+    ///
+    /// Engine-aware launches go through [`spawn_body`](Self::spawn_body)
+    /// instead of this method.
     pub fn launch_with_self_weak(
         &mut self,
         self_weak: Weak<TaskExecution>,
+        task: &'static TaskDef,
+        task_args: Vec<String>,
+    ) {
+        self.spawn_body_inner(self_weak, Weak::new(), task, task_args);
+    }
+
+    /// Engine-aware launch core (slice 4).
+    ///
+    /// Same as `launch_with_self_weak` but additionally wires a
+    /// `Weak<EngineInternals>` into the `TaskContext` (so `ctx.run` and
+    /// `TaskHandle::Drop` can reach the engine) and stores the
+    /// `Arc<TaskContext>` on the execution (so the cancel ladder can
+    /// call `ctx.stop_all` per arch.md §7).
+    pub fn spawn_body(
+        &mut self,
+        self_weak: Weak<TaskExecution>,
+        engine: Weak<EngineInternals>,
+        task: &'static TaskDef,
+        task_args: Vec<String>,
+    ) {
+        self.spawn_body_inner(self_weak, engine, task, task_args);
+    }
+
+    fn spawn_body_inner(
+        &mut self,
+        self_weak: Weak<TaskExecution>,
+        engine: Weak<EngineInternals>,
         task: &'static TaskDef,
         task_args: Vec<String>,
     ) {
@@ -339,6 +397,11 @@ impl TaskExecution {
         // expose `ctx.cancelled()` / `ctx.cancellation()` to the body.
         ctx.set_task_identity(self.id, self.cancellation.clone(), self_weak);
         ctx.set_log_store(self.log_store.clone());
+        // Slice 4: thread the engine weak in so `ctx.run` can reach
+        // `EngineInternals::spawn_child` and `TaskHandle::Drop` can run
+        // the cancel ladder. Empty (`Weak::new()`) for legacy callers.
+        let body_engine = engine.clone();
+        ctx.set_engine(engine);
 
         // Forward exec() output to LogStore.
         start_buffer_forwarder(ctx.output_buffer(), log_store.clone());
@@ -359,28 +422,47 @@ impl TaskExecution {
             let _ = tracing::dispatcher::set_global_default(dispatch);
         }
 
+        // Slice 4: hold an `Arc<TaskContext>` so the cancel ladder can
+        // call `ctx.stop_all`. Both this Arc and the spawned body share
+        // the same context — the body uses `&*ctx_arc` to satisfy the
+        // `&TaskContext` argument of `task.func.call`.
+        let ctx_arc = Arc::new(ctx);
+        if let Ok(mut slot) = self.task_ctx.try_lock() {
+            *slot = Some(ctx_arc.clone());
+        }
+
         // Spawn the task function. The JoinHandle now carries the body's
         // `TaskResult` so the awaited TaskHandle (slice 3) can return it.
         // Status writes are still done here against the shared Arc so
         // observers see the in-flight transition.
         let task_status = self.task_status.clone();
+        let body_ctx = ctx_arc.clone();
+        let _exec_id = self.id;
         let handle: JoinHandle<TaskResult> = tokio::spawn(async move {
-            let result = task.func.call(&ctx, &task_args).await;
+            let result = task.func.call(&body_ctx, &task_args).await;
 
-            let mut s = task_status.lock().await;
-            match &result {
-                Ok(()) => {
-                    *s = TaskStatus::Done;
+            {
+                let mut s = task_status.lock().await;
+                match &result {
+                    Ok(()) => {
+                        *s = TaskStatus::Done;
+                    }
+                    Err(task_err) => {
+                        let failure = TaskFailure {
+                            message: task_err.to_string(),
+                            exit_code: task_err.exit_code(),
+                            output_json: task_err.output().to_string(),
+                        };
+                        tracing::error!("task failed: {}", failure.message);
+                        *s = TaskStatus::Failed(failure);
+                    }
                 }
-                Err(task_err) => {
-                    let failure = TaskFailure {
-                        message: task_err.to_string(),
-                        exit_code: task_err.exit_code(),
-                        output_json: task_err.output().to_string(),
-                    };
-                    tracing::error!("task failed: {}", failure.message);
-                    *s = TaskStatus::Failed(failure);
-                }
+            }
+
+            // Snapshot publish on terminal status (slice 4). Best-effort;
+            // ignore if engine is gone.
+            if let Some(eng) = body_engine.upgrade() {
+                eng.publish_snapshot().await;
             }
 
             result
@@ -391,6 +473,11 @@ impl TaskExecution {
             .task_handle
             .try_lock()
             .expect("task_handle slot uncontended at launch") = Some(handle);
+    }
+
+    /// Read access to the running task's `TaskContext`, if launched.
+    pub async fn task_context(&self) -> Option<Arc<TaskContext>> {
+        self.task_ctx.lock().await.clone()
     }
 
     /// Wait for the task function to complete.
@@ -492,10 +579,17 @@ impl TaskExecution {
 
     /// Background loop that receives spawn events, creates ProcessInfo,
     /// and sets up output forwarding to the LogStore.
+    ///
+    /// Slice 4: also publishes graph snapshots through `engine` on three
+    /// process lifecycle events:
+    /// - process appeared (pushed onto `processes`)
+    /// - readiness flipped to `true`
+    /// - process exited (detected by a 250ms signal-0 polling watcher)
     async fn monitor_spawns(
         mut spawn_rx: mpsc::UnboundedReceiver<SpawnEvent>,
         log_store: Arc<Mutex<LogStore>>,
         processes: Arc<Mutex<Vec<ProcessInfo>>>,
+        engine: Weak<EngineInternals>,
     ) {
         while let Some(event) = spawn_rx.recv().await {
             let buffer = event.buffer.clone();
@@ -521,16 +615,56 @@ impl TaskExecution {
                 idx
             };
 
-            // Watch for readiness changes if a condition was configured
+            // (1) snapshot publish on process-appeared.
+            if let Some(eng) = engine.upgrade() {
+                tokio::spawn(async move {
+                    eng.publish_snapshot().await;
+                });
+            }
+
+            // Watch for readiness changes if a condition was configured.
             if let Some(mut readiness_rx) = event.readiness_rx {
-                let processes = processes.clone();
+                let processes_inner = processes.clone();
+                let engine_ready = engine.clone();
                 tokio::spawn(async move {
                     let _ = readiness_rx.wait_for(|&ready| ready).await;
-                    if let Some(proc) = processes.lock().await.get_mut(process_index) {
+                    if let Some(proc) = processes_inner.lock().await.get_mut(process_index) {
                         proc.ready = true;
+                    }
+                    // (2) snapshot publish on readiness flip.
+                    if let Some(eng) = engine_ready.upgrade() {
+                        eng.publish_snapshot().await;
                     }
                 });
             }
+
+            // (3) explicit exit watcher (slice 4) — poll signal-0 every
+            // 250ms until the process is gone, then update status and
+            // publish. Without this, exits only become visible to the
+            // engine the next time something else calls
+            // `refresh_status` (TUI render path).
+            let exit_pid = event.pid;
+            let exit_processes = processes.clone();
+            let exit_engine = engine.clone();
+            tokio::spawn(async move {
+                if let Some(pid) = exit_pid {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        match signal::kill(Pid::from_raw(pid as i32), None) {
+                            Ok(()) => continue, // still running
+                            Err(_) => break,    // process exited
+                        }
+                    }
+                    if let Some(proc) = exit_processes.lock().await.get_mut(process_index)
+                        && proc.status == ProcessStatus::Running
+                    {
+                        proc.status = ProcessStatus::Done;
+                    }
+                    if let Some(eng) = exit_engine.upgrade() {
+                        eng.publish_snapshot().await;
+                    }
+                }
+            });
 
             // Subscribe to the process's output buffer and forward to LogStore.
             let store = log_store.clone();

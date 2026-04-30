@@ -187,6 +187,12 @@ pub struct TaskContext {
     /// Engine-owned `LogStore` (slice 3 inherits the parent's). Slice 4
     /// will hoist this into `Weak<EngineInternals>::log_store`.
     log_store: Option<Arc<Mutex<LogStore>>>,
+    /// Weak ref to the engine internals. Set by `EngineInternals::spawn_child`
+    /// at task launch. Used by `ctx.run` (via `TaskBuilder`) to funnel
+    /// child spawns through `engine.spawn_child`, by `TaskHandle::Drop`
+    /// to invoke the cancel ladder, and by the synthetic root body to
+    /// reach the control receiver.
+    engine: Option<Weak<crate::execution::engine::EngineInternals>>,
 }
 
 /// Future returned by [`TaskContext::cancellation_signal`].
@@ -252,6 +258,7 @@ impl TaskContext {
             cancellation: None,
             task_exec: None,
             log_store: None,
+            engine: None,
         }
     }
 
@@ -271,6 +278,7 @@ impl TaskContext {
             cancellation: None,
             task_exec: None,
             log_store: None,
+            engine: None,
         }
     }
 
@@ -623,6 +631,26 @@ impl TaskContext {
         self.log_store = Some(store);
     }
 
+    /// Inject the engine weak reference (slice 4). Called by
+    /// `EngineInternals::spawn_child` before the body runs.
+    pub fn set_engine(
+        &mut self,
+        engine: Weak<crate::execution::engine::EngineInternals>,
+    ) {
+        self.engine = Some(engine);
+    }
+
+    /// Upgrade the engine weak reference, if any.
+    ///
+    /// Returns `None` outside the engine (e.g. tests using
+    /// `TaskContext::new` directly), or after the engine has been dropped.
+    pub fn engine_internals(
+        &self,
+    ) -> Option<Arc<crate::execution::engine::EngineInternals>> {
+        self.engine.as_ref().and_then(|w| w.upgrade())
+    }
+
+
     /// Identity of the running task (`None` outside the engine, e.g.
     /// tests that build a `TaskContext` directly).
     pub fn task_id(&self) -> Option<TaskId> {
@@ -745,6 +773,7 @@ impl TaskContext {
         TaskBuilder::new(
             self.task_id,
             self.task_exec.clone(),
+            self.engine.clone(),
             log_store,
             registry,
             task_def,
