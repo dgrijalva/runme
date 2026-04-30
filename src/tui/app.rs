@@ -26,10 +26,13 @@ use super::sidebar::{SidebarEntry, SidebarState};
 use super::viewport::ScrollState;
 
 /// The mode the application is currently in.
+///
+/// The picker and quit-confirmation overlays are orthogonal to mode —
+/// they're driven by `AppState::picker_open` / `AppState::quit_confirm`
+/// rather than mode variants, since they layer over the existing shell
+/// instead of replacing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
-    /// Task picker — fuzzy-find task selection on startup
-    TaskPicker,
     /// Log viewer, navigating with keyboard
     Normal,
     /// Filter expression input mode
@@ -68,9 +71,15 @@ pub struct AppState {
     pub source_colors: SourceColors,
     /// Sidebar state (focus, selection).
     pub sidebar: SidebarState,
-    /// Source visibility filter, keyed by `TaskId`. Empty means show all.
-    /// When non-empty, only entries whose source is in this set are shown.
-    pub source_filter: HashSet<TaskId>,
+    /// Base set of sources eligible for display, derived from the focused
+    /// sidebar entry via `EngineHandle::source_ids_for`. Empty = show
+    /// everything (no filtering applied for "All tasks" focus).
+    pub focus_filter: HashSet<TaskId>,
+    /// Sources the user has manually toggled off (composes with
+    /// `focus_filter`: visible = `(focus_filter or all) ∖ hidden_sources`).
+    /// Persists across focus changes — entries that aren't part of any
+    /// current `focus_filter` simply stay hidden silently.
+    pub hidden_sources: HashSet<TaskId>,
     /// Cached sidebar entries, rebuilt each frame from the graph snapshot.
     pub sidebar_entries: Vec<SidebarEntry>,
     /// Filter input state for the filter bar.
@@ -79,8 +88,16 @@ pub struct AppState {
     pub search: SearchState,
     /// Scroll offset within the entry detail overlay (for long entries).
     pub detail_scroll: usize,
-    /// Task picker state (only populated when in TaskPicker mode).
+    /// Task picker state. `Some` whenever `picker_open` is true; the
+    /// picker is an overlay layered on the Normal-mode shell rather than
+    /// a mode of its own.
     pub picker: Option<PickerState>,
+    /// Whether the picker overlay is currently visible. Re-entrant from
+    /// Normal mode via `t`; toggles independently of `mode`.
+    pub picker_open: bool,
+    /// Whether the quit-confirmation modal is visible. Set by `q` when
+    /// any task other than root is in `Setup`/`Ready` status.
+    pub quit_confirm: bool,
     /// All available tasks for the picker (kept for re-launching).
     pub all_tasks: Vec<&'static TaskDef>,
     /// Group name mapping for display (group_key -> display_name).
@@ -144,12 +161,15 @@ impl AppState {
             scroll: ScrollState::Tail,
             source_colors: SourceColors::new(),
             sidebar: SidebarState::new(),
-            source_filter: HashSet::new(),
+            focus_filter: HashSet::new(),
+            hidden_sources: HashSet::new(),
             sidebar_entries: Vec::new(),
             filter_input: FilterInputState::new(),
             search: SearchState::new(),
             detail_scroll: 0,
             picker: None,
+            picker_open: false,
+            quit_confirm: false,
             all_tasks: Vec::new(),
             group_names: HashMap::new(),
             pending_task: None,
@@ -172,15 +192,29 @@ impl AppState {
         }
     }
 
-    /// Get the visible log lines (filtered by source_filter AND expression filter).
-    /// Returns indices into self.log_lines for entries that pass both filters.
+    /// Whether a given source is currently visible.
+    ///
+    /// Visible = (in `focus_filter` OR `focus_filter` is empty)
+    ///        AND (NOT in `hidden_sources`).
+    fn source_visible(&self, source: TaskId) -> bool {
+        if !self.focus_filter.is_empty() && !self.focus_filter.contains(&source) {
+            return false;
+        }
+        if self.hidden_sources.contains(&source) {
+            return false;
+        }
+        true
+    }
+
+    /// Get the visible log lines as indices into `self.log_lines`.
+    /// Filters by focus + manual hides + expression filter.
     pub fn visible_line_indices(&self) -> Vec<usize> {
         let expr = self.filter_input.active_expr();
         self.log_lines
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                if !self.source_filter.is_empty() && !self.source_filter.contains(&entry.source) {
+                if !self.source_visible(entry.source) {
                     return false;
                 }
                 if let Some(expr) = expr
@@ -194,13 +228,13 @@ impl AppState {
             .collect()
     }
 
-    /// Get the filtered log lines based on source_filter AND expression filter.
+    /// Get the filtered log lines (focus + manual hides + expression filter).
     pub fn visible_log_lines(&self) -> Vec<&LogEntry> {
         let expr = self.filter_input.active_expr();
         self.log_lines
             .iter()
             .filter(|entry| {
-                if !self.source_filter.is_empty() && !self.source_filter.contains(&entry.source) {
+                if !self.source_visible(entry.source) {
                     return false;
                 }
                 if let Some(expr) = expr
@@ -213,36 +247,49 @@ impl AppState {
             .collect()
     }
 
-    /// Toggle visibility of a source. If source_filter is empty (show all),
-    /// switching to filtered mode: add all sources except the toggled one.
-    /// If already filtered, toggle the specific source.
+    /// Toggle a manual hide for a source. Composes with focus filter:
+    /// `hidden_sources` is independent of `focus_filter`. Re-toggling
+    /// removes the source from `hidden_sources` (un-hides).
     pub fn toggle_source_visibility(&mut self, source: TaskId) {
-        if self.source_filter.is_empty() {
-            let all_sources: HashSet<TaskId> = self
-                .sidebar_entries
-                .iter()
-                .map(|e| e.source)
-                .collect();
-            self.source_filter = all_sources;
-            self.source_filter.remove(&source);
-        } else if self.source_filter.contains(&source) {
-            self.source_filter.remove(&source);
+        if self.hidden_sources.contains(&source) {
+            self.hidden_sources.remove(&source);
         } else {
-            self.source_filter.insert(source);
-            let all_sources: HashSet<TaskId> = self
-                .sidebar_entries
-                .iter()
-                .map(|e| e.source)
-                .collect();
-            if self.source_filter == all_sources {
-                self.source_filter.clear();
-            }
+            self.hidden_sources.insert(source);
         }
     }
 
-    /// Show all sources (clear the filter).
+    /// Show all sources: clears manual hides only. The focus filter is
+    /// driven by sidebar selection and isn't affected here.
     pub fn show_all_sources(&mut self) {
-        self.source_filter.clear();
+        self.hidden_sources.clear();
+    }
+
+    /// Update the focus filter based on the currently focused sidebar entry.
+    ///
+    /// - "All tasks" (root) => empty `focus_filter` (no filtering by focus).
+    /// - Task entry => `source_ids_for(task_id)` (the task and its subtree).
+    /// - Process entry => single-source filter `{process_id}`.
+    pub fn refresh_focus_filter(&mut self) {
+        let Some(entry) = self.sidebar_entries.get(self.sidebar.selection) else {
+            self.focus_filter.clear();
+            return;
+        };
+        let Some(handle) = self.engine.as_ref() else {
+            self.focus_filter.clear();
+            return;
+        };
+        if entry.source == handle.root {
+            // "All tasks" — no focus filter.
+            self.focus_filter.clear();
+            return;
+        }
+        if !entry.is_task {
+            // Process entry: filter to just this process's logs.
+            self.focus_filter = std::iter::once(entry.source).collect();
+            return;
+        }
+        let ids = handle.source_ids_for(entry.source);
+        self.focus_filter = ids.into_iter().collect();
     }
 
     /// Launch a task through the engine. Called from the event loop when a
@@ -269,8 +316,49 @@ impl AppState {
 
         self.mode = AppMode::Normal;
         self.picker = None;
+        self.picker_open = false;
         self.pending_task = None;
         self.dirty = true;
+    }
+
+    /// Open the task picker overlay. Re-entrant from Normal mode at any
+    /// time (decision 1 + 8). Builds picker state from the cached task
+    /// list / group names.
+    pub fn open_picker(&mut self) {
+        if self.all_tasks.is_empty() {
+            return;
+        }
+        self.picker = Some(PickerState::new(&self.all_tasks, &self.group_names));
+        self.picker_open = true;
+        self.dirty = true;
+    }
+
+    /// Close the picker overlay without launching a task.
+    pub fn close_picker(&mut self) {
+        self.picker = None;
+        self.picker_open = false;
+        self.dirty = true;
+    }
+
+    /// Whether any task other than the synthetic root is currently in a
+    /// running state (`Setup` or `Ready`).
+    pub fn has_running_tasks(&self) -> bool {
+        let Some(handle) = self.engine.as_ref() else {
+            return false;
+        };
+        let snapshot = handle.graph.borrow().clone();
+        for (id, node) in snapshot.tasks.iter() {
+            if *id == handle.root {
+                continue;
+            }
+            if matches!(
+                node.status,
+                crate::execution::TaskStatus::Setup | crate::execution::TaskStatus::Ready
+            ) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -293,8 +381,8 @@ impl App {
         }
     }
 
-    /// Create an App that starts with the task picker, attached to an
-    /// already-started engine.
+    /// Create an App that starts with the task picker overlay open over
+    /// an empty Normal-mode shell, attached to an already-started engine.
     pub fn with_picker(
         tasks: Vec<&'static TaskDef>,
         group_names: HashMap<String, String>,
@@ -303,8 +391,9 @@ impl App {
     ) -> Self {
         let picker = PickerState::new(&tasks, &group_names);
         let mut state = AppState::new();
-        state.mode = AppMode::TaskPicker;
+        state.mode = AppMode::Normal;
         state.picker = Some(picker);
+        state.picker_open = true;
         state.all_tasks = tasks;
         state.group_names = group_names;
         state.registry = Some(registry);
@@ -371,7 +460,6 @@ fn restore_terminal() -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::log::{LogEntry, ParsedContent};
-    use ratatui::style::Color;
     use std::collections::HashMap;
 
     fn make_entry(source: TaskId) -> LogEntry {
@@ -401,8 +489,11 @@ mod tests {
         assert_eq!(state.scroll, ScrollState::Tail);
         assert!(!state.sidebar.focused);
         assert_eq!(state.sidebar.selection, 0);
-        assert!(state.source_filter.is_empty());
+        assert!(state.focus_filter.is_empty());
+        assert!(state.hidden_sources.is_empty());
         assert!(state.sidebar_entries.is_empty());
+        assert!(!state.picker_open);
+        assert!(!state.quit_confirm);
         assert!(state.engine.is_none());
         assert!(state.current_task_id.is_none());
         assert!(state.sidebar_visible);
@@ -427,85 +518,114 @@ mod tests {
     }
 
     #[test]
-    fn visible_lines_with_filter() {
+    fn visible_lines_with_focus_filter() {
         let mut state = AppState::new();
         let api = TaskId(1);
         let worker = TaskId(2);
         state.log_lines.push(make_entry(api));
         state.log_lines.push(make_entry(worker));
         state.log_lines.push(make_entry(api));
-        state.source_filter.insert(api);
+        state.focus_filter.insert(api);
         let indices = state.visible_line_indices();
         assert_eq!(indices, vec![0, 2]);
     }
 
     #[test]
-    fn show_all_clears_filter() {
+    fn visible_lines_with_hidden_sources() {
         let mut state = AppState::new();
-        state.source_filter.insert(TaskId(1));
-        assert!(!state.source_filter.is_empty());
+        let api = TaskId(1);
+        let worker = TaskId(2);
+        state.log_lines.push(make_entry(api));
+        state.log_lines.push(make_entry(worker));
+        state.log_lines.push(make_entry(api));
+        state.hidden_sources.insert(api);
+        let indices = state.visible_line_indices();
+        assert_eq!(indices, vec![1]);
+    }
+
+    #[test]
+    fn focus_and_hide_compose() {
+        // Focus filter limits to {api, worker}; manual hide removes worker.
+        // Result: only api entries visible.
+        let mut state = AppState::new();
+        let api = TaskId(1);
+        let worker = TaskId(2);
+        let other = TaskId(3);
+        state.log_lines.push(make_entry(api));
+        state.log_lines.push(make_entry(worker));
+        state.log_lines.push(make_entry(other));
+        state.focus_filter.insert(api);
+        state.focus_filter.insert(worker);
+        state.hidden_sources.insert(worker);
+        let indices = state.visible_line_indices();
+        assert_eq!(indices, vec![0]);
+    }
+
+    #[test]
+    fn show_all_clears_hidden_sources() {
+        let mut state = AppState::new();
+        state.hidden_sources.insert(TaskId(1));
+        assert!(!state.hidden_sources.is_empty());
         state.show_all_sources();
-        assert!(state.source_filter.is_empty());
+        assert!(state.hidden_sources.is_empty());
     }
 
     #[test]
-    fn toggle_source_from_all_visible() {
+    fn show_all_does_not_clear_focus_filter() {
         let mut state = AppState::new();
-        let task = TaskId(10);
-        let api = TaskId(11);
-        state.sidebar_entries = vec![
-            SidebarEntry {
-                name: "task".to_string(),
-                source: task,
-                status_tag: "SETUP".to_string(),
-                status_color: Color::Yellow,
-                visible: true,
-                is_task: true,
-                depth: 0,
-            },
-            SidebarEntry {
-                name: "echo hello".to_string(),
-                source: api,
-                status_tag: "RUN".to_string(),
-                status_color: Color::Green,
-                visible: true,
-                is_task: false,
-                depth: 1,
-            },
-        ];
-        state.toggle_source_visibility(api);
-        assert!(state.source_filter.contains(&task));
-        assert!(!state.source_filter.contains(&api));
+        state.focus_filter.insert(TaskId(1));
+        state.hidden_sources.insert(TaskId(2));
+        state.show_all_sources();
+        assert!(state.hidden_sources.is_empty());
+        assert!(state.focus_filter.contains(&TaskId(1)));
     }
 
     #[test]
-    fn toggle_source_back_on_clears_filter() {
+    fn toggle_source_visibility_adds_then_removes() {
         let mut state = AppState::new();
-        let task = TaskId(10);
         let api = TaskId(11);
-        state.sidebar_entries = vec![
-            SidebarEntry {
-                name: "task".to_string(),
-                source: task,
-                status_tag: "SETUP".to_string(),
-                status_color: Color::Yellow,
-                visible: true,
-                is_task: true,
-                depth: 0,
-            },
-            SidebarEntry {
-                name: "echo hello".to_string(),
-                source: api,
-                status_tag: "RUN".to_string(),
-                status_color: Color::Green,
-                visible: true,
-                is_task: false,
-                depth: 1,
-            },
-        ];
         state.toggle_source_visibility(api);
-        assert!(!state.source_filter.is_empty());
+        assert!(state.hidden_sources.contains(&api));
         state.toggle_source_visibility(api);
-        assert!(state.source_filter.is_empty());
+        assert!(!state.hidden_sources.contains(&api));
+    }
+
+    #[test]
+    fn focus_change_does_not_reset_hidden_sources() {
+        // Hidden sources persist across focus changes (silently inert if
+        // not in the new focus set).
+        let mut state = AppState::new();
+        let api = TaskId(11);
+        state.hidden_sources.insert(api);
+        state.focus_filter = [TaskId(99)].into_iter().collect();
+        // Manually re-derive — refresh_focus_filter would need a real engine.
+        assert!(state.hidden_sources.contains(&api));
+    }
+
+    #[test]
+    fn open_picker_with_empty_tasks_is_noop() {
+        let mut state = AppState::new();
+        state.open_picker();
+        assert!(!state.picker_open);
+        assert!(state.picker.is_none());
+    }
+
+    #[test]
+    fn close_picker_clears_state() {
+        let mut state = AppState::new();
+        state.picker_open = true;
+        state.picker = Some(super::super::picker::PickerState::new(
+            &[],
+            &HashMap::new(),
+        ));
+        state.close_picker();
+        assert!(!state.picker_open);
+        assert!(state.picker.is_none());
+    }
+
+    #[test]
+    fn has_running_tasks_without_engine_is_false() {
+        let state = AppState::new();
+        assert!(!state.has_running_tasks());
     }
 }

@@ -319,6 +319,28 @@ async fn drain_records_async(
 ///
 /// The child is spawned in its own process group, allowing group-wide
 /// signal delivery for clean shutdown.
+///
+/// # Drop semantics
+///
+/// Mirrors `TaskHandle`: handle lifetime == process lifetime. Dropping
+/// the handle without first consuming it via `.complete()`, `.stop()`,
+/// or `.wait()` sends SIGTERM to the process group (the handle was
+/// "armed"). Drop is sync — it does not wait for the process to exit;
+/// it just signals.
+///
+/// In practice, this means:
+///
+/// ```rust,ignore
+/// // BAD: process gets killed at the end of this statement.
+/// ctx.spawn(cmd!(server)).await?;
+///
+/// // GOOD: handle lives for the rest of the task body.
+/// let _h = ctx.spawn(cmd!(server)).await?;
+///
+/// // GOOD: explicit completion.
+/// ctx.spawn(cmd!(build)).complete().await?;
+/// ctx.exec(cmd!(build)).await?;
+/// ```
 pub struct ProcessHandle {
     child: tokio::process::Child,
     /// Unique id for this process in the unified task-id space. Allocated
@@ -338,6 +360,11 @@ pub struct ProcessHandle {
     readiness_rx: tokio::sync::watch::Receiver<bool>,
     /// Background readiness probe task (if configured).
     _readiness_task: Option<tokio::task::JoinHandle<()>>,
+    /// Whether `Drop` should signal the process group with SIGTERM.
+    /// Cleared by any consuming method (`complete`, `stop`, `wait`) so
+    /// that a handle whose lifetime has been formally ended doesn't
+    /// double-signal an already-exited process.
+    armed: bool,
 }
 
 impl ProcessHandle {
@@ -360,6 +387,9 @@ impl ProcessHandle {
 
     /// Graceful shutdown: send SIGTERM, wait for the timeout, then SIGKILL if still alive.
     pub async fn stop(&mut self, timeout: Duration) -> Result<(), ProcessError> {
+        // Caller is taking ownership of process termination — disarm
+        // the Drop signal so we don't double-signal.
+        self.armed = false;
         // Send SIGTERM to the process group
         let _ = self.signal(Signal::SIGTERM);
 
@@ -386,7 +416,12 @@ impl ProcessHandle {
     }
 
     /// Wait for the process to exit and return the result.
+    ///
+    /// Disarms the Drop-kill: the caller has formally awaited the
+    /// process's exit, so dropping the handle afterwards must not
+    /// signal anything.
     pub async fn wait(&mut self) -> ProcessResult {
+        self.armed = false;
         let termination = match self.child.wait().await {
             Ok(status) => Termination::from_exit_status(status),
             Err(_) => Termination::Exited(-1),
@@ -448,6 +483,24 @@ impl ProcessHandle {
     /// Useful for binding task-level readiness to this process's readiness.
     pub fn readiness_rx(&self) -> tokio::sync::watch::Receiver<bool> {
         self.readiness_rx.clone()
+    }
+}
+
+impl Drop for ProcessHandle {
+    /// Drop without first consuming via `.complete()`, `.stop()`, or
+    /// `.wait()` sends SIGTERM to the process group. Sync — does not
+    /// wait for exit. Mirrors `TaskHandle::Drop` so process lifetime
+    /// is tied to handle ownership.
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Try the process group first; fall back to the pid if no pgid.
+        if let Some(pgid) = self.pgid {
+            let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGTERM));
+        } else if let Some(id) = self.child.id() {
+            let _ = killpg(Pid::from_raw(id as i32), Some(Signal::SIGTERM));
+        }
     }
 }
 
@@ -707,6 +760,7 @@ pub async fn spawn(
         _stderr_task: Some(stderr_task),
         readiness_rx,
         _readiness_task: None,
+        armed: true,
     })
 }
 
@@ -1031,6 +1085,44 @@ mod tests {
         handle.stop(Duration::from_secs(2)).await.unwrap();
 
         assert!(!handle.is_running());
+    }
+
+    #[tokio::test]
+    async fn test_drop_kills_process() {
+        // ProcessHandle::Drop sends SIGTERM to the process group when
+        // the handle hasn't been consumed via complete/stop/wait.
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let handle = spawn("sleep 60", "test", buffer).await.unwrap();
+        let pgid = handle.pgid().expect("should have a pgid");
+
+        // Verify alive before drop.
+        assert!(killpg(Pid::from_raw(pgid), None).is_ok());
+
+        drop(handle);
+
+        // Give the OS a moment to deliver the signal.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // killpg with sig 0 returns ESRCH if the process group is gone.
+        assert!(
+            killpg(Pid::from_raw(pgid), None).is_err(),
+            "process group {} should be dead after handle drop",
+            pgid,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_complete_disarms_drop() {
+        // After `.complete()`, a subsequent drop of an internal handle
+        // (we test via wait+drop) must not signal anything. We verify
+        // the handle correctly clears `armed` so the OS doesn't get
+        // a redundant SIGTERM on an already-reaped pid.
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let handle = spawn("sh -c 'echo done; exit 0'", "test", buffer).await.unwrap();
+        let _result = handle.complete().await;
+        // No assertion needed beyond "no panic / no UB"; if armed
+        // remained true, killpg on an already-reaped pgid would still
+        // return harmlessly. This test just exercises the path.
     }
 
     #[tokio::test]

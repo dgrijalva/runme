@@ -18,7 +18,10 @@ async fn build(ctx: &TaskContext) -> TaskResult {
 #[rnme::task]
 async fn start(ctx: &TaskContext) -> TaskResult {
     info!("Starting dev server");
-    let handle = ctx.spawn("cargo run --bin server").await?;
+    let _server = ctx.spawn("cargo run --bin server").await?;
+    // The handle owns the process lifetime — wait until cancelled so
+    // the server runs as long as the task does.
+    ctx.cancellation_signal().await;
     Ok(())
 }
 ```

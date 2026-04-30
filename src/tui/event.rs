@@ -211,9 +211,23 @@ async fn refresh_sidebar_state(state: &mut AppState) {
         return;
     };
     let snapshot = handle.graph.borrow().clone();
+
+    // Compose the effective visibility set: focus_filter (if any) minus
+    // any manually hidden sources. Empty `effective` => show everything.
+    let effective: std::collections::HashSet<TaskId> = if state.focus_filter.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        state
+            .focus_filter
+            .iter()
+            .copied()
+            .filter(|id| !state.hidden_sources.contains(id))
+            .collect()
+    };
+
     state.sidebar_entries = sidebar::build_sidebar_entries_from_graph(
         &snapshot,
-        &state.source_filter,
+        &effective,
         &mut state.source_colors,
     );
     state.sidebar.clamp_selection(state.sidebar_entries.len());
@@ -244,7 +258,8 @@ fn check_for_crashes(
                 .find(|(prev_id, _)| prev_id == id)
                 .is_some_and(|(_, s)| matches!(s, ProcessStatus::Running));
             if was_running {
-                let is_filtered = !state.source_filter.is_empty();
+                let is_filtered =
+                    !state.focus_filter.is_empty() || !state.hidden_sources.is_empty();
                 let not_tailing = !matches!(state.scroll, viewport::ScrollState::Tail);
                 if is_filtered || not_tailing {
                     state.notifications.push((
@@ -302,7 +317,16 @@ fn handle_key(
         .map(|h| h.graph.borrow().source_labels())
         .unwrap_or_default();
 
-    if state.mode == AppMode::TaskPicker {
+    // Quit-confirmation modal takes priority over everything else.
+    if state.quit_confirm {
+        keys::handle_quit_confirm_key(key, state);
+        state.dirty = true;
+        return;
+    }
+
+    // Picker overlay layers over the Normal-mode shell — re-entrant from
+    // any non-modal context (design decision 1 + 8).
+    if state.picker_open {
         keys::handle_picker_key(key, state);
         state.dirty = true;
         return;
@@ -364,7 +388,13 @@ fn handle_key(
             return;
         }
         KeyCode::Char('q') => {
-            state.running = false;
+            // Design decision 7: prompt to confirm if any task is still
+            // running. Otherwise quit immediately.
+            if state.has_running_tasks() {
+                state.quit_confirm = true;
+            } else {
+                state.running = false;
+            }
             state.dirty = true;
             return;
         }
@@ -376,6 +406,11 @@ fn handle_key(
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.running = false;
             state.dirty = true;
+            return;
+        }
+        KeyCode::Char('t') => {
+            // Open the task picker overlay (decision 1 + 8). Re-entrant.
+            state.open_picker();
             return;
         }
         KeyCode::Tab => {
@@ -407,13 +442,12 @@ fn handle_mouse(
     state: &mut AppState,
     terminal: &Terminal<CrosstermBackend<io::Stdout>>,
 ) {
+    if state.picker_open || state.quit_confirm {
+        return;
+    }
     if matches!(
         state.mode,
-        AppMode::Help
-            | AppMode::EntryDetail
-            | AppMode::ProcessDetail
-            | AppMode::TaskPicker
-            | AppMode::CopyMenu
+        AppMode::Help | AppMode::EntryDetail | AppMode::ProcessDetail | AppMode::CopyMenu
     ) {
         return;
     }

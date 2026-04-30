@@ -21,22 +21,11 @@ use super::viewport::{self, ScrollState, new_entries_since_pin};
 use crate::log::LogEntry;
 
 /// Render a single frame. Draws the sidebar (left), log viewer (right), and
-/// status bar (bottom). In TaskPicker mode, renders the picker full-screen instead.
+/// status bar (bottom). Picker and quit-confirmation are layered overlays.
 pub fn render_frame(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     state: &mut AppState,
 ) -> io::Result<()> {
-    // Task picker mode gets its own full-screen rendering path
-    if state.mode == AppMode::TaskPicker {
-        terminal.draw(|frame| {
-            let area = frame.area();
-            if let Some(ref mut picker_state) = state.picker {
-                picker::render_picker(frame, area, picker_state);
-            }
-        })?;
-        return Ok(());
-    }
-
     terminal.draw(|frame| {
         let area = frame.area();
 
@@ -206,14 +195,19 @@ pub fn render_frame(
 
         // -- Status bar (always visible) --
         {
-            let mode_text = match state.mode {
-                AppMode::TaskPicker => "PICKER",
-                AppMode::Normal | AppMode::Help => "NORMAL",
-                AppMode::FilterInput => "FILTER",
-                AppMode::SearchInput => "SEARCH",
-                AppMode::EntryDetail => "DETAIL",
-                AppMode::ProcessDetail => "PROCESS",
-                AppMode::CopyMenu => "COPY",
+            let mode_text = if state.picker_open {
+                "PICKER"
+            } else if state.quit_confirm {
+                "QUIT?"
+            } else {
+                match state.mode {
+                    AppMode::Normal | AppMode::Help => "NORMAL",
+                    AppMode::FilterInput => "FILTER",
+                    AppMode::SearchInput => "SEARCH",
+                    AppMode::EntryDetail => "DETAIL",
+                    AppMode::ProcessDetail => "PROCESS",
+                    AppMode::CopyMenu => "COPY",
+                }
             };
 
             let focus_text = if state.sidebar.focused {
@@ -253,8 +247,8 @@ pub fn render_frame(
                 Style::default().fg(THEME.dim),
             ));
 
-            // Source filter indicator
-            if !state.source_filter.is_empty() {
+            // Source filter indicator (focus + manual hides composed).
+            if !state.focus_filter.is_empty() || !state.hidden_sources.is_empty() {
                 let hidden_count = state.sidebar_entries.iter().filter(|e| !e.visible).count();
                 if hidden_count > 0 {
                     spans.push(Span::raw(" "));
@@ -320,6 +314,18 @@ pub fn render_frame(
         // -- Process detail overlay --
         if state.mode == AppMode::ProcessDetail {
             render_process_detail(frame, area, state);
+        }
+
+        // -- Task picker overlay (decisions 1 + 8) --
+        if state.picker_open
+            && let Some(ref mut picker_state) = state.picker
+        {
+            render_picker_overlay(frame, area, picker_state);
+        }
+
+        // -- Quit-confirmation overlay (decision 7) --
+        if state.quit_confirm {
+            render_quit_confirm(frame, area);
         }
 
         // -- Notifications (top of log area, auto-dismiss) --
@@ -441,12 +447,16 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         ]),
         Line::from(""),
         Line::from(vec![
+            Span::raw("  t      "),
+            Span::styled("Open task picker (re-entrant)", desc),
+        ]),
+        Line::from(vec![
             Span::raw("  r      "),
             Span::styled("Restart task", desc),
         ]),
         Line::from(vec![
             Span::raw("  q      "),
-            Span::styled("Quit", desc),
+            Span::styled("Quit (prompts if tasks running)", desc),
         ]),
         Line::from(vec![
             Span::raw("  ?      "),
@@ -535,6 +545,82 @@ fn render_copy_menu(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         .wrap(Wrap { trim: false });
 
     frame.render_widget(menu_paragraph, popup_area);
+}
+
+/// Render the task picker as a centered overlay covering most of the
+/// screen. The Normal-mode shell (sidebar, log pane, status bar) stays
+/// visible behind it (decisions 1 + 8).
+fn render_picker_overlay(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    picker: &mut super::picker::PickerState,
+) {
+    use ratatui::widgets::Clear;
+
+    // Picker takes ~80% of width and height, capped at sensible bounds,
+    // centered. Leaves the shell visible at the edges.
+    let picker_width = ((area.width as u32 * 80 / 100) as u16).clamp(40, 100);
+    let picker_height = ((area.height as u32 * 80 / 100) as u16).clamp(10, 40);
+    let picker_width = picker_width.min(area.width);
+    let picker_height = picker_height.min(area.height);
+
+    let x = area.width.saturating_sub(picker_width) / 2;
+    let y = area.height.saturating_sub(picker_height) / 2;
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + x,
+        area.y + y,
+        picker_width,
+        picker_height,
+    );
+
+    frame.render_widget(Clear, popup_area);
+    picker::render_picker(frame, popup_area, picker);
+}
+
+/// Render the quit-confirmation modal (decision 7). Only shown when
+/// `q` is pressed while running tasks exist.
+fn render_quit_confirm(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    use ratatui::widgets::{Borders, Clear, Wrap};
+
+    let desc = Style::default().fg(THEME.dim);
+    let modal_text = vec![
+        Line::from(Span::styled(
+            "Tasks still running.",
+            Style::default()
+                .fg(THEME.level_warn)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("Quit anyway? [y/N]", desc)),
+    ];
+
+    let modal_height = (modal_text.len() + 2) as u16;
+    let modal_width = 36u16;
+
+    let x = area.width.saturating_sub(modal_width) / 2;
+    let y = area.height.saturating_sub(modal_height) / 2;
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + x,
+        area.y + y,
+        modal_width.min(area.width),
+        modal_height.min(area.height),
+    );
+
+    frame.render_widget(Clear, popup_area);
+
+    let modal_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(THEME.level_warn))
+        .title(Span::styled(
+            " Quit ",
+            Style::default().fg(THEME.level_warn),
+        ));
+
+    let modal_paragraph = Paragraph::new(modal_text)
+        .block(modal_block)
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(modal_paragraph, popup_area);
 }
 
 /// Render the entry detail overlay showing all fields of the focused log entry.

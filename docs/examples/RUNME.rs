@@ -9,7 +9,11 @@ fn setup(ctx: &mut InitContext) {
 #[rnme::task]
 async fn ticker(ctx: &TaskContext) -> TaskResult {
     info!("starting ticker");
-    ctx.spawn("bash -c 'i=0; while true; do echo \"tick $i\"; i=$((i+1)); sleep 1; done'").await?;
+    let _h = ctx.spawn("bash -c 'i=0; while true; do echo \"tick $i\"; i=$((i+1)); sleep 1; done'").await?;
+    // Process lives as long as `_h` is alive — i.e., until the task
+    // body returns or is cancelled. Wait for cancellation so the
+    // ticker keeps running until the user kills the task.
+    ctx.cancellation_signal().await;
     Ok(())
 }
 
@@ -17,10 +21,12 @@ async fn ticker(ctx: &TaskContext) -> TaskResult {
 #[rnme::task]
 async fn multi(ctx: &TaskContext) -> TaskResult {
     info!("spawning 3 processes");
-    ctx.spawn(Cmd::from("bash -c 'while true; do echo \"[fast] $(date +%T)\"; sleep 0.5; done'").label("fast")).await?;
-    ctx.spawn(Cmd::from("bash -c 'while true; do echo \"[slow] $(date +%T)\"; sleep 2; done'").label("slow")).await?;
-    ctx.spawn(Cmd::from("bash -c 'for i in $(seq 1 5); do echo \"[finite] step $i\"; sleep 1; done; echo done'").label("finite")).await?;
+    let _fast = ctx.spawn(Cmd::from("bash -c 'while true; do echo \"[fast] $(date +%T)\"; sleep 0.5; done'").label("fast")).await?;
+    let _slow = ctx.spawn(Cmd::from("bash -c 'while true; do echo \"[slow] $(date +%T)\"; sleep 2; done'").label("slow")).await?;
+    let _finite = ctx.spawn(Cmd::from("bash -c 'for i in $(seq 1 5); do echo \"[finite] step $i\"; sleep 1; done; echo done'").label("finite")).await?;
 
+    // Hold the handles alive until the task is cancelled.
+    ctx.cancellation_signal().await;
     Ok(())
 }
 
@@ -33,7 +39,8 @@ async fn json_logs(ctx: &TaskContext) -> TaskResult {
             sleep 1
         done
     "#;
-    ctx.spawn(cmd!(bash -c {script})).await?;
+    let _h = ctx.spawn(cmd!(bash -c {script})).await?;
+    ctx.cancellation_signal().await;
     Ok(())
 }
 

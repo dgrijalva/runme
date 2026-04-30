@@ -98,8 +98,17 @@ async fn invoke_other(ctx: &TaskContext) -> TaskResult {
 
 /// A task that spawns a long-running process and returns immediately.
 /// Used to test that stop_all() cleans up spawned processes.
+///
+/// With the new ProcessHandle::Drop semantics (handle drop sends SIGTERM),
+/// we explicitly detach via `tokio::spawn` so the handle outlives the
+/// task body — exercising the `stop_all` cleanup path instead of the
+/// drop-kills path.
 #[rnme::task(desc = "Spawns a sleep process")]
 async fn spawn_sleeper(ctx: &TaskContext) -> TaskResult {
-    let _handle = ctx.spawn("sleep 300").await?;
+    let handle = ctx.spawn("sleep 300").await?;
+    tokio::spawn(async move {
+        let _h = handle;
+        std::future::pending::<()>().await;
+    });
     Ok(())
 }

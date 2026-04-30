@@ -281,7 +281,9 @@ pub enum PickerItem {
     Task(PickerTask),
 }
 
-/// Render the task picker full-screen.
+/// Render the task picker into the given area. Used by the frame as
+/// a centered overlay (decisions 1 + 8); the caller chooses the size
+/// and position.
 pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut PickerState) {
     // Ensure selection is within bounds and visible
     picker.ensure_visible(area.height as usize);

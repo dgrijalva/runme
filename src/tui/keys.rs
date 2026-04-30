@@ -16,14 +16,16 @@ use super::viewport::{
 /// Handle keys when sidebar is focused.
 pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
     match key.code {
-        // j / Down: move sidebar selection down
+        // j / Down: move sidebar selection down, re-deriving the focus filter.
         KeyCode::Char('j') | KeyCode::Down => {
             state.sidebar.move_down(state.sidebar_entries.len());
+            state.refresh_focus_filter();
         }
 
-        // k / Up: move sidebar selection up
+        // k / Up: move sidebar selection up, re-deriving the focus filter.
         KeyCode::Char('k') | KeyCode::Up => {
             state.sidebar.move_up();
+            state.refresh_focus_filter();
         }
 
         // Enter: open process detail (for process entries) or toggle source visibility (for task entry)
@@ -289,27 +291,27 @@ pub(super) fn handle_log_viewer_key(
     }
 }
 
-/// Handle keys when in task picker mode.
+/// Handle keys when the picker overlay is open.
 ///
-/// Returns `Some(task)` if the user selected a task, `None` otherwise.
-/// The caller (event loop) is responsible for launching the task.
+/// Picker is an overlay (decision 1 + 8): Esc closes the overlay
+/// without quitting; Ctrl-C still quits the entire TUI.
+/// Sets `state.pending_task` when the user picks a task; the event
+/// loop spawns it (the new task appears in the sidebar) and the
+/// overlay closes.
 pub(super) fn handle_picker_key(key: KeyEvent, state: &mut AppState) {
     match key.code {
-        // Esc or q: quit (no task to run)
-        KeyCode::Esc | KeyCode::Char('q') => {
-            if let Some(ref picker) = state.picker
-                && (picker.input.is_empty() || key.code == KeyCode::Esc)
-            {
-                state.running = false;
-            }
+        // Esc: close overlay without quitting.
+        KeyCode::Esc => {
+            state.close_picker();
         }
 
-        // Ctrl-C: quit
+        // Ctrl-C: quit the TUI entirely.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.running = false;
         }
 
-        // Enter: launch selected task
+        // Enter: launch selected task. Caller (event loop) spawns it via
+        // the engine; the overlay closes once the spawn completes.
         KeyCode::Enter => {
             if let Some(ref picker) = state.picker
                 && let Some(task) = picker.selected_task()
@@ -841,6 +843,24 @@ pub(super) fn navigate_to_entry(
     }
 }
 
+/// Handle keys in the quit-confirmation modal.
+///
+/// Design decision 7: prompted only when tasks are still running.
+/// `y` confirms (running -> false; the outer driver calls `engine.quit()`
+/// when the event loop exits). Anything else dismisses.
+pub(super) fn handle_quit_confirm_key(key: KeyEvent, state: &mut AppState) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            state.quit_confirm = false;
+            state.running = false;
+        }
+        // n / N / Esc / anything else dismisses.
+        _ => {
+            state.quit_confirm = false;
+        }
+    }
+}
+
 /// Handle keys in the copy menu overlay.
 pub(super) fn handle_copy_menu_key(key: KeyEvent, state: &mut AppState) {
     match key.code {
@@ -1097,6 +1117,7 @@ mod tests {
         ];
 
         let labels = HashMap::new();
+        // Press '2' — hides sidebar_entries[1] (api).
         handle_log_viewer_key(
             make_key_event(KeyCode::Char('2'), KeyModifiers::NONE),
             &mut state,
@@ -1105,15 +1126,15 @@ mod tests {
             80,
             &labels,
         );
-        assert!(state.source_filter.contains(&task_id));
-        assert!(!state.source_filter.contains(&api_id));
+        assert!(state.hidden_sources.contains(&api_id));
+        assert!(!state.hidden_sources.contains(&task_id));
     }
 
     #[test]
     fn a_key_shows_all() {
         let mut state = AppState::new();
-        state.source_filter.insert(TaskId(2));
-        assert!(!state.source_filter.is_empty());
+        state.hidden_sources.insert(TaskId(2));
+        assert!(!state.hidden_sources.is_empty());
 
         let labels = HashMap::new();
         handle_log_viewer_key(
@@ -1124,7 +1145,7 @@ mod tests {
             80,
             &labels,
         );
-        assert!(state.source_filter.is_empty());
+        assert!(state.hidden_sources.is_empty());
     }
 
     // -- Entry detail view tests --
@@ -1596,5 +1617,103 @@ mod tests {
         // Esc should reset the history index
         handle_filter_input_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
         assert!(state.filter_history_index.is_none());
+    }
+
+    // -- Picker overlay tests --
+
+    #[test]
+    fn picker_esc_closes_overlay_keeps_running() {
+        let mut state = AppState::new();
+        state.picker_open = true;
+        state.picker = Some(super::super::picker::PickerState::new(
+            &[],
+            &HashMap::new(),
+        ));
+        assert!(state.running);
+
+        handle_picker_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
+        assert!(!state.picker_open);
+        assert!(state.picker.is_none());
+        assert!(state.running, "Esc on picker must not quit the TUI");
+    }
+
+    #[test]
+    fn picker_q_does_not_quit() {
+        let mut state = AppState::new();
+        state.picker_open = true;
+        state.picker = Some(super::super::picker::PickerState::new(
+            &[],
+            &HashMap::new(),
+        ));
+
+        // 'q' in the picker is just an input character, not a quit.
+        handle_picker_key(
+            make_key_event(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(state.running, "q in picker must not quit");
+        assert!(state.picker_open, "q in picker must not close overlay");
+    }
+
+    #[test]
+    fn picker_ctrl_c_quits() {
+        let mut state = AppState::new();
+        state.picker_open = true;
+        state.picker = Some(super::super::picker::PickerState::new(
+            &[],
+            &HashMap::new(),
+        ));
+
+        handle_picker_key(
+            make_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &mut state,
+        );
+        assert!(!state.running);
+    }
+
+    // -- Quit-confirm modal tests --
+
+    #[test]
+    fn quit_confirm_y_quits() {
+        let mut state = AppState::new();
+        state.quit_confirm = true;
+        handle_quit_confirm_key(
+            make_key_event(KeyCode::Char('y'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(!state.quit_confirm);
+        assert!(!state.running);
+    }
+
+    #[test]
+    fn quit_confirm_uppercase_y_quits() {
+        let mut state = AppState::new();
+        state.quit_confirm = true;
+        handle_quit_confirm_key(
+            make_key_event(KeyCode::Char('Y'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(!state.running);
+    }
+
+    #[test]
+    fn quit_confirm_n_dismisses() {
+        let mut state = AppState::new();
+        state.quit_confirm = true;
+        handle_quit_confirm_key(
+            make_key_event(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(!state.quit_confirm);
+        assert!(state.running);
+    }
+
+    #[test]
+    fn quit_confirm_esc_dismisses() {
+        let mut state = AppState::new();
+        state.quit_confirm = true;
+        handle_quit_confirm_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
+        assert!(!state.quit_confirm);
+        assert!(state.running);
     }
 }

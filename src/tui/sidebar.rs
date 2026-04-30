@@ -86,9 +86,14 @@ pub struct SidebarEntry {
 
 /// Build the list of sidebar entries from the engine's graph snapshot.
 ///
-/// Lists every direct child of `TaskId::ROOT` as a top-level task, with its
-/// processes nested under it (running first, then completed). The synthetic
-/// root itself is not rendered.
+/// First entry is always the synthetic "All tasks" row whose source is
+/// `snapshot.root` — selecting it focuses the root and drives the
+/// unfiltered log view (design decision 2). Subsequent entries are
+/// direct children of root with their processes and descendant tasks
+/// nested below.
+///
+/// `visible_sources` is the *effective* set after composing focus +
+/// hidden manual toggles — used to dim entries hidden from the log view.
 pub fn build_sidebar_entries_from_graph(
     snapshot: &GraphSnapshot,
     visible_sources: &HashSet<TaskId>,
@@ -96,15 +101,27 @@ pub fn build_sidebar_entries_from_graph(
 ) -> Vec<SidebarEntry> {
     let mut entries = Vec::new();
 
-    // Walk children of root in deterministic order: order in `children`
-    // reflects spawn order, which is what users expect.
     let Some(root) = snapshot.tasks.get(&snapshot.root) else {
         return entries;
     };
 
-    // Recursive walk so descendant tasks (`ctx.run` children) appear under
-    // their parent at depth+1, processes at depth+2. For now we keep depth
-    // at 0/1 — multi-level nesting is a downstream UX pass.
+    // Synthetic "All tasks" row — static label per design decision 2:
+    // no status tag, no count, no indent. The renderer treats it as
+    // a heading (no visibility marker, blank row after it).
+    entries.push(SidebarEntry {
+        name: "All tasks".to_string(),
+        source: snapshot.root,
+        status_tag: String::new(),
+        status_color: THEME.dim,
+        visible: true,
+        is_task: true,
+        depth: 0,
+    });
+
+    // Direct children of root render flush left as peers of "All tasks"
+    // (depth 0). The graph still parents them under root structurally;
+    // the visual nesting is purely a sidebar choice. Descendant tasks
+    // (`ctx.run` children) and their processes nest at depth+1.
     for &child_id in &root.children {
         push_task_subtree(snapshot, child_id, 0, visible_sources, source_colors, &mut entries);
     }
@@ -200,15 +217,12 @@ pub fn render_sidebar(
     state: &SidebarState,
     source_colors: &mut SourceColors,
 ) {
+    // No header title — "All tasks" is the first entry and serves as
+    // the sidebar's heading (decision: drop the multi-task-meaningless
+    // "processes" label).
     let block = Block::default()
         .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(THEME.border))
-        .title(Span::styled(
-            " processes ",
-            Style::default()
-                .fg(if state.focused { THEME.accent } else { THEME.dim })
-                .add_modifier(Modifier::BOLD),
-        ));
+        .border_style(Style::default().fg(THEME.border));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -225,13 +239,63 @@ pub fn render_sidebar(
     let mut lines: Vec<Line<'static>> = Vec::new();
     let base_overhead = 12_u16;
 
+    let root_source = entries.first().map(|e| e.source);
+
     for (i, entry) in entries.iter().enumerate() {
-        let is_selected = state.focused && i == state.selection;
+        // `is_marked`: this index is the sidebar's selection — drives
+        // the `>` arrow. Visible regardless of focus so the user sees
+        // which entry drives the log filter even when the log pane has
+        // focus.
+        // `is_active`: full selection highlight (background) — only when
+        // the sidebar itself has keyboard focus.
+        let is_marked = i == state.selection;
+        let is_active = state.focused && is_marked;
+        let is_all_tasks_row = Some(entry.source) == root_source && i == 0;
+
+        // "All tasks" is a heading: flush-left, no visibility marker,
+        // followed by a blank row (decision: it's not a toggleable
+        // source, just the root-focus shortcut).
+        if is_all_tasks_row {
+            let name_fg = if is_marked {
+                // Same accent whether sidebar is active or just marked —
+                // the bg fill (`is_active` patch below) carries the
+                // additional "actively focused" hint.
+                THEME.accent
+            } else {
+                THEME.dim
+            };
+            let name_style = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
+            let prefix = if is_marked { "> " } else { "  " };
+            let prefix_style = if is_marked {
+                Style::default().fg(THEME.accent)
+            } else {
+                Style::default().fg(THEME.dim)
+            };
+
+            let mut spans = vec![
+                Span::styled(prefix.to_string(), prefix_style),
+                Span::styled(entry.name.clone(), name_style),
+            ];
+            // Pad to width so selection highlight fills the row.
+            let used = prefix.len() + entry.name.len();
+            if used < inner.width as usize {
+                spans.push(Span::raw(" ".repeat(inner.width as usize - used)));
+            }
+            let mut line = Line::from(spans);
+            if is_active {
+                line = line.patch_style(Style::default().bg(THEME.selection_bg));
+            }
+            lines.push(line);
+            // Blank separator row before the actual tasks.
+            lines.push(Line::from(""));
+            continue;
+        }
+
         let indent_width = entry.depth * 2;
         let indent = " ".repeat(indent_width);
         let max_name_width =
             inner.width.saturating_sub(base_overhead + indent_width as u16) as usize;
-        let prefix = if is_selected { "> " } else { "  " };
+        let prefix = if is_marked { "> " } else { "  " };
         let name_color = source_colors.color_for(entry.source);
         let name_style = if !entry.visible {
             Style::default().fg(THEME.dim)
@@ -245,7 +309,11 @@ pub fn render_sidebar(
         } else {
             entry.name.clone()
         };
-        let tag = format!("[{}]", entry.status_tag);
+        let tag = if entry.status_tag.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", entry.status_tag)
+        };
         let used = prefix.len() + indent_width + 2 + display_name.len() + tag.len();
         let padding = if used < inner.width as usize {
             " ".repeat(inner.width as usize - used)
@@ -267,7 +335,7 @@ pub fn render_sidebar(
         let mut spans = Vec::new();
         spans.push(Span::styled(
             prefix.to_string(),
-            if is_selected {
+            if is_marked {
                 Style::default().fg(THEME.accent)
             } else {
                 Style::default().fg(THEME.dim)
@@ -291,7 +359,7 @@ pub fn render_sidebar(
         }
 
         let mut line = Line::from(spans);
-        if is_selected {
+        if is_active {
             line = line.patch_style(Style::default().bg(THEME.selection_bg));
         }
         lines.push(line);
@@ -403,12 +471,37 @@ mod tests {
     }
 
     #[test]
-    fn build_entries_empty() {
+    fn build_entries_empty_when_no_root() {
         let mut sc = SourceColors::new();
         let snap = GraphSnapshot::default();
         let entries =
             build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
+        // Default snapshot has no root entry => no entries at all.
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn build_entries_just_all_tasks_when_root_has_no_children() {
+        let mut sc = SourceColors::new();
+        let root = TaskNode {
+            id: TaskId::ROOT,
+            name: "<root>".to_string(),
+            parent: None,
+            children: Vec::new(),
+            status: TaskStatus::Setup,
+            processes: Vec::new(),
+        };
+        let mut map = std::collections::HashMap::new();
+        map.insert(TaskId::ROOT, root);
+        let snap = GraphSnapshot {
+            root: TaskId::ROOT,
+            tasks: Arc::new(map),
+        };
+        let entries = build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "All tasks");
+        assert_eq!(entries[0].source, TaskId::ROOT);
+        assert_eq!(entries[0].depth, 0);
     }
 
     #[test]
@@ -417,11 +510,29 @@ mod tests {
         let id = TaskId(7);
         let snap = snap_with_one_task(id, "my-task", TaskStatus::Setup);
         let entries = build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
-        assert_eq!(entries.len(), 1);
+        // First entry is "All tasks", second is the actual task at depth 0
+        // (peer of "All tasks" visually; the synthetic root header is
+        // flush left and the task appears flush left below it).
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "All tasks");
+        assert_eq!(entries[0].source, TaskId::ROOT);
+        assert!(entries[1].is_task);
+        assert_eq!(entries[1].name, "my-task");
+        assert_eq!(entries[1].status_tag, "SETUP");
+        assert_eq!(entries[1].source, id);
+        assert_eq!(entries[1].depth, 0);
+    }
+
+    #[test]
+    fn all_tasks_entry_is_first() {
+        let mut sc = SourceColors::new();
+        let id = TaskId(7);
+        let snap = snap_with_one_task(id, "my-task", TaskStatus::Ready);
+        let entries = build_sidebar_entries_from_graph(&snap, &HashSet::new(), &mut sc);
+        assert_eq!(entries[0].source, TaskId::ROOT);
+        assert_eq!(entries[0].name, "All tasks");
+        assert!(entries[0].status_tag.is_empty());
         assert!(entries[0].is_task);
-        assert_eq!(entries[0].name, "my-task");
-        assert_eq!(entries[0].status_tag, "SETUP");
-        assert_eq!(entries[0].source, id);
     }
 
     #[test]
@@ -497,6 +608,9 @@ mod tests {
         let mut visible = HashSet::new();
         visible.insert(TaskId(99));
         let entries = build_sidebar_entries_from_graph(&snap, &visible, &mut sc);
-        assert!(!entries[0].visible);
+        // entries[0] is "All tasks" (always visible).
+        // entries[1] is the actual task — should be dimmed.
+        assert_eq!(entries.len(), 2);
+        assert!(!entries[1].visible);
     }
 }
