@@ -146,33 +146,33 @@ pub fn kitchen_sink_runme() -> &'static str {
     r#"use rnme::prelude::*;
 
 /// A task that succeeds.
-#[rnme::task(desc = "Always succeeds")]
+#[rnme::task]
 async fn succeed(_ctx: &TaskContext) -> TaskResult {
     Ok(())
 }
 
 /// A task that fails with exit code 42.
-#[rnme::task(desc = "Fails with code 42")]
+#[rnme::task]
 async fn fail_with_code(_ctx: &TaskContext) -> TaskResult {
     Err(TaskError::from("intentional failure").with_code(42))
 }
 
 /// A task that takes arguments and logs them.
-#[rnme::task(desc = "Echoes arguments")]
+#[rnme::task]
 async fn echo_args(_ctx: &TaskContext, message: String, count: Option<u32>) -> TaskResult {
     info!("message={}, count={:?}", message, count);
     Ok(())
 }
 
 /// A task that produces stdout output via ctx.exec().
-#[rnme::task(desc = "Produces output")]
+#[rnme::task]
 async fn produce_output(ctx: &TaskContext) -> TaskResult {
     ctx.exec("echo hello-from-produce-output").await?.ok()?;
     Ok(())
 }
 
 /// A task that fails with default exit code.
-#[rnme::task(desc = "Fails with default code")]
+#[rnme::task]
 async fn fail_default(_ctx: &TaskContext) -> TaskResult {
     Err("default failure".into())
 }
@@ -183,7 +183,8 @@ async fn fail_default(_ctx: &TaskContext) -> TaskResult {
 pub fn minimal_runme() -> &'static str {
     r#"use rnme::prelude::*;
 
-#[rnme::task(desc = "Minimal success task")]
+/// Minimal success task
+#[rnme::task]
 async fn hello(_ctx: &TaskContext) -> TaskResult {
     Ok(())
 }
@@ -196,7 +197,8 @@ async fn hello(_ctx: &TaskContext) -> TaskResult {
 pub fn sub_dir_runme() -> &'static str {
     r#"use rnme::prelude::*;
 
-#[rnme::task(desc = "A task in a subdirectory")]
+/// A task in a subdirectory
+#[rnme::task]
 async fn sub_task(_ctx: &TaskContext) -> TaskResult {
     info!("running sub_task");
     Ok(())

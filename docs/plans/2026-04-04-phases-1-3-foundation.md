@@ -182,7 +182,8 @@ Implement two attribute macros:
 
 Input:
 ```rust
-#[runme::task(desc = "Build the project", watch = "src/**/*.rs")]
+/// Build the project
+#[runme::task(watch = "src/**/*.rs")]
 fn build(ctx: &TaskContext) {
     // user code
 }
@@ -261,12 +262,14 @@ Create `examples/RUNME.rs`:
 ```rust
 use runme::prelude::*;
 
-#[runme::task(desc = "Say hello")]
+/// Say hello
+#[runme::task]
 fn hello(ctx: &TaskContext) {
     println!("Hello from task: {}", ctx.name);
 }
 
-#[runme::task(desc = "Say goodbye")]
+/// Say goodbye
+#[runme::task]
 fn goodbye(ctx: &TaskContext) {
     println!("Goodbye from task: {}", ctx.name);
 }
@@ -745,12 +748,14 @@ Validate the end-to-end flow: discovery + compilation + process management worki
 
    use runme::prelude::*;
 
-   #[runme::task(desc = "Run echo")]
+   /// Run echo
+   #[runme::task]
    async fn echo(ctx: &TaskContext) {
        ctx.exec("echo 'Hello from runme!'").await.unwrap();
    }
 
-   #[runme::task(desc = "Run a background process")]
+   /// Run a background process
+   #[runme::task]
    async fn background(ctx: &TaskContext) {
        let handle = ctx.spawn("sleep 5").await.unwrap();
        println!("Process spawned, stopping...");
@@ -804,7 +809,7 @@ validation:
 
 - **TaskError design**: struct with `serde_json::Value` output + `ExitHint` enum. Blanket `From<Serialize>` for easy construction, `ResultExt::task_err()` for std error types. TaskError intentionally never implements Serialize or std::error::Error.
 - **ExecResult → ExecOutput**: Renamed, dropped exit_code field. Non-zero exit is now `ProcessError::ExitCode { code, output }`. `ExecOutputExt` trait provides `.output()` on `Result<ExecOutput, ProcessError>` to access captured output regardless of success/failure.
-- **Doc comments as descriptions**: `#[runme::task]` extracts `///` doc comments as task description, falling back to `desc = "..."` attribute.
+- **Doc comments as descriptions**: `#[runme::task]` extracts `///` doc comments as the task description. Doc comments are the only source — there is no `desc =` attribute fallback.
 - **RUNME.rs build mode**: Debug (not release) — task runner scripts don't need runtime optimization.
 - **Output streaming**: Not yet implemented. `ctx.exec()` captures into buffers but nothing streams to terminal. This is the bridge to Phase 5 (log engine). The `install` task currently produces no visible output.
 - **Command API**: New section added to system_design.md — `Cmd` type as a value describing a process, with shell string convenience path and `std::process::Command` conversion.

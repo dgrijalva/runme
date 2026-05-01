@@ -13,7 +13,8 @@ const __RNME_GROUP: &str = "";
 // Form 1: Zero args
 // ============================================================
 
-#[rnme::task(desc = "A zero-arg task")]
+/// A zero-arg task
+#[rnme::task]
 async fn zero_arg_task(ctx: &TaskContext) -> TaskResult {
     info!("running zero_arg_task: {}", ctx.name);
     Ok(())
@@ -40,7 +41,8 @@ async fn test_zero_arg_metadata_is_none() {
 // Form 2: Simple args — multiple params
 // ============================================================
 
-#[rnme::task(desc = "A task with simple args")]
+/// A task with simple args
+#[rnme::task]
 async fn simple_args_task(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
     info!(
         "simple_args_task: env={}, port={}, verbose={}",
@@ -119,7 +121,8 @@ async fn test_simple_args_metadata_returns_command() {
 // Form 2: Simple args — single primitive param
 // ============================================================
 
-#[rnme::task(desc = "A task with a single string arg")]
+/// A task with a single string arg
+#[rnme::task]
 async fn single_string_task(ctx: &TaskContext, name: String) -> TaskResult {
     info!("single_string_task: name={}", name);
     let _ = ctx;
@@ -147,7 +150,8 @@ async fn test_single_string_metadata() {
 // Form 2: Simple args — Optional and Vec params
 // ============================================================
 
-#[rnme::task(desc = "A task with optional and vec args")]
+/// A task with optional and vec args
+#[rnme::task]
 async fn optional_vec_task(
     ctx: &TaskContext,
     label: String,
@@ -190,7 +194,8 @@ async fn test_optional_absent() {
 // Form 2: Underscore-to-dash conversion
 // ============================================================
 
-#[rnme::task(desc = "A task with underscored param names")]
+/// A task with underscored param names
+#[rnme::task]
 async fn underscore_task(ctx: &TaskContext, my_flag: bool, my_value: String) -> TaskResult {
     info!(
         "underscore_task: my_flag={}, my_value={}",
@@ -222,7 +227,8 @@ struct DeployArgs {
     port: u16,
 }
 
-#[rnme::task(desc = "A task with a parser struct")]
+/// A task with a parser struct
+#[rnme::task]
 async fn parser_struct_task(ctx: &TaskContext, args: DeployArgs) -> TaskResult {
     info!("parser_struct_task: env={}, port={}", args.env, args.port);
     let _ = ctx;

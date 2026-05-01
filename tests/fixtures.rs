@@ -16,19 +16,19 @@ const __RNME_GROUP: &str = "";
 // ============================================================
 
 /// A task that succeeds immediately.
-#[rnme::task(desc = "Returns Ok(())")]
+#[rnme::task]
 async fn succeed(_ctx: &TaskContext) -> TaskResult {
     Ok(())
 }
 
 /// A task that fails with the default exit code (1).
-#[rnme::task(desc = "Returns Err with default exit code")]
+#[rnme::task]
 async fn fail_default(_ctx: &TaskContext) -> TaskResult {
     Err("task failed".into())
 }
 
 /// A task that fails with a specific exit code (42).
-#[rnme::task(desc = "Returns Err with exit code 42")]
+#[rnme::task]
 async fn fail_with_code(_ctx: &TaskContext) -> TaskResult {
     Err(TaskError::from("task failed with code 42").with_code(42))
 }
@@ -38,7 +38,7 @@ async fn fail_with_code(_ctx: &TaskContext) -> TaskResult {
 // ============================================================
 
 /// A task that logs its arguments via info!().
-#[rnme::task(desc = "Logs arguments")]
+#[rnme::task]
 async fn echo_args(_ctx: &TaskContext, message: String) -> TaskResult {
     info!("echo_args: message={}", message);
     Ok(())
@@ -49,14 +49,14 @@ async fn echo_args(_ctx: &TaskContext, message: String) -> TaskResult {
 // ============================================================
 
 /// A task that uses ctx.exec() to run a simple command.
-#[rnme::task(desc = "Runs echo via ctx.exec()")]
+#[rnme::task]
 async fn spawn_echo(ctx: &TaskContext) -> TaskResult {
     ctx.exec("echo hello from spawn_echo").await?.ok()?;
     Ok(())
 }
 
 /// A task that tries to exec a nonexistent command.
-#[rnme::task(desc = "Tries to run a nonexistent command")]
+#[rnme::task]
 async fn fail_spawn(ctx: &TaskContext) -> TaskResult {
     let result = ctx.exec("__nonexistent_command_12345").await;
     match result {
@@ -73,7 +73,7 @@ async fn fail_spawn(ctx: &TaskContext) -> TaskResult {
 // ============================================================
 
 /// A task that emits messages at multiple log levels.
-#[rnme::task(desc = "Emits info, warn, error")]
+#[rnme::task]
 async fn log_levels(_ctx: &TaskContext) -> TaskResult {
     info!("info message from log_levels");
     warn!("warn message from log_levels");
@@ -86,7 +86,7 @@ async fn log_levels(_ctx: &TaskContext) -> TaskResult {
 // ============================================================
 
 /// A task that invokes the "succeed" task via ctx.run().
-#[rnme::task(desc = "Invokes another task")]
+#[rnme::task]
 async fn invoke_other(ctx: &TaskContext) -> TaskResult {
     ctx.run("succeed", &[]).await?;
     Ok(())
@@ -103,12 +103,34 @@ async fn invoke_other(ctx: &TaskContext) -> TaskResult {
 /// we explicitly detach via `tokio::spawn` so the handle outlives the
 /// task body — exercising the `stop_all` cleanup path instead of the
 /// drop-kills path.
-#[rnme::task(desc = "Spawns a sleep process")]
+#[rnme::task]
 async fn spawn_sleeper(ctx: &TaskContext) -> TaskResult {
     let handle = ctx.spawn("sleep 300").await?;
     tokio::spawn(async move {
         let _h = handle;
         std::future::pending::<()>().await;
     });
+    Ok(())
+}
+
+// ============================================================
+// UI mode hints (mode = cli|tui via macro attr)
+// ============================================================
+
+/// Mode hint: cli (bare ident).
+#[rnme::task(mode = cli)]
+async fn mode_hint_cli(_ctx: &TaskContext) -> TaskResult {
+    Ok(())
+}
+
+/// Mode hint: tui (bare ident).
+#[rnme::task(mode = tui)]
+async fn mode_hint_tui(_ctx: &TaskContext) -> TaskResult {
+    Ok(())
+}
+
+/// Mode hint: cli (string literal).
+#[rnme::task(mode = "cli")]
+async fn mode_hint_cli_str(_ctx: &TaskContext) -> TaskResult {
     Ok(())
 }

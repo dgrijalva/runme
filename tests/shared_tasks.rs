@@ -35,7 +35,8 @@
 //!
 //! const __RNME_GROUP: &str = "my_group";
 //!
-//! #[rnme::task(desc = "A reusable task")]
+//! /// A reusable task
+//! #[rnme::task]
 //! async fn my_task(ctx: &TaskContext) -> TaskResult {
 //!     // ...
 //!     Ok(())
@@ -187,7 +188,8 @@ async fn test_shared_task_arg_metadata() {
 
 const __RNME_GROUP: &str = "";
 
-#[rnme::task(desc = "A local task in the test binary")]
+/// A local task in the test binary
+#[rnme::task]
 async fn local_test_task(ctx: &TaskContext) -> TaskResult {
     info!("local_test_task: {}", ctx.name);
     Ok(())

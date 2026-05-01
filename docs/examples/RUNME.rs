@@ -194,7 +194,7 @@ async fn concurrent(ctx: &TaskContext) -> TaskResult {
 ///
 /// Each parameter becomes a CLI flag:
 ///   rnme deploy --env staging --port 8080 --verbose
-#[rnme::task(desc = "Deploy to an environment")]
+#[rnme::task]
 async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
     info!("Deploying to {} on port {} (verbose: {})", env, port, verbose);
     if verbose {
@@ -223,7 +223,7 @@ struct GreetArgs {
 ///
 /// Usage:
 ///   rnme greet --name world --count 3
-#[rnme::task(desc = "Greet someone by name")]
+#[rnme::task]
 async fn greet(ctx: &TaskContext, args: GreetArgs) -> TaskResult {
     for i in 0..args.count {
         ctx.println(format!("[{}/{}] Hello, {}!", i + 1, args.count, args.name)).await;
@@ -235,7 +235,7 @@ async fn greet(ctx: &TaskContext, args: GreetArgs) -> TaskResult {
 ///
 /// Uses `ctx.tasks()` to discover tasks matching a glob pattern, then
 /// `ctx.run()` to invoke each one.
-#[rnme::task(desc = "Run all test tasks")]
+#[rnme::task]
 async fn test_all(ctx: &TaskContext) -> TaskResult {
     if let Some(query) = ctx.tasks() {
         let test_tasks = query.matching("*:test");
@@ -258,7 +258,7 @@ async fn test_all(ctx: &TaskContext) -> TaskResult {
 /// `ready_on_port` blocks the spawn until the server is actually listening,
 /// `ready_timeout` bounds how long to wait for that probe, and `timeout`
 /// hard-kills the process if it overstays its welcome.
-#[rnme::task(desc = "Demo: readiness probe and process timeout")]
+#[rnme::task]
 async fn server_ready(ctx: &TaskContext) -> TaskResult {
     use std::time::Duration;
     info!("starting server; waiting for port 8765");
@@ -276,7 +276,7 @@ async fn server_ready(ctx: &TaskContext) -> TaskResult {
 ///
 /// Each step is an RAII guard: when the guard is dropped the step is recorded
 /// as complete (or failed, if `step.fail()` was called).
-#[rnme::task(desc = "Run a multi-phase pipeline")]
+#[rnme::task]
 async fn pipeline(ctx: &TaskContext) -> TaskResult {
     {
         let _step = ctx.begin_step("compile");

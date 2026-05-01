@@ -133,6 +133,42 @@ fn test_resolve_ui_mode_default_no_terminal() {
 }
 
 // ============================================================
+// #[task(mode = ...)] attribute → TaskDef::ui_hint
+// ============================================================
+
+/// `mode = cli` (bare ident) sets ui_hint to Cli.
+#[test]
+fn test_task_attr_mode_cli_ident() {
+    let reg = Registry::from_inventory();
+    let task = reg.get("mode_hint_cli").expect("fixture exists");
+    assert!(matches!(task.ui_hint, Some(UiHint::Cli)));
+}
+
+/// `mode = tui` (bare ident) sets ui_hint to Tui.
+#[test]
+fn test_task_attr_mode_tui_ident() {
+    let reg = Registry::from_inventory();
+    let task = reg.get("mode_hint_tui").expect("fixture exists");
+    assert!(matches!(task.ui_hint, Some(UiHint::Tui)));
+}
+
+/// `mode = "cli"` (string literal) also accepted.
+#[test]
+fn test_task_attr_mode_cli_string() {
+    let reg = Registry::from_inventory();
+    let task = reg.get("mode_hint_cli_str").expect("fixture exists");
+    assert!(matches!(task.ui_hint, Some(UiHint::Cli)));
+}
+
+/// Tasks without the `mode` attr have no ui_hint.
+#[test]
+fn test_task_attr_no_mode_is_none() {
+    let reg = Registry::from_inventory();
+    let task = reg.get("succeed").expect("fixture exists");
+    assert!(task.ui_hint.is_none());
+}
+
+// ============================================================
 // Priority 2: Init hooks
 // ============================================================
 
@@ -215,7 +251,7 @@ async fn wait_terminal(
 
 /// Cross-task invocation where inner task fails should propagate the error.
 /// Define a helper task that calls fail_default via ctx.run().
-#[rnme::task(desc = "Invokes a failing task")]
+#[rnme::task]
 async fn invoke_failing(ctx: &TaskContext) -> TaskResult {
     ctx.run("fail_default", &[]).await?;
     Ok(())
@@ -332,25 +368,28 @@ async fn test_exec_nonexistent_command() {
 // Task discovery + invocation (ctx.tasks() → ctx.run())
 // ============================================================
 
-#[rnme::task(desc = "Step A")]
+/// Step A
+#[rnme::task]
 async fn step_a(_ctx: &TaskContext) -> TaskResult {
     info!("step_a ran");
     Ok(())
 }
 
-#[rnme::task(desc = "Step B")]
+/// Step B
+#[rnme::task]
 async fn step_b(_ctx: &TaskContext) -> TaskResult {
     info!("step_b ran");
     Ok(())
 }
 
-#[rnme::task(desc = "Step C — fails")]
+/// Step C — fails
+#[rnme::task]
 async fn step_c(_ctx: &TaskContext) -> TaskResult {
     Err("step_c failed".into())
 }
 
 /// Discovers tasks matching "step_*", runs each, collects results.
-#[rnme::task(desc = "Run all steps")]
+#[rnme::task]
 async fn run_discovered_steps(ctx: &TaskContext) -> TaskResult {
     let query = ctx.tasks().expect("registry should be injected");
     let steps = query.matching("step_*");
@@ -397,7 +436,7 @@ async fn test_discover_and_run_tasks() {
 }
 
 /// Discovers tasks matching a pattern and runs only the ones that match.
-#[rnme::task(desc = "Run matching steps selectively")]
+#[rnme::task]
 async fn run_matching_steps(ctx: &TaskContext) -> TaskResult {
     let query = ctx.tasks().expect("registry should be injected");
 

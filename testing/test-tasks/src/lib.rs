@@ -20,23 +20,23 @@ use rnme::prelude::*;
 /// Group name for tasks in this shared crate.
 const __RNME_GROUP: &str = "shared";
 
-/// A simple task that always succeeds.
-#[rnme::task(desc = "A shared task that greets")]
+/// A shared task that greets
+#[rnme::task]
 async fn greet(ctx: &TaskContext) -> TaskResult {
     info!("hello from shared greet task: {}", ctx.name);
     Ok(())
 }
 
-/// A task with arguments to test cross-crate arg handling.
-#[rnme::task(desc = "A shared task with args")]
+/// A shared task with args
+#[rnme::task]
 async fn shared_echo(ctx: &TaskContext, message: String) -> TaskResult {
     info!("shared_echo: message={}", message);
     let _ = ctx;
     Ok(())
 }
 
-/// A task in the shared group to verify group assignment.
-#[rnme::task(desc = "Reports its own group")]
+/// Reports its own group
+#[rnme::task]
 async fn group_check(ctx: &TaskContext) -> TaskResult {
     info!("group_check running in context: {}", ctx.name);
     Ok(())

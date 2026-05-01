@@ -172,11 +172,14 @@ fn extract_typed_param(arg: &FnArg) -> Result<(syn::Ident, syn::Type), syn::Erro
 /// injected by the code generator at compile time. For standalone usage (tests,
 /// examples), define `const __RNME_GROUP: &str = "";` manually.
 ///
+/// The task description is taken from the function's `///` doc comments.
+///
 /// # Three argument forms
 ///
 /// **Form 1: Zero args**
 /// ```ignore
-/// #[rnme::task(desc = "Build the project")]
+/// /// Build the project
+/// #[rnme::task]
 /// async fn build(ctx: &TaskContext) -> TaskResult {
 ///     ctx.exec("cargo build").await?.ok()?;
 ///     Ok(())
@@ -185,7 +188,8 @@ fn extract_typed_param(arg: &FnArg) -> Result<(syn::Ident, syn::Type), syn::Erro
 ///
 /// **Form 2: Simple args** (auto-generates clap from params)
 /// ```ignore
-/// #[rnme::task(desc = "Deploy to environment")]
+/// /// Deploy to environment
+/// #[rnme::task]
 /// async fn deploy(ctx: &TaskContext, env: String, port: u16, verbose: bool) -> TaskResult {
 ///     // env -> --env <value>, port -> --port <value>, verbose -> --verbose (flag)
 ///     Ok(())
@@ -200,7 +204,8 @@ fn extract_typed_param(arg: &FnArg) -> Result<(syn::Ident, syn::Type), syn::Erro
 ///     env: String,
 /// }
 ///
-/// #[rnme::task(desc = "Deploy to environment")]
+/// /// Deploy to environment
+/// #[rnme::task]
 /// async fn deploy(ctx: &TaskContext, args: DeployArgs) -> TaskResult {
 ///     Ok(())
 /// }
@@ -212,10 +217,10 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let is_async = input_fn.sig.asyncness.is_some();
 
-    // Parse attributes: desc = "..."
-    let mut description: Option<String> = None;
+    // Parse attributes: mode = cli|tui
+    let mut ui_hint: Option<proc_macro2::TokenStream> = None;
 
-    // Parse the attribute as a comma-separated list of name = "value" pairs
+    // Parse the attribute as a comma-separated list of name = value pairs
     let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
     let parsed_attrs = match syn::parse::Parser::parse(attr_parser, attr) {
         Ok(attrs) => attrs,
@@ -226,18 +231,61 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         match meta {
             Meta::NameValue(MetaNameValue { path, value, .. }) => {
                 let key = path.get_ident().map(|i| i.to_string()).unwrap_or_default();
-                let val = match &value {
-                    Expr::Lit(ExprLit {
-                        lit: Lit::Str(s), ..
-                    }) => s.value(),
-                    _ => {
-                        return syn::Error::new_spanned(value, "expected string literal")
-                            .to_compile_error()
-                            .into();
-                    }
-                };
                 match key.as_str() {
-                    "desc" | "description" => description = Some(val),
+                    "mode" => {
+                        let mode_str = match &value {
+                            Expr::Path(p) => match p.path.get_ident() {
+                                Some(i) => i.to_string(),
+                                None => {
+                                    return syn::Error::new_spanned(
+                                        value,
+                                        "expected `cli` or `tui`",
+                                    )
+                                    .to_compile_error()
+                                    .into();
+                                }
+                            },
+                            Expr::Lit(ExprLit {
+                                lit: Lit::Str(s), ..
+                            }) => s.value(),
+                            _ => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    "expected `cli` or `tui` (bare ident or string literal)",
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        };
+                        ui_hint = Some(match mode_str.as_str() {
+                            "cli" | "Cli" | "CLI" => {
+                                quote! { Some(::rnme::task::UiHint::Cli) }
+                            }
+                            "tui" | "Tui" | "TUI" => {
+                                quote! { Some(::rnme::task::UiHint::Tui) }
+                            }
+                            other => {
+                                return syn::Error::new_spanned(
+                                    value,
+                                    format!(
+                                        "unknown mode `{}` — expected `cli` or `tui`",
+                                        other
+                                    ),
+                                )
+                                .to_compile_error()
+                                .into();
+                            }
+                        });
+                    }
+                    "desc" | "description" => {
+                        return syn::Error::new_spanned(
+                            path,
+                            "task descriptions come from `///` doc comments — \
+                             remove this attribute and write a `///` line above the fn",
+                        )
+                        .to_compile_error()
+                        .into();
+                    }
                     other => {
                         return syn::Error::new_spanned(
                             path,
@@ -249,37 +297,39 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
             other => {
-                return syn::Error::new_spanned(other, "expected `key = \"value\"` format")
+                return syn::Error::new_spanned(other, "expected `key = value` format")
                     .to_compile_error()
                     .into();
             }
         }
     }
 
-    // If no desc attribute, extract from doc comments (/// lines)
-    if description.is_none() {
-        let doc_lines: Vec<String> = input_fn
-            .attrs
-            .iter()
-            .filter_map(|attr| {
-                if attr.path().is_ident("doc")
-                    && let Meta::NameValue(MetaNameValue {
-                        value:
-                            Expr::Lit(ExprLit {
-                                lit: Lit::Str(s), ..
-                            }),
-                        ..
-                    }) = &attr.meta
-                {
-                    return Some(s.value().trim().to_string());
-                }
-                None
-            })
-            .collect();
-        if !doc_lines.is_empty() {
-            description = Some(doc_lines.join(" "));
-        }
-    }
+    let ui_hint_tokens = ui_hint.unwrap_or_else(|| quote! { None });
+
+    // Description is taken from `///` doc comments on the fn.
+    let doc_lines: Vec<String> = input_fn
+        .attrs
+        .iter()
+        .filter_map(|attr| {
+            if attr.path().is_ident("doc")
+                && let Meta::NameValue(MetaNameValue {
+                    value:
+                        Expr::Lit(ExprLit {
+                            lit: Lit::Str(s), ..
+                        }),
+                    ..
+                }) = &attr.meta
+            {
+                return Some(s.value().trim().to_string());
+            }
+            None
+        })
+        .collect();
+    let description: Option<String> = if doc_lines.is_empty() {
+        None
+    } else {
+        Some(doc_lines.join(" "))
+    };
 
     // Generate the description token
     let desc_tokens = match &description {
@@ -442,7 +492,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                 group: __RNME_GROUP,
                 func: ::rnme::task::TaskFnKind::Static(#wrapper_name),
                 arg_metadata: #arg_metadata_name,
-                ui_hint: None,
+                ui_hint: #ui_hint_tokens,
             }
         }
     };
