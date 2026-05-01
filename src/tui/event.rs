@@ -90,12 +90,14 @@ pub async fn run_event_loop(
                             state.launch_picked_task(task, Vec::new()).await;
                         }
 
-                        if let Some(top_id) = state.pending_restart_top.take()
+                        if let Some(req) = state.pending_restart.take()
                             && let Some(handle) = state.engine.clone()
                         {
-                            match handle.restart(top_id).await {
+                            match handle.restart(req.top_id).await {
                                 Ok(new_id) => {
-                                    state.follow_source = Some(new_id);
+                                    if req.follow {
+                                        state.follow_source = Some(new_id);
+                                    }
                                     state.current_task_id = Some(new_id);
                                     state.scroll = super::viewport::ScrollState::Tail;
                                     state.search = super::search::SearchState::new();
@@ -198,6 +200,18 @@ pub async fn run_event_loop(
     }
 
     Ok(())
+}
+
+/// Source TaskId of the log entry under the log viewer's cursor.
+fn log_cursor_source(entries: &[LogEntry], scroll: &viewport::ScrollState) -> Option<TaskId> {
+    if entries.is_empty() {
+        return None;
+    }
+    let idx = match *scroll {
+        viewport::ScrollState::Tail => entries.len() - 1,
+        viewport::ScrollState::Pinned { cursor, .. } => cursor.min(entries.len() - 1),
+    };
+    entries.get(idx).map(|e| e.source)
 }
 
 /// Rebuild the sidebar entries from the engine's `GraphSnapshot`.
@@ -405,22 +419,45 @@ fn handle_key(
             return;
         }
         KeyCode::Char('r') => {
-            // Restart the top-level ancestor of the currently-selected
-            // entry. Section headers and missing selection are no-ops so
-            // the user has to point at an actual task — silently
-            // restarting a default would be too easy to do by accident.
+            // Restart the top-level ancestor of the entry the user is
+            // currently looking at. Source resolution depends on focus:
+            // - Sidebar: the selected sidebar entry (header → no-op).
+            // - Log view: the cursor log entry's source. Every log entry
+            //   is attributable to a task, so this works regardless of
+            //   sidebar selection.
+            //
+            // Sidebar selection follows the new top-level task on success
+            // — except when the user triggered restart from log focus
+            // while a section header was selected, in which case keeping
+            // the header selected preserves their broader filter view.
             let Some(handle) = state.engine.as_ref() else {
                 return;
             };
-            let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) else {
+            let header_selected = state
+                .sidebar_entries
+                .get(state.sidebar.selection)
+                .map(|e| e.is_section_header())
+                .unwrap_or(false);
+            let source = if state.sidebar.focused {
+                if header_selected {
+                    return;
+                }
+                state
+                    .sidebar_entries
+                    .get(state.sidebar.selection)
+                    .map(|e| e.source)
+            } else {
+                log_cursor_source(&filtered_entries, &state.scroll)
+            };
+            let Some(source) = source else {
                 return;
             };
-            if entry.is_section_header() {
-                return;
-            }
             let snapshot = handle.graph.borrow().clone();
-            if let Some(top_id) = snapshot.top_level_of(entry.source) {
-                state.pending_restart_top = Some(top_id);
+            if let Some(top_id) = snapshot.top_level_of(source) {
+                state.pending_restart = Some(super::app::PendingRestart {
+                    top_id,
+                    follow: !header_selected,
+                });
                 state.dirty = true;
             }
             return;

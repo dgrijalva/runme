@@ -51,6 +51,18 @@ pub enum AppMode {
     KillMenu,
 }
 
+/// A pending `r` request, queued by the sync key handler for the async
+/// loop body to await against `EngineHandle::restart`.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingRestart {
+    pub top_id: TaskId,
+    /// Whether sidebar selection should follow the new top-level task.
+    /// `false` keeps the selection in place (e.g. when the user
+    /// triggered restart from log focus while a section header was
+    /// selected — they want to keep that filter view).
+    pub follow: bool,
+}
+
 /// Source-visibility filter driven by the focused sidebar entry.
 ///
 /// All non-`All` variants except `Source` are *dynamic*: they resolve
@@ -160,10 +172,10 @@ pub struct AppState {
     /// The most recently launched task definition. Used by the status
     /// bar to display the active task's name.
     pub current_task: Option<&'static TaskDef>,
-    /// Set by the `r` handler — the top-level TaskId to restart. The
-    /// async loop body consumes it, awaits `EngineHandle::restart`, and
-    /// stashes the returned new id in `follow_source`.
-    pub pending_restart_top: Option<TaskId>,
+    /// Set by the `r` handler — the pending restart request. The async
+    /// loop body consumes it, awaits `EngineHandle::restart`, and (if
+    /// `follow` is set) stashes the returned new id in `follow_source`.
+    pub pending_restart: Option<PendingRestart>,
     /// After a restart, the new top-level TaskId that selection should
     /// follow once the sidebar rebuild picks it up.
     pub follow_source: Option<TaskId>,
@@ -218,7 +230,7 @@ impl AppState {
             filter_history: Vec::new(),
             filter_history_index: None,
             current_task: None,
-            pending_restart_top: None,
+            pending_restart: None,
             follow_source: None,
             last_viewport_height: None,
             registry: None,

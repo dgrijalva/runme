@@ -126,8 +126,11 @@ pub fn adjust_scroll_offset(
     if selection_row + margin >= top + vh {
         top = (selection_row + margin + 1).saturating_sub(vh);
     }
-    // Don't scroll past the end if content fits or shrinks.
-    let max_top = total_rows.saturating_sub(vh);
+    // Allow scrolling `margin` past the last row so the bottom selection
+    // gets the same scroll-off cushion the top one does (visually:
+    // `margin` blank rows below the last entry when the cursor sits at
+    // the very end).
+    let max_top = (total_rows + margin).saturating_sub(vh);
     top.min(max_top)
 }
 
@@ -1156,11 +1159,18 @@ mod tests {
     }
 
     #[test]
-    fn scroll_offset_clamps_to_max_top() {
-        // After resize (viewport grew), offset shouldn't leave blank rows
-        // below the content.
-        let new_top = adjust_scroll_offset(15, 5, 20, 10);
-        assert!(new_top + 10 <= 20 || new_top == 0);
+    fn scroll_offset_leaves_padding_below_last_entry() {
+        // Selection at the very last row → top should sit so the entry
+        // is `margin` rows above the viewport bottom (visually: blank
+        // rows below the last entry).
+        let total = 20;
+        let vh: u16 = 10;
+        let margin = SIDEBAR_SCROLL_MARGIN as usize;
+        let new_top = adjust_scroll_offset(0, total - 1, total, vh);
+        // last entry's screen row = (total - 1) - new_top, must leave
+        // room for `margin` rows below it within the viewport.
+        let last_screen_row = (total - 1) - new_top;
+        assert!(last_screen_row + margin < vh as usize);
     }
 
     #[test]
