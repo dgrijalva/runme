@@ -84,7 +84,7 @@ impl Default for Theme {
             dim: Color::DarkGray,
             border: Color::DarkGray,
             selection_bg: Color::DarkGray,
-            selection_bg_dim: Color::Indexed(236),
+            selection_bg_dim: Color::Rgb(64, 64, 64),
 
             search_match_bg: Color::Yellow,
             search_match_fg: Color::Black,
