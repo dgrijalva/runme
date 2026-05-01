@@ -257,7 +257,7 @@ pub fn render_frame(
             ));
 
             // Source filter indicator (focus + manual hides composed).
-            if !state.focus_filter.is_empty() || !state.hidden_sources.is_empty() {
+            if state.focus_filter.is_active() || !state.hidden_sources.is_empty() {
                 let hidden_count = state.sidebar_entries.iter().filter(|e| !e.visible).count();
                 if hidden_count > 0 {
                     spans.push(Span::raw(" "));

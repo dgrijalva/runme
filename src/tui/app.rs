@@ -10,7 +10,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::sync::Mutex;
 
-use crate::execution::{EngineHandle, TaskId};
+use crate::execution::{EngineHandle, TaskId, TaskStatus};
 use crate::log::LogEntry;
 use crate::log::field_stats::FieldStats;
 use crate::log::filter as log_filter;
@@ -51,6 +51,32 @@ pub enum AppMode {
     KillMenu,
 }
 
+/// Source-visibility filter driven by the focused sidebar entry.
+///
+/// `RunningTops` and `CompletedTops` are *dynamic*: they resolve against
+/// the live graph each time the effective set is queried, so new spawns
+/// and status transitions show up without the user re-selecting the
+/// header. `Frozen` captures a static set, used for Task / Process
+/// selection where the intent is to pin the view to those exact ids.
+#[derive(Debug, Clone)]
+pub enum FocusFilter {
+    /// No filtering by focus.
+    All,
+    /// Captured set (Task/Process selection).
+    Frozen(HashSet<TaskId>),
+    /// All currently-running top-level subtrees.
+    RunningTops,
+    /// All currently-completed top-level subtrees.
+    CompletedTops,
+}
+
+impl FocusFilter {
+    /// Whether any focus-driven filtering is active.
+    pub fn is_active(&self) -> bool {
+        !matches!(self, FocusFilter::All)
+    }
+}
+
 /// Core application state, shared across the event loop and rendering.
 pub struct AppState {
     /// Which view/mode is active
@@ -73,10 +99,11 @@ pub struct AppState {
     pub source_colors: SourceColors,
     /// Sidebar state (focus, selection).
     pub sidebar: SidebarState,
-    /// Base set of sources eligible for display, derived from the focused
-    /// sidebar entry via `EngineHandle::source_ids_for`. Empty = show
-    /// everything (no filtering applied for "All tasks" focus).
-    pub focus_filter: HashSet<TaskId>,
+    /// Source-visibility filter driven by sidebar focus. The dynamic
+    /// section variants (`RunningTops`, `CompletedTops`) are resolved
+    /// against the live graph at query time so newly-spawned or
+    /// transitioned tasks are picked up without re-selecting the header.
+    pub focus_filter: FocusFilter,
     /// Sources the user has manually toggled off (composes with
     /// `focus_filter`: visible = `(focus_filter or all) ∖ hidden_sources`).
     /// Persists across focus changes — entries that aren't part of any
@@ -163,7 +190,7 @@ impl AppState {
             scroll: ScrollState::Tail,
             source_colors: SourceColors::new(),
             sidebar: SidebarState::new(),
-            focus_filter: HashSet::new(),
+            focus_filter: FocusFilter::All,
             hidden_sources: HashSet::new(),
             sidebar_entries: Vec::new(),
             filter_input: FilterInputState::new(),
@@ -194,12 +221,45 @@ impl AppState {
         }
     }
 
-    /// Whether a given source is currently visible.
+    /// Resolve the focus filter against the current graph.
     ///
-    /// Visible = (in `focus_filter` OR `focus_filter` is empty)
-    ///        AND (NOT in `hidden_sources`).
-    fn source_visible(&self, source: TaskId) -> bool {
-        if !self.focus_filter.is_empty() && !self.focus_filter.contains(&source) {
+    /// Returns `None` when no filtering by focus should be applied
+    /// (`FocusFilter::All`, or a section variant with no engine wired).
+    /// `Frozen` returns a clone of the captured set. `RunningTops` /
+    /// `CompletedTops` walk the live graph to gather matching top-level
+    /// subtrees, so they pick up spawns and transitions automatically.
+    pub fn effective_visible_sources(&self) -> Option<HashSet<TaskId>> {
+        match &self.focus_filter {
+            FocusFilter::All => None,
+            FocusFilter::Frozen(set) => Some(set.clone()),
+            FocusFilter::RunningTops => self.section_visible_sources(true),
+            FocusFilter::CompletedTops => self.section_visible_sources(false),
+        }
+    }
+
+    fn section_visible_sources(&self, want_running: bool) -> Option<HashSet<TaskId>> {
+        let handle = self.engine.as_ref()?;
+        let snapshot = handle.graph.borrow().clone();
+        let root = snapshot.tasks.get(&handle.root)?;
+        let mut filter = HashSet::new();
+        for &child_id in &root.children {
+            let Some(child) = snapshot.tasks.get(&child_id) else {
+                continue;
+            };
+            let is_running = matches!(child.status, TaskStatus::Setup | TaskStatus::Ready);
+            if is_running == want_running {
+                for src in handle.source_ids_for(child_id) {
+                    filter.insert(src);
+                }
+            }
+        }
+        Some(filter)
+    }
+
+    fn source_visible_in(&self, source: TaskId, effective: &Option<HashSet<TaskId>>) -> bool {
+        if let Some(set) = effective
+            && !set.contains(&source)
+        {
             return false;
         }
         if self.hidden_sources.contains(&source) {
@@ -212,11 +272,12 @@ impl AppState {
     /// Filters by focus + manual hides + expression filter.
     pub fn visible_line_indices(&self) -> Vec<usize> {
         let expr = self.filter_input.active_expr();
+        let effective = self.effective_visible_sources();
         self.log_lines
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                if !self.source_visible(entry.source) {
+                if !self.source_visible_in(entry.source, &effective) {
                     return false;
                 }
                 if let Some(expr) = expr
@@ -233,10 +294,11 @@ impl AppState {
     /// Get the filtered log lines (focus + manual hides + expression filter).
     pub fn visible_log_lines(&self) -> Vec<&LogEntry> {
         let expr = self.filter_input.active_expr();
+        let effective = self.effective_visible_sources();
         self.log_lines
             .iter()
             .filter(|entry| {
-                if !self.source_visible(entry.source) {
+                if !self.source_visible_in(entry.source, &effective) {
                     return false;
                 }
                 if let Some(expr) = expr
@@ -277,56 +339,25 @@ impl AppState {
     /// - Process entry => single-source filter `{process_id}`.
     pub fn refresh_focus_filter(&mut self) {
         use super::sidebar::SidebarEntryKind;
-        use crate::execution::TaskStatus;
 
         let Some(entry) = self.sidebar_entries.get(self.sidebar.selection) else {
-            self.focus_filter.clear();
+            self.focus_filter = FocusFilter::All;
             return;
         };
-        let Some(handle) = self.engine.as_ref() else {
-            self.focus_filter.clear();
-            return;
-        };
-        match entry.kind {
-            SidebarEntryKind::AllTasks => {
-                // No focus filter.
-                self.focus_filter.clear();
-            }
-            SidebarEntryKind::RunningHeader | SidebarEntryKind::CompletedHeader => {
-                // Walk the graph: pick top-level tasks whose status matches
-                // the section, then union `source_ids_for` for each.
-                let want_running = matches!(entry.kind, SidebarEntryKind::RunningHeader);
-                let snapshot = handle.graph.borrow().clone();
-                let mut top_level: Vec<TaskId> = Vec::new();
-                if let Some(root) = snapshot.tasks.get(&handle.root) {
-                    for &child_id in &root.children {
-                        let Some(child) = snapshot.tasks.get(&child_id) else {
-                            continue;
-                        };
-                        let is_running =
-                            matches!(child.status, TaskStatus::Setup | TaskStatus::Ready);
-                        if is_running == want_running {
-                            top_level.push(child_id);
-                        }
-                    }
-                }
-                let mut filter = HashSet::new();
-                for id in top_level {
-                    for src in handle.source_ids_for(id) {
-                        filter.insert(src);
-                    }
-                }
-                self.focus_filter = filter;
-            }
+        self.focus_filter = match entry.kind {
+            SidebarEntryKind::AllTasks => FocusFilter::All,
+            SidebarEntryKind::RunningHeader => FocusFilter::RunningTops,
+            SidebarEntryKind::CompletedHeader => FocusFilter::CompletedTops,
             SidebarEntryKind::Process => {
-                // Process entry: filter to just this process's logs.
-                self.focus_filter = std::iter::once(entry.source).collect();
+                FocusFilter::Frozen(std::iter::once(entry.source).collect())
             }
-            SidebarEntryKind::Task => {
-                let ids = handle.source_ids_for(entry.source);
-                self.focus_filter = ids.into_iter().collect();
-            }
-        }
+            SidebarEntryKind::Task => match self.engine.as_ref() {
+                Some(handle) => {
+                    FocusFilter::Frozen(handle.source_ids_for(entry.source).into_iter().collect())
+                }
+                None => FocusFilter::All,
+            },
+        };
     }
 
     /// Launch a task through the engine. Called from the event loop when a
@@ -520,7 +551,7 @@ mod tests {
         assert_eq!(state.scroll, ScrollState::Tail);
         assert!(!state.sidebar.focused);
         assert_eq!(state.sidebar.selection, 0);
-        assert!(state.focus_filter.is_empty());
+        assert!(!state.focus_filter.is_active());
         assert!(state.hidden_sources.is_empty());
         assert!(state.sidebar_entries.is_empty());
         assert!(!state.picker_open);
@@ -556,7 +587,7 @@ mod tests {
         state.log_lines.push(make_entry(api));
         state.log_lines.push(make_entry(worker));
         state.log_lines.push(make_entry(api));
-        state.focus_filter.insert(api);
+        state.focus_filter = FocusFilter::Frozen([api].into_iter().collect());
         let indices = state.visible_line_indices();
         assert_eq!(indices, vec![0, 2]);
     }
@@ -585,8 +616,7 @@ mod tests {
         state.log_lines.push(make_entry(api));
         state.log_lines.push(make_entry(worker));
         state.log_lines.push(make_entry(other));
-        state.focus_filter.insert(api);
-        state.focus_filter.insert(worker);
+        state.focus_filter = FocusFilter::Frozen([api, worker].into_iter().collect());
         state.hidden_sources.insert(worker);
         let indices = state.visible_line_indices();
         assert_eq!(indices, vec![0]);
@@ -604,11 +634,11 @@ mod tests {
     #[test]
     fn show_all_does_not_clear_focus_filter() {
         let mut state = AppState::new();
-        state.focus_filter.insert(TaskId(1));
+        state.focus_filter = FocusFilter::Frozen([TaskId(1)].into_iter().collect());
         state.hidden_sources.insert(TaskId(2));
         state.show_all_sources();
         assert!(state.hidden_sources.is_empty());
-        assert!(state.focus_filter.contains(&TaskId(1)));
+        assert!(matches!(&state.focus_filter, FocusFilter::Frozen(s) if s.contains(&TaskId(1))));
     }
 
     #[test]
@@ -628,7 +658,7 @@ mod tests {
         let mut state = AppState::new();
         let api = TaskId(11);
         state.hidden_sources.insert(api);
-        state.focus_filter = [TaskId(99)].into_iter().collect();
+        state.focus_filter = FocusFilter::Frozen([TaskId(99)].into_iter().collect());
         // Manually re-derive — refresh_focus_filter would need a real engine.
         assert!(state.hidden_sources.contains(&api));
     }
@@ -675,34 +705,33 @@ mod tests {
     }
 
     #[test]
-    fn refresh_focus_filter_no_engine_clears() {
-        // Engine-less variants always clear `focus_filter`. This guards
-        // the "no engine wired" path in `refresh_focus_filter` for all
-        // selectable kinds, including section headers.
+    fn refresh_focus_filter_sets_section_variants() {
+        // Section header selection picks the matching dynamic variant —
+        // engine presence doesn't matter for the variant choice; resolution
+        // happens later in `effective_visible_sources`.
         let mut state = AppState::new();
-        state.focus_filter.insert(TaskId(99));
         state.sidebar_entries = vec![
             make_header("All tasks", SidebarEntryKind::AllTasks),
             make_header("Running tasks", SidebarEntryKind::RunningHeader),
             make_header("Completed tasks", SidebarEntryKind::CompletedHeader),
         ];
-        for sel in 0..3 {
-            state.focus_filter.insert(TaskId(sel as u64 + 1));
-            state.sidebar.selection = sel;
-            state.refresh_focus_filter();
-            assert!(
-                state.focus_filter.is_empty(),
-                "selection {} should clear focus_filter without engine",
-                sel
-            );
-        }
+        state.sidebar.selection = 0;
+        state.refresh_focus_filter();
+        assert!(matches!(state.focus_filter, FocusFilter::All));
+        state.sidebar.selection = 1;
+        state.refresh_focus_filter();
+        assert!(matches!(state.focus_filter, FocusFilter::RunningTops));
+        state.sidebar.selection = 2;
+        state.refresh_focus_filter();
+        assert!(matches!(state.focus_filter, FocusFilter::CompletedTops));
     }
 
     #[tokio::test]
-    async fn refresh_focus_filter_section_headers_with_engine() {
-        // With a real engine and known top-level tasks (one completed),
-        // Completed header populates `focus_filter` with that task's
-        // subtree ids; AllTasks clears it.
+    async fn section_filters_resolve_dynamically() {
+        // RunningTops/CompletedTops re-resolve against the live graph each
+        // time `effective_visible_sources` is called, so a task that
+        // transitions running -> done is reflected without re-running
+        // `refresh_focus_filter`.
         use crate::error::TaskResult;
         use crate::execution::Engine;
         use crate::task::{TaskContext, TaskDef, TaskFnKind};
@@ -731,16 +760,11 @@ mod tests {
         registry.register(&OK);
         let (engine, handle) = Engine::start(Arc::new(registry));
 
-        // Spawn one task and wait for it to finish.
         let id = handle.spawn_task(&OK, vec![]).await.unwrap();
-        // Spin until the task reaches a terminal status.
         for _ in 0..200 {
             let snap = handle.graph.borrow().clone();
             if let Some(node) = snap.tasks.get(&id)
-                && !matches!(
-                    node.status,
-                    crate::execution::TaskStatus::Setup | crate::execution::TaskStatus::Ready
-                )
+                && !matches!(node.status, TaskStatus::Setup | TaskStatus::Ready)
             {
                 break;
             }
@@ -749,32 +773,37 @@ mod tests {
 
         let mut state = AppState::new();
         state.engine = Some(handle.clone());
-        state.sidebar_entries = vec![
-            make_header("All tasks", SidebarEntryKind::AllTasks),
-            make_header("Running tasks", SidebarEntryKind::RunningHeader),
-            make_header("Completed tasks", SidebarEntryKind::CompletedHeader),
-        ];
 
-        // AllTasks clears.
-        state.sidebar.selection = 0;
-        state.focus_filter.insert(TaskId(99));
-        state.refresh_focus_filter();
-        assert!(state.focus_filter.is_empty());
+        // The task is now done. CompletedTops should include its subtree;
+        // RunningTops should not. We deliberately don't call
+        // refresh_focus_filter between these reads — the same variant
+        // resolves to different sets as the graph changes.
+        state.focus_filter = FocusFilter::CompletedTops;
+        let completed = state.effective_visible_sources().expect("set");
+        assert!(completed.contains(&id));
 
-        // RunningHeader: no running top-level tasks => empty filter.
-        state.sidebar.selection = 1;
-        state.refresh_focus_filter();
-        assert!(state.focus_filter.is_empty());
-
-        // CompletedHeader: includes the completed task's id.
-        state.sidebar.selection = 2;
-        state.refresh_focus_filter();
-        assert!(
-            state.focus_filter.contains(&id),
-            "CompletedHeader filter must include the completed task's id"
-        );
+        state.focus_filter = FocusFilter::RunningTops;
+        let running = state.effective_visible_sources().expect("set");
+        assert!(!running.contains(&id));
 
         let _ = handle.quit().await;
         engine.shutdown().await;
+    }
+
+    #[test]
+    fn frozen_filter_is_unaffected_by_graph_changes() {
+        // Frozen captures a static set — used for Task/Process selection.
+        let mut state = AppState::new();
+        let captured = TaskId(7);
+        state.focus_filter = FocusFilter::Frozen([captured].into_iter().collect());
+        let resolved = state.effective_visible_sources().expect("set");
+        assert!(resolved.contains(&captured));
+        assert_eq!(resolved.len(), 1);
+    }
+
+    #[test]
+    fn all_filter_returns_none() {
+        let state = AppState::new();
+        assert!(state.effective_visible_sources().is_none());
     }
 }

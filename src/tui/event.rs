@@ -212,17 +212,14 @@ async fn refresh_sidebar_state(state: &mut AppState) {
     };
     let snapshot = handle.graph.borrow().clone();
 
-    // Compose the effective visibility set: focus_filter (if any) minus
+    // Compose the effective visibility set: focus filter (if any) minus
     // any manually hidden sources. Empty `effective` => show everything.
-    let effective: std::collections::HashSet<TaskId> = if state.focus_filter.is_empty() {
-        std::collections::HashSet::new()
-    } else {
-        state
-            .focus_filter
-            .iter()
-            .copied()
+    let effective: std::collections::HashSet<TaskId> = match state.effective_visible_sources() {
+        Some(set) => set
+            .into_iter()
             .filter(|id| !state.hidden_sources.contains(id))
-            .collect()
+            .collect(),
+        None => std::collections::HashSet::new(),
     };
 
     state.sidebar_entries =
@@ -253,7 +250,7 @@ fn check_for_crashes(state: &mut AppState, prev_statuses: &mut Vec<(TaskId, Proc
                 .is_some_and(|(_, s)| matches!(s, ProcessStatus::Running));
             if was_running {
                 let is_filtered =
-                    !state.focus_filter.is_empty() || !state.hidden_sources.is_empty();
+                    state.focus_filter.is_active() || !state.hidden_sources.is_empty();
                 let not_tailing = !matches!(state.scroll, viewport::ScrollState::Tail);
                 if is_filtered || not_tailing {
                     state.notifications.push((
