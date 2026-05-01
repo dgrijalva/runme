@@ -328,15 +328,15 @@ pub(super) fn handle_picker_key(key: KeyEvent, state: &mut AppState) {
             }
         }
 
-        // j / Down: move selection down
-        KeyCode::Char('j') | KeyCode::Down => {
+        // Down: move selection down (no j-binding — `j` types into filter)
+        KeyCode::Down => {
             if let Some(ref mut picker) = state.picker {
                 picker.move_down();
             }
         }
 
-        // k / Up: move selection up
-        KeyCode::Char('k') | KeyCode::Up => {
+        // Up: move selection up (no k-binding — `k` types into filter)
+        KeyCode::Up => {
             if let Some(ref mut picker) = state.picker {
                 picker.move_up();
             }
