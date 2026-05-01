@@ -154,7 +154,12 @@ pub fn render_frame(
             let current_search_entry = state.search.current_match_index();
 
             // Place rendered entries into the buffer at their Y positions
-            let cursor_style = Style::default().bg(THEME.selection_bg);
+            let cursor_bg = if state.sidebar.focused {
+                THEME.selection_bg_dim
+            } else {
+                THEME.selection_bg
+            };
+            let cursor_style = Style::default().bg(cursor_bg);
             for ve in &vp_layout.entries {
                 // Determine if this entry is the current search match
                 let is_current_search_match = current_search_entry == Some(ve.entry_index);

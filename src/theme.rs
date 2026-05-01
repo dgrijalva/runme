@@ -56,6 +56,7 @@ pub struct Theme {
     pub dim: Color,
     pub border: Color,
     pub selection_bg: Color,
+    pub selection_bg_dim: Color,
 
     // Search highlighting
     pub search_match_bg: Color,
@@ -83,6 +84,7 @@ impl Default for Theme {
             dim: Color::DarkGray,
             border: Color::DarkGray,
             selection_bg: Color::DarkGray,
+            selection_bg_dim: Color::Indexed(236),
 
             search_match_bg: Color::Yellow,
             search_match_fg: Color::Black,
