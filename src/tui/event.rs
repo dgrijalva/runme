@@ -405,22 +405,21 @@ fn handle_key(
             return;
         }
         KeyCode::Char('r') => {
-            // Resolve a top-level task id to restart. Prefer the current
-            // sidebar selection (walks up from sub-tasks/processes); fall
-            // back to the most recently launched task when the selection
-            // isn't task-like (section header, no entries yet, etc).
+            // Restart the top-level ancestor of the currently-selected
+            // entry. Section headers and missing selection are no-ops so
+            // the user has to point at an actual task — silently
+            // restarting a default would be too easy to do by accident.
             let Some(handle) = state.engine.as_ref() else {
                 return;
             };
+            let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) else {
+                return;
+            };
+            if entry.is_section_header() {
+                return;
+            }
             let snapshot = handle.graph.borrow().clone();
-            let from_selection = state
-                .sidebar_entries
-                .get(state.sidebar.selection)
-                .filter(|e| !e.is_section_header())
-                .and_then(|e| snapshot.top_level_of(e.source));
-            let top_id = from_selection
-                .or_else(|| state.current_task_id.and_then(|id| snapshot.top_level_of(id)));
-            if let Some(top_id) = top_id {
+            if let Some(top_id) = snapshot.top_level_of(entry.source) {
                 state.pending_restart_top = Some(top_id);
                 state.dirty = true;
             }
