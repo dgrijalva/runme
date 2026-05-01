@@ -78,7 +78,7 @@ pub fn render_frame(
                 frame,
                 sidebar_area,
                 &state.sidebar_entries,
-                &state.sidebar,
+                &mut state.sidebar,
                 &mut state.source_colors,
             );
         }

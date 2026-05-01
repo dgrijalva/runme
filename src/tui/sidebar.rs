@@ -40,6 +40,10 @@ use crate::theme::{SourceColors, THEME};
 /// Fixed sidebar width in columns.
 pub const SIDEBAR_WIDTH: u16 = 28;
 
+/// Scroll-off margin: selection never gets closer than this many rows
+/// to the top or bottom of the visible sidebar.
+pub const SIDEBAR_SCROLL_MARGIN: u16 = 2;
+
 /// State for the sidebar.
 #[derive(Debug, Clone)]
 pub struct SidebarState {
@@ -47,6 +51,11 @@ pub struct SidebarState {
     pub focused: bool,
     /// Index of the selected entry in the sidebar list.
     pub selection: usize,
+    /// Vertical scroll offset measured in rendered rows. Updated by
+    /// `render_sidebar` to keep `selection` visible with a scroll-off
+    /// margin; not driven directly by the user (no PgUp/PgDn — selection
+    /// drives scroll).
+    pub scroll_offset: usize,
 }
 
 impl SidebarState {
@@ -54,6 +63,7 @@ impl SidebarState {
         Self {
             focused: false,
             selection: 0,
+            scroll_offset: 0,
         }
     }
 
@@ -74,6 +84,51 @@ impl SidebarState {
             self.selection = self.selection.min(max_entries - 1);
         }
     }
+}
+
+/// Visual line position of each sidebar entry. The renderer inserts a
+/// blank separator row before each section header (except `AllTasks`),
+/// so visual row != entry index.
+///
+/// Returns `(positions, total_rows)` where `positions[i]` is the row at
+/// which entry `i` is rendered (entry rows are 1 row tall).
+pub fn entry_line_positions(entries: &[SidebarEntry]) -> (Vec<usize>, usize) {
+    let mut positions = Vec::with_capacity(entries.len());
+    let mut row = 0;
+    for entry in entries {
+        if entry.is_section_header() && !matches!(entry.kind, SidebarEntryKind::AllTasks) {
+            row += 1; // blank separator row above the header
+        }
+        positions.push(row);
+        row += 1; // the entry itself
+    }
+    (positions, row)
+}
+
+/// Adjust `scroll_offset` so the selected entry is visible with a
+/// scroll-off margin, using the same shape as `viewport::adjust_top_for_cursor`.
+pub fn adjust_scroll_offset(
+    scroll_offset: usize,
+    selection_row: usize,
+    total_rows: usize,
+    viewport_height: u16,
+) -> usize {
+    if viewport_height == 0 || total_rows == 0 {
+        return 0;
+    }
+    let vh = viewport_height as usize;
+    let margin = (SIDEBAR_SCROLL_MARGIN as usize).min(vh / 2);
+
+    let mut top = scroll_offset;
+    if selection_row < top + margin {
+        top = selection_row.saturating_sub(margin);
+    }
+    if selection_row + margin >= top + vh {
+        top = (selection_row + margin + 1).saturating_sub(vh);
+    }
+    // Don't scroll past the end if content fits or shrinks.
+    let max_top = total_rows.saturating_sub(vh);
+    top.min(max_top)
 }
 
 impl Default for SidebarState {
@@ -378,7 +433,7 @@ pub fn render_sidebar(
     frame: &mut Frame,
     area: Rect,
     entries: &[SidebarEntry],
-    state: &SidebarState,
+    state: &mut SidebarState,
     source_colors: &mut SourceColors,
 ) {
     let block = Block::default()
@@ -514,7 +569,27 @@ pub fn render_sidebar(
         lines.push(line);
     }
 
-    let paragraph = Paragraph::new(lines);
+    // Compute scroll offset to keep the selection visible. `lines.len()`
+    // matches `total_rows` from `entry_line_positions` since each entry
+    // contributes one rendered row plus an optional blank separator.
+    let (positions, total_rows) = entry_line_positions(entries);
+    let selection_row = positions
+        .get(state.selection)
+        .copied()
+        .unwrap_or(state.selection);
+    state.scroll_offset = adjust_scroll_offset(
+        state.scroll_offset,
+        selection_row,
+        total_rows,
+        inner.height,
+    );
+
+    let visible: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(state.scroll_offset)
+        .take(inner.height as usize)
+        .collect();
+    let paragraph = Paragraph::new(visible);
     frame.render_widget(paragraph, inner);
 }
 
@@ -1034,6 +1109,63 @@ mod tests {
         assert_eq!(next_section_level(&entries, 3), Some(5));
         // At the last section-level row → None.
         assert_eq!(next_section_level(&entries, 5), None);
+    }
+
+    #[test]
+    fn entry_line_positions_accounts_for_separators() {
+        // Layout: AllTasks, RunningHeader (with blank above), Task,
+        // Process, CompletedHeader (with blank above), Task.
+        // Visual rows: 0=AllTasks, 1=blank, 2=Running, 3=Task, 4=Process,
+        //              5=blank, 6=Completed, 7=Task.
+        let entries = vec![
+            make_entry(SidebarEntryKind::AllTasks, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::RunningHeader, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::Task, 0, TaskId(1)),
+            make_entry(SidebarEntryKind::Process, 1, TaskId(2)),
+            make_entry(SidebarEntryKind::CompletedHeader, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::Task, 0, TaskId(3)),
+        ];
+        let (positions, total) = entry_line_positions(&entries);
+        assert_eq!(positions, vec![0, 2, 3, 4, 6, 7]);
+        assert_eq!(total, 8);
+    }
+
+    #[test]
+    fn scroll_offset_keeps_selection_in_view() {
+        // Viewport height 5, content height 20. Selection at row 15 with
+        // current top 0 → scroll down so selection sits inside the
+        // viewport with margin.
+        let new_top = adjust_scroll_offset(0, 15, 20, 5);
+        assert!(new_top > 0);
+        assert!(15 >= new_top + SIDEBAR_SCROLL_MARGIN as usize);
+        assert!(15 + SIDEBAR_SCROLL_MARGIN as usize <= new_top + 5);
+    }
+
+    #[test]
+    fn scroll_offset_pulls_back_when_selection_above() {
+        // Selection at row 1, current top at 8 → must scroll up.
+        let new_top = adjust_scroll_offset(8, 1, 20, 5);
+        assert_eq!(new_top, 0);
+    }
+
+    #[test]
+    fn scroll_offset_zero_when_content_fits() {
+        // Content shorter than viewport → no scrolling.
+        let new_top = adjust_scroll_offset(0, 1, 3, 10);
+        assert_eq!(new_top, 0);
+    }
+
+    #[test]
+    fn scroll_offset_clamps_to_max_top() {
+        // After resize (viewport grew), offset shouldn't leave blank rows
+        // below the content.
+        let new_top = adjust_scroll_offset(15, 5, 20, 10);
+        assert!(new_top + 10 <= 20 || new_top == 0);
+    }
+
+    #[test]
+    fn scroll_offset_handles_zero_viewport() {
+        assert_eq!(adjust_scroll_offset(5, 3, 20, 0), 0);
     }
 
     #[test]
