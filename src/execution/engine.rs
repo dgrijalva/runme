@@ -23,7 +23,7 @@ use crate::log::store::LogStore;
 use crate::task::{Registry, TaskDef};
 
 use super::TaskId;
-use super::control::{Control, EngineError, KillSignal, SpawnOptions};
+use super::control::{Control, EngineError, KillSignal, RestartError, SpawnOptions};
 use super::execution::{ProcessInfo, ProcessStatus, TaskExecution, TaskStatus};
 use super::handle::TaskHandle;
 use super::root::ROOT_TASK;
@@ -74,6 +74,59 @@ impl Default for GraphSnapshot {
 }
 
 impl GraphSnapshot {
+    /// Walk parent links to find the direct child of `ROOT` that owns `id`.
+    /// Returns `Some(id)` if `id` is itself top-level. Returns `None` for
+    /// `ROOT`, unknown ids, or nodes whose parent chain doesn't reach `ROOT`.
+    pub fn top_level(&self, id: TaskId) -> Option<TaskId> {
+        if id == TaskId::ROOT {
+            return None;
+        }
+        let mut current = id;
+        loop {
+            let node = self.tasks.get(&current)?;
+            match node.parent {
+                Some(p) if p == TaskId::ROOT => return Some(current),
+                Some(p) => current = p,
+                None => return None,
+            }
+        }
+    }
+
+    /// Parent chain for `id`, immediate-parent first, excluding `ROOT`.
+    /// Empty for `ROOT` and unknown ids.
+    pub fn ancestors(&self, id: TaskId) -> Vec<TaskId> {
+        let mut out = Vec::new();
+        if id == TaskId::ROOT {
+            return out;
+        }
+        let Some(mut node) = self.tasks.get(&id) else {
+            return out;
+        };
+        while let Some(p) = node.parent {
+            if p == TaskId::ROOT {
+                break;
+            }
+            out.push(p);
+            let Some(next) = self.tasks.get(&p) else {
+                break;
+            };
+            node = next;
+        }
+        out
+    }
+
+    /// True if `id` is a direct child of `ROOT`.
+    pub fn is_top_level(&self, id: TaskId) -> bool {
+        if id == TaskId::ROOT {
+            return false;
+        }
+        self.tasks
+            .get(&id)
+            .and_then(|n| n.parent)
+            .map(|p| p == TaskId::ROOT)
+            .unwrap_or(false)
+    }
+
     /// Returns a map from every TaskId in the graph (tasks + processes)
     /// to its display label. For tasks, the label is the task name.
     /// For processes, the label is the command_label (falling back to
@@ -581,6 +634,19 @@ impl EngineHandle {
         Ok(())
     }
 
+    /// Restart a top-level task. Cancels the existing task and subtree
+    /// (the cancelled node stays in the graph snapshot), then spawns a
+    /// fresh sibling using the same `TaskDef` and args. Returns the new
+    /// `TaskId`.
+    pub async fn restart(&self, id: TaskId) -> Result<TaskId, RestartError> {
+        let (tx, rx) = oneshot::channel();
+        self.internals
+            .control_tx
+            .send(Control::RestartTask { id, reply: tx })
+            .map_err(|_| RestartError::ShuttingDown)?;
+        rx.await.map_err(|_| RestartError::ShuttingDown)?
+    }
+
     /// Shut down the runtime: cancel root subtree, then root body returns.
     pub async fn quit(&self) -> Result<(), EngineError> {
         let (tx, rx) = oneshot::channel();
@@ -850,6 +916,31 @@ mod tests {
         description: None,
         group: "",
         func: TaskFnKind::Static(slow_task),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
+    fn parent_spawns_ok<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move {
+            // Spawn (not await) so the parent's body can return while
+            // the child remains registered in the graph.
+            let h = ctx.run("ok", &[]).spawn()?;
+            // Detach so dropping the parent body doesn't cancel the child.
+            tokio::spawn(async move {
+                let _ = h.await;
+            });
+            Ok(())
+        })
+    }
+
+    static PARENT_SPAWNS_OK: TaskDef = TaskDef {
+        name: "parent_spawns_ok",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(parent_spawns_ok),
         arg_metadata: no_args,
         ui_hint: None,
     };
@@ -1130,6 +1221,168 @@ mod tests {
 
         let _ = handle.quit().await;
         engine.shutdown().await;
+    }
+
+    // Restart slice tests
+    #[tokio::test]
+    async fn restart_top_level_returns_new_id_and_keeps_old_subtree() {
+        let registry = build_registry(&[&SLOW]);
+        let (engine, handle) = Engine::start(registry);
+
+        let old_id = handle
+            .spawn_task(&SLOW, vec![])
+            .await
+            .expect("spawn_task should succeed");
+        // Let it actually start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let new_id = handle.restart(old_id).await.expect("restart should succeed");
+        assert_ne!(old_id, new_id, "restart must return a fresh TaskId");
+
+        // Old must reach Cancelled and remain in the graph.
+        let status = wait_terminal(&handle, old_id).await;
+        assert!(
+            matches!(status, TaskStatus::Cancelled),
+            "old task must be cancelled; got {status:?}"
+        );
+        let snap = handle.graph.borrow().clone();
+        assert!(
+            snap.tasks.contains_key(&old_id),
+            "old TaskNode must remain in the snapshot"
+        );
+        assert!(
+            snap.tasks.contains_key(&new_id),
+            "new TaskNode must be present"
+        );
+
+        // New task is also a direct child of ROOT.
+        let new_node = snap.tasks.get(&new_id).expect("new node");
+        assert_eq!(new_node.parent, Some(TaskId::ROOT));
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_non_top_level_errors() {
+        let registry = build_registry(&[&OK, &PARENT_SPAWNS_OK]);
+        let (engine, handle) = Engine::start(registry);
+
+        let parent_id = handle
+            .spawn_task(&PARENT_SPAWNS_OK, vec![])
+            .await
+            .expect("spawn parent");
+        let _ = wait_terminal(&handle, parent_id).await;
+        // Allow snapshot publish for the child.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let snap = handle.graph.borrow().clone();
+        let parent_node = snap.tasks.get(&parent_id).expect("parent in graph");
+        assert_eq!(parent_node.children.len(), 1);
+        let child_id = parent_node.children[0];
+
+        let err = handle
+            .restart(child_id)
+            .await
+            .expect_err("restart on non-top-level must error");
+        assert!(
+            matches!(err, RestartError::NotTopLevel(id) if id == child_id),
+            "expected NotTopLevel; got {err:?}"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn restart_unknown_id_errors_not_found() {
+        let registry = build_registry(&[]);
+        let (engine, handle) = Engine::start(registry);
+
+        let err = handle
+            .restart(TaskId(99_999))
+            .await
+            .expect_err("restart on unknown id must error");
+        assert!(
+            matches!(err, RestartError::NotFound(_)),
+            "expected NotFound; got {err:?}"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn graph_helpers_on_root() {
+        let snap = GraphSnapshot::default();
+        assert_eq!(snap.top_level(TaskId::ROOT), None);
+        assert!(!snap.is_top_level(TaskId::ROOT));
+        assert!(snap.ancestors(TaskId::ROOT).is_empty());
+    }
+
+    #[test]
+    fn graph_helpers_on_unknown_id() {
+        let snap = GraphSnapshot::default();
+        let unknown = TaskId(12_345);
+        assert_eq!(snap.top_level(unknown), None);
+        assert!(!snap.is_top_level(unknown));
+        assert!(snap.ancestors(unknown).is_empty());
+    }
+
+    #[test]
+    fn graph_helpers_on_nested_ids() {
+        // Build a synthetic snapshot: ROOT → top → mid → leaf
+        let top = TaskId(1);
+        let mid = TaskId(2);
+        let leaf = TaskId(3);
+        let mut tasks = HashMap::new();
+        tasks.insert(
+            top,
+            TaskNode {
+                id: top,
+                name: "top".into(),
+                parent: Some(TaskId::ROOT),
+                children: vec![mid],
+                status: TaskStatus::Setup,
+                processes: vec![],
+            },
+        );
+        tasks.insert(
+            mid,
+            TaskNode {
+                id: mid,
+                name: "mid".into(),
+                parent: Some(top),
+                children: vec![leaf],
+                status: TaskStatus::Setup,
+                processes: vec![],
+            },
+        );
+        tasks.insert(
+            leaf,
+            TaskNode {
+                id: leaf,
+                name: "leaf".into(),
+                parent: Some(mid),
+                children: vec![],
+                status: TaskStatus::Setup,
+                processes: vec![],
+            },
+        );
+        let snap = GraphSnapshot {
+            root: TaskId::ROOT,
+            tasks: Arc::new(tasks),
+        };
+
+        assert_eq!(snap.top_level(top), Some(top));
+        assert_eq!(snap.top_level(mid), Some(top));
+        assert_eq!(snap.top_level(leaf), Some(top));
+        assert!(snap.is_top_level(top));
+        assert!(!snap.is_top_level(mid));
+        assert!(!snap.is_top_level(leaf));
+        assert!(snap.ancestors(top).is_empty());
+        assert_eq!(snap.ancestors(mid), vec![top]);
+        assert_eq!(snap.ancestors(leaf), vec![mid, top]);
     }
 
     #[tokio::test]

@@ -24,7 +24,7 @@ use crate::error::{TaskError, TaskResult};
 use crate::task::{TaskContext, TaskDef, TaskFnKind};
 
 use super::TaskId;
-use super::control::{Control, KillSignal};
+use super::control::{Control, KillSignal, RestartError};
 use super::engine::take_control_rx;
 
 /// Synthetic root `TaskDef`. Library-provided, never registered with
@@ -118,6 +118,50 @@ pub(crate) fn root_body_fn<'a>(
                             let engine_clone = engine.clone();
                             tokio::spawn(async move {
                                 engine_clone.cancel_subtree_with(id, kill_timeout).await;
+                            });
+                        }
+
+                        Control::RestartTask { id, reply } => {
+                            // Verify the task is top-level (direct child of ROOT).
+                            let exec = match engine.lookup(id) {
+                                Some(e) => e,
+                                None => {
+                                    let _ = reply.send(Err(RestartError::NotFound(id)));
+                                    continue;
+                                }
+                            };
+                            if exec.parent != Some(TaskId::ROOT) {
+                                let _ = reply.send(Err(RestartError::NotTopLevel(id)));
+                                continue;
+                            }
+                            let Some(def) = exec.task_def else {
+                                let _ = reply.send(Err(RestartError::NotFound(id)));
+                                continue;
+                            };
+                            let args = exec.task_args.clone();
+                            // Cancel the existing subtree first so the
+                            // user-visible "old" task transitions to
+                            // Cancelled. The TaskExecution stays in the
+                            // table — the graph snapshot keeps it.
+                            let engine_cancel = engine.clone();
+                            let engine_spawn = engine.clone();
+                            let opts = super::control::SpawnOptions::default();
+                            tokio::spawn(async move {
+                                engine_cancel
+                                    .cancel_subtree_with(id, super::engine::CANCEL_TIMEOUT)
+                                    .await;
+                                match engine_spawn.spawn_child(TaskId::ROOT, def, args, opts) {
+                                    Ok(handle) => {
+                                        let new_id = handle.id();
+                                        let _ = reply.send(Ok(new_id));
+                                        tokio::spawn(async move {
+                                            let _ = handle.await;
+                                        });
+                                    }
+                                    Err(e) => {
+                                        let _ = reply.send(Err(RestartError::Task(e)));
+                                    }
+                                }
                             });
                         }
 

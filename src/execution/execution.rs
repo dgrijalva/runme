@@ -251,6 +251,13 @@ pub struct TaskExecution {
     // ── Registry ───────────────────────────────────────────────────
     /// Optional shared registry for task discovery and cross-invocation.
     registry: Option<Arc<Registry>>,
+
+    // ── Restart support ────────────────────────────────────────────
+    /// The `TaskDef` and args this execution was launched with. Captured
+    /// in `spawn_body` so `Engine::restart` can re-spawn the same task.
+    /// `None` for the synthetic root.
+    pub task_def: Option<&'static TaskDef>,
+    pub task_args: Vec<String>,
 }
 
 impl TaskExecution {
@@ -296,6 +303,8 @@ impl TaskExecution {
             log_store,
             tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
             registry: None,
+            task_def: None,
+            task_args: Vec::new(),
         }
     }
 
@@ -316,6 +325,8 @@ impl TaskExecution {
         task_args: Vec<String>,
     ) {
         self.task_name = task.name.to_string();
+        self.task_def = Some(task);
+        self.task_args = task_args.clone();
 
         let tracing_buffer = self.tracing_buffer.clone();
         let log_store = self.log_store.clone();

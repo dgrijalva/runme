@@ -40,6 +40,25 @@ impl From<TaskError> for EngineError {
     }
 }
 
+/// Errors produced by `Engine::restart`.
+#[derive(Debug, thiserror::Error)]
+pub enum RestartError {
+    #[error("task is not top-level: {0}")]
+    NotTopLevel(TaskId),
+    #[error("task not found: {0}")]
+    NotFound(TaskId),
+    #[error("engine is shutting down")]
+    ShuttingDown,
+    #[error("{0}")]
+    Task(TaskError),
+}
+
+impl From<TaskError> for RestartError {
+    fn from(err: TaskError) -> Self {
+        RestartError::Task(err)
+    }
+}
+
 /// Per-invocation spawn options.
 ///
 /// Designed to grow: future fields (ready_when, env overlay, etc.) land
@@ -86,5 +105,12 @@ pub(crate) enum Control {
     /// Cancel the entire root subtree and exit the runtime.
     Quit {
         reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    /// Restart a top-level task: cancel the existing one (subtree stays
+    /// in the graph) and spawn a fresh sibling using the same `TaskDef`
+    /// and args.
+    RestartTask {
+        id: TaskId,
+        reply: oneshot::Sender<Result<TaskId, RestartError>>,
     },
 }
