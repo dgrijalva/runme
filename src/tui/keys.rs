@@ -28,6 +28,28 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
             state.refresh_focus_filter();
         }
 
+        // ]: jump to the next section-level entry (section header or
+        // top-level task). Skips sub-tasks and processes. Stays put when
+        // already at the last section-level row.
+        KeyCode::Char(']') => {
+            if let Some(idx) =
+                sidebar::next_section_level(&state.sidebar_entries, state.sidebar.selection)
+            {
+                state.sidebar.selection = idx;
+                state.refresh_focus_filter();
+            }
+        }
+
+        // [: jump to the previous section-level entry. Symmetric with `]`.
+        KeyCode::Char('[') => {
+            if let Some(idx) =
+                sidebar::prev_section_level(&state.sidebar_entries, state.sidebar.selection)
+            {
+                state.sidebar.selection = idx;
+                state.refresh_focus_filter();
+            }
+        }
+
         // Enter: open process detail (for process entries) or toggle source visibility (for task entry).
         // Section headers no-op — they're filter-only rows.
         KeyCode::Enter => {

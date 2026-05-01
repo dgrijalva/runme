@@ -148,6 +148,36 @@ impl SidebarEntry {
     pub fn is_section_header(&self) -> bool {
         self.kind.is_section_header()
     }
+
+    /// Whether this entry is a "section-level" landmark — section headers
+    /// or top-level task rows. These are the jump targets for `[` / `]`
+    /// navigation; sub-tasks and processes are skipped.
+    pub fn is_section_level(&self) -> bool {
+        self.is_section_header() || (matches!(self.kind, SidebarEntryKind::Task) && self.depth == 0)
+    }
+}
+
+/// Find the next section-level entry strictly after `from`, or `None` if
+/// `from` is already at the last section-level row.
+pub fn next_section_level(entries: &[SidebarEntry], from: usize) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .skip(from + 1)
+        .find(|(_, e)| e.is_section_level())
+        .map(|(i, _)| i)
+}
+
+/// Find the next section-level entry strictly before `from`, or `None` if
+/// `from` is already at or above the first section-level row.
+pub fn prev_section_level(entries: &[SidebarEntry], from: usize) -> Option<usize> {
+    entries
+        .iter()
+        .enumerate()
+        .take(from)
+        .rev()
+        .find(|(_, e)| e.is_section_level())
+        .map(|(i, _)| i)
 }
 
 /// Build the list of sidebar entries from the engine's graph snapshot.
@@ -955,5 +985,74 @@ mod tests {
         };
         assert!(!task.is_section_header());
         assert!(task.is_task());
+    }
+
+    fn make_entry(kind: SidebarEntryKind, depth: usize, source: TaskId) -> SidebarEntry {
+        SidebarEntry {
+            name: String::new(),
+            source,
+            status_tag: String::new(),
+            status_color: Color::Gray,
+            visible: true,
+            kind,
+            depth,
+        }
+    }
+
+    #[test]
+    fn section_level_includes_headers_and_top_level_tasks() {
+        let entries = vec![
+            make_entry(SidebarEntryKind::AllTasks, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::RunningHeader, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::Task, 0, TaskId(1)),
+            make_entry(SidebarEntryKind::Process, 1, TaskId(2)),
+            make_entry(SidebarEntryKind::Task, 1, TaskId(3)), // sub-task
+            make_entry(SidebarEntryKind::CompletedHeader, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::Task, 0, TaskId(4)),
+        ];
+        let levels: Vec<bool> = entries.iter().map(|e| e.is_section_level()).collect();
+        assert_eq!(levels, vec![true, true, true, false, false, true, true]);
+    }
+
+    #[test]
+    fn next_section_level_skips_subitems() {
+        let entries = vec![
+            make_entry(SidebarEntryKind::AllTasks, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::RunningHeader, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::Task, 0, TaskId(1)),
+            make_entry(SidebarEntryKind::Process, 1, TaskId(2)),
+            make_entry(SidebarEntryKind::Task, 1, TaskId(3)),
+            make_entry(SidebarEntryKind::CompletedHeader, 0, TaskId::ROOT),
+        ];
+        // From "All tasks" → next is RunningHeader.
+        assert_eq!(next_section_level(&entries, 0), Some(1));
+        // From RunningHeader → next is the top-level Task.
+        assert_eq!(next_section_level(&entries, 1), Some(2));
+        // From the top-level Task → next jumps over process + sub-task.
+        assert_eq!(next_section_level(&entries, 2), Some(5));
+        // From a sub-item → finds the next section-level row going down.
+        assert_eq!(next_section_level(&entries, 3), Some(5));
+        // At the last section-level row → None.
+        assert_eq!(next_section_level(&entries, 5), None);
+    }
+
+    #[test]
+    fn prev_section_level_skips_subitems() {
+        let entries = vec![
+            make_entry(SidebarEntryKind::AllTasks, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::RunningHeader, 0, TaskId::ROOT),
+            make_entry(SidebarEntryKind::Task, 0, TaskId(1)),
+            make_entry(SidebarEntryKind::Process, 1, TaskId(2)),
+            make_entry(SidebarEntryKind::Task, 1, TaskId(3)),
+            make_entry(SidebarEntryKind::CompletedHeader, 0, TaskId::ROOT),
+        ];
+        // From CompletedHeader → previous is the top-level Task.
+        assert_eq!(prev_section_level(&entries, 5), Some(2));
+        // From a sub-item → finds the next section-level row going up.
+        assert_eq!(prev_section_level(&entries, 4), Some(2));
+        // From the top-level Task → RunningHeader.
+        assert_eq!(prev_section_level(&entries, 2), Some(1));
+        // At the first row → None.
+        assert_eq!(prev_section_level(&entries, 0), None);
     }
 }
