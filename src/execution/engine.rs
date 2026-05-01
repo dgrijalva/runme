@@ -115,6 +115,24 @@ impl GraphSnapshot {
         out
     }
 
+    /// Resolve any source id (task or process) to its top-level task.
+    ///
+    /// Processes aren't in the `tasks` map directly — they live nested in
+    /// their owning task's `processes` vec. This helper handles both
+    /// cases: if `id` is a task, behaves like `top_level`; if it's a
+    /// process, finds its owning task first, then walks up.
+    pub fn top_level_of(&self, id: TaskId) -> Option<TaskId> {
+        if self.tasks.contains_key(&id) {
+            return self.top_level(id);
+        }
+        let owner = self
+            .tasks
+            .iter()
+            .find(|(_, node)| node.processes.iter().any(|p| p.id == id))
+            .map(|(tid, _)| *tid)?;
+        self.top_level(owner)
+    }
+
     /// True if `id` is a direct child of `ROOT`.
     pub fn is_top_level(&self, id: TaskId) -> bool {
         if id == TaskId::ROOT {

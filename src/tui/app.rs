@@ -53,17 +53,19 @@ pub enum AppMode {
 
 /// Source-visibility filter driven by the focused sidebar entry.
 ///
-/// `RunningTops` and `CompletedTops` are *dynamic*: they resolve against
-/// the live graph each time the effective set is queried, so new spawns
-/// and status transitions show up without the user re-selecting the
-/// header. `Frozen` captures a static set, used for Task / Process
-/// selection where the intent is to pin the view to those exact ids.
+/// All non-`All` variants except `Source` are *dynamic*: they resolve
+/// against the live graph each time the effective set is queried, so
+/// new spawns, status transitions, and freshly-started sub-tasks show
+/// up without the user re-selecting anything.
 #[derive(Debug, Clone)]
 pub enum FocusFilter {
     /// No filtering by focus.
     All,
-    /// Captured set (Task/Process selection).
-    Frozen(HashSet<TaskId>),
+    /// A single source id — used for process selection.
+    Source(TaskId),
+    /// A task and its current descendants (sub-tasks + processes),
+    /// evaluated against the live graph.
+    TaskSubtree(TaskId),
     /// All currently-running top-level subtrees.
     RunningTops,
     /// All currently-completed top-level subtrees.
@@ -155,12 +157,16 @@ pub struct AppState {
     pub filter_history: Vec<String>,
     /// Current position in filter history (for Up/Down cycling). None = not browsing history.
     pub filter_history_index: Option<usize>,
-    /// The currently running task definition (kept for restart).
+    /// The most recently launched task definition. Used by the status
+    /// bar to display the active task's name.
     pub current_task: Option<&'static TaskDef>,
-    /// The arguments the current task was launched with (kept for restart).
-    pub current_task_args: Vec<String>,
-    /// Flag: the event loop should restart the current task.
-    pub pending_restart: bool,
+    /// Set by the `r` handler — the top-level TaskId to restart. The
+    /// async loop body consumes it, awaits `EngineHandle::restart`, and
+    /// stashes the returned new id in `follow_source`.
+    pub pending_restart_top: Option<TaskId>,
+    /// After a restart, the new top-level TaskId that selection should
+    /// follow once the sidebar rebuild picks it up.
+    pub follow_source: Option<TaskId>,
     /// Last known viewport height (rows available for log entries), cached for copy operations.
     pub last_viewport_height: Option<u16>,
     /// Shared registry for task discovery and cross-invocation.
@@ -212,8 +218,8 @@ impl AppState {
             filter_history: Vec::new(),
             filter_history_index: None,
             current_task: None,
-            current_task_args: Vec::new(),
-            pending_restart: false,
+            pending_restart_top: None,
+            follow_source: None,
             last_viewport_height: None,
             registry: None,
             field_stats: FieldStats::new(),
@@ -231,7 +237,11 @@ impl AppState {
     pub fn effective_visible_sources(&self) -> Option<HashSet<TaskId>> {
         match &self.focus_filter {
             FocusFilter::All => None,
-            FocusFilter::Frozen(set) => Some(set.clone()),
+            FocusFilter::Source(id) => Some(std::iter::once(*id).collect()),
+            FocusFilter::TaskSubtree(id) => {
+                let handle = self.engine.as_ref()?;
+                Some(handle.source_ids_for(*id).into_iter().collect())
+            }
             FocusFilter::RunningTops => self.section_visible_sources(true),
             FocusFilter::CompletedTops => self.section_visible_sources(false),
         }
@@ -348,15 +358,8 @@ impl AppState {
             SidebarEntryKind::AllTasks => FocusFilter::All,
             SidebarEntryKind::RunningHeader => FocusFilter::RunningTops,
             SidebarEntryKind::CompletedHeader => FocusFilter::CompletedTops,
-            SidebarEntryKind::Process => {
-                FocusFilter::Frozen(std::iter::once(entry.source).collect())
-            }
-            SidebarEntryKind::Task => match self.engine.as_ref() {
-                Some(handle) => {
-                    FocusFilter::Frozen(handle.source_ids_for(entry.source).into_iter().collect())
-                }
-                None => FocusFilter::All,
-            },
+            SidebarEntryKind::Process => FocusFilter::Source(entry.source),
+            SidebarEntryKind::Task => FocusFilter::TaskSubtree(entry.source),
         };
     }
 
@@ -364,7 +367,6 @@ impl AppState {
     /// task is selected from the picker or `r` is used to restart.
     pub async fn launch_picked_task(&mut self, task: &'static TaskDef, task_args: Vec<String>) {
         self.current_task = Some(task);
-        self.current_task_args = task_args.clone();
 
         if let Some(handle) = self.engine.as_ref() {
             match handle.spawn_task(task, task_args).await {
@@ -587,7 +589,7 @@ mod tests {
         state.log_lines.push(make_entry(api));
         state.log_lines.push(make_entry(worker));
         state.log_lines.push(make_entry(api));
-        state.focus_filter = FocusFilter::Frozen([api].into_iter().collect());
+        state.focus_filter = FocusFilter::Source(api);
         let indices = state.visible_line_indices();
         assert_eq!(indices, vec![0, 2]);
     }
@@ -607,8 +609,9 @@ mod tests {
 
     #[test]
     fn focus_and_hide_compose() {
-        // Focus filter limits to {api, worker}; manual hide removes worker.
-        // Result: only api entries visible.
+        // Focus filter limits to {api}; manual hide of worker is also
+        // applied. Only api entries visible (worker would already be
+        // filtered out by focus, but the hide composes).
         let mut state = AppState::new();
         let api = TaskId(1);
         let worker = TaskId(2);
@@ -616,7 +619,7 @@ mod tests {
         state.log_lines.push(make_entry(api));
         state.log_lines.push(make_entry(worker));
         state.log_lines.push(make_entry(other));
-        state.focus_filter = FocusFilter::Frozen([api, worker].into_iter().collect());
+        state.focus_filter = FocusFilter::Source(api);
         state.hidden_sources.insert(worker);
         let indices = state.visible_line_indices();
         assert_eq!(indices, vec![0]);
@@ -634,11 +637,11 @@ mod tests {
     #[test]
     fn show_all_does_not_clear_focus_filter() {
         let mut state = AppState::new();
-        state.focus_filter = FocusFilter::Frozen([TaskId(1)].into_iter().collect());
+        state.focus_filter = FocusFilter::Source(TaskId(1));
         state.hidden_sources.insert(TaskId(2));
         state.show_all_sources();
         assert!(state.hidden_sources.is_empty());
-        assert!(matches!(&state.focus_filter, FocusFilter::Frozen(s) if s.contains(&TaskId(1))));
+        assert!(matches!(&state.focus_filter, FocusFilter::Source(id) if *id == TaskId(1)));
     }
 
     #[test]
@@ -658,7 +661,7 @@ mod tests {
         let mut state = AppState::new();
         let api = TaskId(11);
         state.hidden_sources.insert(api);
-        state.focus_filter = FocusFilter::Frozen([TaskId(99)].into_iter().collect());
+        state.focus_filter = FocusFilter::Source(TaskId(99));
         // Manually re-derive — refresh_focus_filter would need a real engine.
         assert!(state.hidden_sources.contains(&api));
     }
@@ -791,13 +794,15 @@ mod tests {
     }
 
     #[test]
-    fn frozen_filter_is_unaffected_by_graph_changes() {
-        // Frozen captures a static set — used for Task/Process selection.
-        let mut state = AppState::new();
-        let captured = TaskId(7);
-        state.focus_filter = FocusFilter::Frozen([captured].into_iter().collect());
+    fn source_filter_is_static_single_id() {
+        // Source variant resolves to exactly the captured id (used for
+        // process selection, where the filter is "this process's logs").
+        let state = AppState {
+            focus_filter: FocusFilter::Source(TaskId(7)),
+            ..AppState::new()
+        };
         let resolved = state.effective_visible_sources().expect("set");
-        assert!(resolved.contains(&captured));
+        assert!(resolved.contains(&TaskId(7)));
         assert_eq!(resolved.len(), 1);
     }
 

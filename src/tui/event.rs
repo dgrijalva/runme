@@ -90,32 +90,28 @@ pub async fn run_event_loop(
                             state.launch_picked_task(task, Vec::new()).await;
                         }
 
-                        if state.pending_restart {
-                            state.pending_restart = false;
-                            if let Some(task) = state.current_task {
-                                if let (Some(handle), Some(prev_id)) =
-                                    (state.engine.clone(), state.current_task_id.take())
-                                {
-                                    tokio::spawn(async move {
-                                        let _ = handle
-                                            .kill_task(prev_id, crate::execution::KillSignal::Term)
-                                            .await;
-                                    });
+                        if let Some(top_id) = state.pending_restart_top.take()
+                            && let Some(handle) = state.engine.clone()
+                        {
+                            match handle.restart(top_id).await {
+                                Ok(new_id) => {
+                                    state.follow_source = Some(new_id);
+                                    state.current_task_id = Some(new_id);
+                                    state.scroll = super::viewport::ScrollState::Tail;
+                                    state.search = super::search::SearchState::new();
+                                    state.detail_scroll = 0;
+                                    state.process_detail_index = None;
+                                    state.process_detail_scroll = 0;
+                                    state.process_detail_sockets = None;
+                                    state.dirty = true;
                                 }
-
-                                state.scroll = super::viewport::ScrollState::Tail;
-                                state.sidebar.selection = 0;
-                                state.sidebar.focused = false;
-                                state.search = super::search::SearchState::new();
-                                state.sidebar_entries.clear();
-                                state.detail_scroll = 0;
-                                state.process_detail_index = None;
-                                state.process_detail_scroll = 0;
-                                state.process_detail_sockets = None;
-                                prev_process_statuses.clear();
-
-                                let args = state.current_task_args.clone();
-                                state.launch_picked_task(task, args).await;
+                                Err(e) => {
+                                    state.notifications.push((
+                                        format!("restart failed: {e}"),
+                                        std::time::Instant::now(),
+                                    ));
+                                    state.dirty = true;
+                                }
                             }
                         }
                     }
@@ -224,6 +220,20 @@ async fn refresh_sidebar_state(state: &mut AppState) {
 
     state.sidebar_entries =
         sidebar::build_sidebar_entries_from_graph(&snapshot, &effective, &mut state.source_colors);
+
+    // After a restart, follow the new top-level entry once it appears in
+    // the freshly-rebuilt list.
+    if let Some(target) = state.follow_source
+        && let Some(idx) = state
+            .sidebar_entries
+            .iter()
+            .position(|e| e.source == target)
+    {
+        state.sidebar.selection = idx;
+        state.follow_source = None;
+        state.refresh_focus_filter();
+    }
+
     state.sidebar.clamp_selection(state.sidebar_entries.len());
 }
 
@@ -394,9 +404,26 @@ fn handle_key(
             state.dirty = true;
             return;
         }
-        KeyCode::Char('r') if state.current_task.is_some() => {
-            state.pending_restart = true;
-            state.dirty = true;
+        KeyCode::Char('r') => {
+            // Resolve a top-level task id to restart. Prefer the current
+            // sidebar selection (walks up from sub-tasks/processes); fall
+            // back to the most recently launched task when the selection
+            // isn't task-like (section header, no entries yet, etc).
+            let Some(handle) = state.engine.as_ref() else {
+                return;
+            };
+            let snapshot = handle.graph.borrow().clone();
+            let from_selection = state
+                .sidebar_entries
+                .get(state.sidebar.selection)
+                .filter(|e| !e.is_section_header())
+                .and_then(|e| snapshot.top_level_of(e.source));
+            let top_id = from_selection
+                .or_else(|| state.current_task_id.and_then(|id| snapshot.top_level_of(id)));
+            if let Some(top_id) = top_id {
+                state.pending_restart_top = Some(top_id);
+                state.dirty = true;
+            }
             return;
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
