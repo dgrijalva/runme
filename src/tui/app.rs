@@ -268,10 +268,17 @@ impl AppState {
 
     /// Update the focus filter based on the currently focused sidebar entry.
     ///
-    /// - "All tasks" (root) => empty `focus_filter` (no filtering by focus).
+    /// - "All tasks" header => empty `focus_filter` (no filtering by focus).
+    /// - "Running tasks" header => union of `source_ids_for` for every
+    ///   currently-running (`Setup` | `Ready`) top-level task.
+    /// - "Completed tasks" header => union of `source_ids_for` for every
+    ///   currently-completed (anything else) top-level task.
     /// - Task entry => `source_ids_for(task_id)` (the task and its subtree).
     /// - Process entry => single-source filter `{process_id}`.
     pub fn refresh_focus_filter(&mut self) {
+        use super::sidebar::SidebarEntryKind;
+        use crate::execution::TaskStatus;
+
         let Some(entry) = self.sidebar_entries.get(self.sidebar.selection) else {
             self.focus_filter.clear();
             return;
@@ -280,18 +287,46 @@ impl AppState {
             self.focus_filter.clear();
             return;
         };
-        if entry.source == handle.root {
-            // "All tasks" — no focus filter.
-            self.focus_filter.clear();
-            return;
+        match entry.kind {
+            SidebarEntryKind::AllTasks => {
+                // No focus filter.
+                self.focus_filter.clear();
+            }
+            SidebarEntryKind::RunningHeader | SidebarEntryKind::CompletedHeader => {
+                // Walk the graph: pick top-level tasks whose status matches
+                // the section, then union `source_ids_for` for each.
+                let want_running = matches!(entry.kind, SidebarEntryKind::RunningHeader);
+                let snapshot = handle.graph.borrow().clone();
+                let mut top_level: Vec<TaskId> = Vec::new();
+                if let Some(root) = snapshot.tasks.get(&handle.root) {
+                    for &child_id in &root.children {
+                        let Some(child) = snapshot.tasks.get(&child_id) else {
+                            continue;
+                        };
+                        let is_running =
+                            matches!(child.status, TaskStatus::Setup | TaskStatus::Ready);
+                        if is_running == want_running {
+                            top_level.push(child_id);
+                        }
+                    }
+                }
+                let mut filter = HashSet::new();
+                for id in top_level {
+                    for src in handle.source_ids_for(id) {
+                        filter.insert(src);
+                    }
+                }
+                self.focus_filter = filter;
+            }
+            SidebarEntryKind::Process => {
+                // Process entry: filter to just this process's logs.
+                self.focus_filter = std::iter::once(entry.source).collect();
+            }
+            SidebarEntryKind::Task => {
+                let ids = handle.source_ids_for(entry.source);
+                self.focus_filter = ids.into_iter().collect();
+            }
         }
-        if !entry.is_task {
-            // Process entry: filter to just this process's logs.
-            self.focus_filter = std::iter::once(entry.source).collect();
-            return;
-        }
-        let ids = handle.source_ids_for(entry.source);
-        self.focus_filter = ids.into_iter().collect();
     }
 
     /// Launch a task through the engine. Called from the event loop when a
@@ -620,5 +655,126 @@ mod tests {
     fn has_running_tasks_without_engine_is_false() {
         let state = AppState::new();
         assert!(!state.has_running_tasks());
+    }
+
+    // -- refresh_focus_filter on section headers (engine-less variants) --
+
+    use super::super::sidebar::{SidebarEntry, SidebarEntryKind};
+    use ratatui::style::Color;
+
+    fn make_header(name: &str, kind: SidebarEntryKind) -> SidebarEntry {
+        SidebarEntry {
+            name: name.to_string(),
+            source: TaskId::ROOT,
+            status_tag: String::new(),
+            status_color: Color::Gray,
+            visible: true,
+            kind,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn refresh_focus_filter_no_engine_clears() {
+        // Engine-less variants always clear `focus_filter`. This guards
+        // the "no engine wired" path in `refresh_focus_filter` for all
+        // selectable kinds, including section headers.
+        let mut state = AppState::new();
+        state.focus_filter.insert(TaskId(99));
+        state.sidebar_entries = vec![
+            make_header("All tasks", SidebarEntryKind::AllTasks),
+            make_header("Running tasks", SidebarEntryKind::RunningHeader),
+            make_header("Completed tasks", SidebarEntryKind::CompletedHeader),
+        ];
+        for sel in 0..3 {
+            state.focus_filter.insert(TaskId(sel as u64 + 1));
+            state.sidebar.selection = sel;
+            state.refresh_focus_filter();
+            assert!(
+                state.focus_filter.is_empty(),
+                "selection {} should clear focus_filter without engine",
+                sel
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_focus_filter_section_headers_with_engine() {
+        // With a real engine and known top-level tasks (one completed),
+        // Completed header populates `focus_filter` with that task's
+        // subtree ids; AllTasks clears it.
+        use crate::error::TaskResult;
+        use crate::execution::Engine;
+        use crate::task::{TaskContext, TaskDef, TaskFnKind};
+        use std::future::Future;
+        use std::pin::Pin;
+
+        fn no_args() -> Option<clap::Command> {
+            None
+        }
+        fn ok_task<'a>(
+            _ctx: &'a TaskContext,
+            _args: &[String],
+        ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+            Box::pin(async move { Ok(()) })
+        }
+        static OK: TaskDef = TaskDef {
+            name: "ok_focus_test",
+            description: None,
+            group: "",
+            func: TaskFnKind::Static(ok_task),
+            arg_metadata: no_args,
+            ui_hint: None,
+        };
+
+        let mut registry = crate::task::Registry::new();
+        registry.register(&OK);
+        let (engine, handle) = Engine::start(Arc::new(registry));
+
+        // Spawn one task and wait for it to finish.
+        let id = handle.spawn_task(&OK, vec![]).await.unwrap();
+        // Spin until the task reaches a terminal status.
+        for _ in 0..200 {
+            let snap = handle.graph.borrow().clone();
+            if let Some(node) = snap.tasks.get(&id)
+                && !matches!(
+                    node.status,
+                    crate::execution::TaskStatus::Setup | crate::execution::TaskStatus::Ready
+                )
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut state = AppState::new();
+        state.engine = Some(handle.clone());
+        state.sidebar_entries = vec![
+            make_header("All tasks", SidebarEntryKind::AllTasks),
+            make_header("Running tasks", SidebarEntryKind::RunningHeader),
+            make_header("Completed tasks", SidebarEntryKind::CompletedHeader),
+        ];
+
+        // AllTasks clears.
+        state.sidebar.selection = 0;
+        state.focus_filter.insert(TaskId(99));
+        state.refresh_focus_filter();
+        assert!(state.focus_filter.is_empty());
+
+        // RunningHeader: no running top-level tasks => empty filter.
+        state.sidebar.selection = 1;
+        state.refresh_focus_filter();
+        assert!(state.focus_filter.is_empty());
+
+        // CompletedHeader: includes the completed task's id.
+        state.sidebar.selection = 2;
+        state.refresh_focus_filter();
+        assert!(
+            state.focus_filter.contains(&id),
+            "CompletedHeader filter must include the completed task's id"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
     }
 }

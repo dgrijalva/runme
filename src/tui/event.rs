@@ -625,7 +625,7 @@ async fn poll_lsof(state: &mut AppState) {
 fn get_process_detail_pid(state: &AppState) -> Option<u32> {
     let sidebar_idx = state.process_detail_index?;
     let entry = state.sidebar_entries.get(sidebar_idx)?;
-    if entry.is_task {
+    if entry.is_task() || entry.is_section_header() {
         return None;
     }
     let handle = state.engine.as_ref()?;

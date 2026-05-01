@@ -28,10 +28,13 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
             state.refresh_focus_filter();
         }
 
-        // Enter: open process detail (for process entries) or toggle source visibility (for task entry)
+        // Enter: open process detail (for process entries) or toggle source visibility (for task entry).
+        // Section headers no-op — they're filter-only rows.
         KeyCode::Enter => {
             if let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) {
-                if entry.is_task {
+                if entry.is_section_header() {
+                    // Section headers are no-op for activation keys.
+                } else if entry.is_task() {
                     let source = entry.source;
                     state.toggle_source_visibility(source);
                 } else {
@@ -43,20 +46,25 @@ pub(super) fn handle_sidebar_key(key: KeyEvent, state: &mut AppState) {
             }
         }
 
-        // Space: toggle source visibility
+        // Space: toggle source visibility. Section headers no-op.
         KeyCode::Char(' ') => {
             if let Some(entry) = state.sidebar_entries.get(state.sidebar.selection) {
-                let source = entry.source;
-                state.toggle_source_visibility(source);
+                if entry.is_section_header() {
+                    // No-op.
+                } else {
+                    let source = entry.source;
+                    state.toggle_source_visibility(source);
+                }
             }
         }
 
-        // s: stop selected process (SIGTERM)
+        // s: stop selected process (SIGTERM). Section headers no-op
+        // (handled inside `send_signal_to_selected`).
         KeyCode::Char('s') => {
             send_signal_to_selected(state, nix::sys::signal::Signal::SIGTERM);
         }
 
-        // S: send SIGHUP to selected process
+        // S: send SIGHUP to selected process.
         KeyCode::Char('S') => {
             send_signal_to_selected(state, nix::sys::signal::Signal::SIGHUP);
         }
@@ -688,7 +696,8 @@ pub(super) fn send_signal_to_selected(state: &mut AppState, sig: nix::sys::signa
         Some(e) => e,
         None => return,
     };
-    if entry.is_task {
+    // Tasks and section headers can't be signaled — only process entries.
+    if entry.is_task() || entry.is_section_header() {
         return;
     }
     // Find the process in the engine's graph snapshot, matched by id.
@@ -935,23 +944,29 @@ pub(super) enum KillTarget {
 
 /// Resolve the kill target from the current sidebar selection.
 ///
-/// - `None` if the "All tasks" row (root) is selected, or selection is empty.
-///   Caller should treat as no-op + status hint.
-/// - For task entries (excluding root), returns `Task(entry.source)`.
+/// - `None` if a section header ("All tasks", "Running tasks", "Completed
+///   tasks") is selected, or selection is empty. Caller should treat as
+///   no-op + status hint.
+/// - For task entries, returns `Task(entry.source)`.
 /// - For process entries, returns `Process(entry.source)` — the engine
 ///   walks its table to find the owning task and signals just that
 ///   process group.
 pub(super) fn resolve_kill_target(state: &AppState) -> Option<KillTarget> {
     let entry = state.sidebar_entries.get(state.sidebar.selection)?;
 
-    // "All tasks" row points at root — never a valid kill target via `kk`/`k9`.
+    // Section headers (including "All tasks") are never valid kill targets.
+    if entry.is_section_header() {
+        return None;
+    }
+
+    // Defensive: a non-header entry pointing at root would also be invalid.
     if let Some(handle) = state.engine.as_ref()
         && entry.source == handle.root
     {
         return None;
     }
 
-    if entry.is_task {
+    if entry.is_task() {
         Some(KillTarget::Task(entry.source))
     } else {
         Some(KillTarget::Process(entry.source))
@@ -1142,7 +1157,7 @@ fn osc52_copy(content: &str) {
 mod tests {
     use crossterm::event::{KeyEventKind, KeyEventState};
 
-    use super::super::sidebar::SidebarEntry;
+    use super::super::sidebar::{SidebarEntry, SidebarEntryKind};
     use super::super::viewport::ScrollState;
     use super::*;
     use ratatui::style::Color;
@@ -1185,7 +1200,7 @@ mod tests {
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
-                is_task: true,
+                kind: SidebarEntryKind::Task,
                 depth: 0,
             },
             SidebarEntry {
@@ -1194,7 +1209,7 @@ mod tests {
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
-                is_task: false,
+                kind: SidebarEntryKind::Process,
                 depth: 1,
             },
             SidebarEntry {
@@ -1203,7 +1218,7 @@ mod tests {
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
-                is_task: false,
+                kind: SidebarEntryKind::Process,
                 depth: 1,
             },
         ];
@@ -1242,7 +1257,7 @@ mod tests {
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
-                is_task: true,
+                kind: SidebarEntryKind::Task,
                 depth: 0,
             },
             SidebarEntry {
@@ -1251,7 +1266,7 @@ mod tests {
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
-                is_task: false,
+                kind: SidebarEntryKind::Process,
                 depth: 1,
             },
         ];
@@ -1488,7 +1503,7 @@ mod tests {
             status_tag: "SETUP".to_string(),
             status_color: Color::Yellow,
             visible: true,
-            is_task: true,
+            kind: SidebarEntryKind::Task,
             depth: 0,
         }];
 
@@ -1512,7 +1527,7 @@ mod tests {
                 status_tag: "READY".to_string(),
                 status_color: Color::Green,
                 visible: true,
-                is_task: true,
+                kind: SidebarEntryKind::Task,
                 depth: 0,
             },
             SidebarEntry {
@@ -1521,7 +1536,7 @@ mod tests {
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
-                is_task: false,
+                kind: SidebarEntryKind::Process,
                 depth: 1,
             },
         ];
@@ -1546,7 +1561,7 @@ mod tests {
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
-                is_task: true,
+                kind: SidebarEntryKind::Task,
                 depth: 0,
             },
             SidebarEntry {
@@ -1555,7 +1570,7 @@ mod tests {
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
-                is_task: false,
+                kind: SidebarEntryKind::Process,
                 depth: 1,
             },
         ];
@@ -1581,7 +1596,7 @@ mod tests {
                 status_tag: "SETUP".to_string(),
                 status_color: Color::Yellow,
                 visible: true,
-                is_task: true,
+                kind: SidebarEntryKind::Task,
                 depth: 0,
             },
             SidebarEntry {
@@ -1590,7 +1605,7 @@ mod tests {
                 status_tag: "RUN".to_string(),
                 status_color: Color::Green,
                 visible: true,
-                is_task: false,
+                kind: SidebarEntryKind::Process,
                 depth: 1,
             },
         ];
@@ -1600,6 +1615,121 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    // -- Section header guard tests --
+    //
+    // Section headers ("All tasks" / "Running tasks" / "Completed tasks")
+    // are filter-driving rows: navigation works, but Enter/Space/s/S no-op.
+
+    fn make_header_entry(name: &str, kind: SidebarEntryKind) -> SidebarEntry {
+        SidebarEntry {
+            name: name.to_string(),
+            source: TaskId::ROOT,
+            status_tag: String::new(),
+            status_color: Color::Gray,
+            visible: true,
+            kind,
+            depth: 0,
+        }
+    }
+
+    #[test]
+    fn sidebar_enter_on_section_header_is_noop() {
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar_entries = vec![
+            make_header_entry("All tasks", SidebarEntryKind::AllTasks),
+            make_header_entry("Running tasks", SidebarEntryKind::RunningHeader),
+            make_header_entry("Completed tasks", SidebarEntryKind::CompletedHeader),
+        ];
+        for sel in 0..3 {
+            state.sidebar.selection = sel;
+            state.mode = AppMode::Normal;
+            handle_sidebar_key(
+                make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+                &mut state,
+            );
+            // Mode should not have flipped to ProcessDetail; visibility
+            // should not have toggled either.
+            assert_eq!(state.mode, AppMode::Normal);
+            assert!(state.hidden_sources.is_empty());
+        }
+    }
+
+    #[test]
+    fn sidebar_space_on_section_header_is_noop() {
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar_entries =
+            vec![make_header_entry("Running tasks", SidebarEntryKind::RunningHeader)];
+        state.sidebar.selection = 0;
+        handle_sidebar_key(
+            make_key_event(KeyCode::Char(' '), KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(state.hidden_sources.is_empty());
+    }
+
+    #[test]
+    fn sidebar_s_on_section_header_is_noop() {
+        // No engine + section header selected: should not panic, should
+        // not attempt any signal dispatch.
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar_entries = vec![make_header_entry(
+            "Completed tasks",
+            SidebarEntryKind::CompletedHeader,
+        )];
+        state.sidebar.selection = 0;
+        handle_sidebar_key(
+            make_key_event(KeyCode::Char('s'), KeyModifiers::NONE),
+            &mut state,
+        );
+        handle_sidebar_key(
+            make_key_event(KeyCode::Char('S'), KeyModifiers::NONE),
+            &mut state,
+        );
+        // No crash + no state change is the test here.
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn sidebar_arrows_navigate_through_section_headers() {
+        // Down should let selection advance through section header rows
+        // even though they're not toggleable.
+        let mut state = AppState::new();
+        state.sidebar.focused = true;
+        state.sidebar_entries = vec![
+            make_header_entry("All tasks", SidebarEntryKind::AllTasks),
+            make_header_entry("Running tasks", SidebarEntryKind::RunningHeader),
+            make_header_entry("Completed tasks", SidebarEntryKind::CompletedHeader),
+        ];
+        assert_eq!(state.sidebar.selection, 0);
+        handle_sidebar_key(
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.sidebar.selection, 1);
+        handle_sidebar_key(
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert_eq!(state.sidebar.selection, 2);
+    }
+
+    #[test]
+    fn resolve_kill_target_section_header_is_none() {
+        let mut state = AppState::new();
+        state.sidebar_entries = vec![
+            make_header_entry("All tasks", SidebarEntryKind::AllTasks),
+            make_header_entry("Running tasks", SidebarEntryKind::RunningHeader),
+            make_header_entry("Completed tasks", SidebarEntryKind::CompletedHeader),
+        ];
+        for sel in 0..3 {
+            state.sidebar.selection = sel;
+            assert_eq!(resolve_kill_target(&state), None);
+        }
     }
 
     #[test]
@@ -1846,7 +1976,7 @@ mod tests {
             status_tag: "RUN".to_string(),
             status_color: Color::Green,
             visible: true,
-            is_task: true,
+            kind: SidebarEntryKind::Task,
             depth: 0,
         }
     }
@@ -1858,7 +1988,7 @@ mod tests {
             status_tag: "RUN".to_string(),
             status_color: Color::Green,
             visible: true,
-            is_task: false,
+            kind: SidebarEntryKind::Process,
             depth: 1,
         }
     }
