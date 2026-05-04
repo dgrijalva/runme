@@ -3,23 +3,45 @@ mod compile;
 mod crate_name;
 mod discover;
 mod frontmatter;
+mod init;
 mod transform;
 
 use compile::compile_workspace;
 use discover::discover;
+use init::{InitOutcome, run_init};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    // Discovery mode: walk up from cwd to find the nearest RUNME.rs
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
-        eprintln!("runme: could not determine current directory: {}", e);
+        eprintln!("rnme: could not determine current directory: {}", e);
         std::process::exit(1);
     });
 
+    // `--init` is handled before discovery so it works in directories
+    // that don't yet have a RUNME.rs. Only honored as the first arg —
+    // mixing it with other flags isn't meaningful.
+    if args.get(1).is_some_and(|a| a == "--init") {
+        match run_init(&cwd) {
+            Ok(InitOutcome::Created(path)) => {
+                println!("rnme: wrote {}", path.display());
+                std::process::exit(0);
+            }
+            Ok(InitOutcome::AlreadyExists(path)) => {
+                eprintln!("rnme: {} already exists", path.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("rnme: --init failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let discovery_result = discover(&cwd);
     if discovery_result.nearest.is_none() {
-        eprintln!("runme: no RUNME.rs found (searched from {})", cwd.display());
+        eprintln!("rnme: no RUNME.rs found (searched from {})", cwd.display());
+        eprintln!("rnme: run `rnme --init` to create one in this directory");
         std::process::exit(1);
     }
 
