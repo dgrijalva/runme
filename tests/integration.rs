@@ -56,36 +56,27 @@ async fn test_success_returns_ok() {
 // Priority 1: resolve_ui_mode() — pure function tests
 // ============================================================
 
-/// Explicit --ui tui with terminal → Tui.
+/// Explicit --tui with terminal → Tui.
 #[test]
 fn test_resolve_ui_mode_explicit_tui_with_terminal() {
     let mode = resolve_ui_mode(Some(UiMode::Tui), None, true);
     assert!(matches!(mode, UiMode::Tui));
 }
 
-/// Explicit --ui tui without terminal → falls back to Cli.
+/// Explicit --tui without terminal → falls back to Cli.
 #[test]
 fn test_resolve_ui_mode_explicit_tui_no_terminal() {
     let mode = resolve_ui_mode(Some(UiMode::Tui), None, false);
     assert!(matches!(mode, UiMode::Cli));
 }
 
-/// Explicit --ui cli always → Cli regardless of terminal.
+/// Explicit --cli always → Cli regardless of terminal.
 #[test]
 fn test_resolve_ui_mode_explicit_cli() {
     let with_term = resolve_ui_mode(Some(UiMode::Cli), None, true);
     let without_term = resolve_ui_mode(Some(UiMode::Cli), None, false);
     assert!(matches!(with_term, UiMode::Cli));
     assert!(matches!(without_term, UiMode::Cli));
-}
-
-/// Explicit --ui agent always → Agent regardless of terminal.
-#[test]
-fn test_resolve_ui_mode_explicit_agent() {
-    let with_term = resolve_ui_mode(Some(UiMode::Agent), None, true);
-    let without_term = resolve_ui_mode(Some(UiMode::Agent), None, false);
-    assert!(matches!(with_term, UiMode::Agent));
-    assert!(matches!(without_term, UiMode::Agent));
 }
 
 /// Explicit flag overrides task hint.

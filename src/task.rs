@@ -115,9 +115,9 @@ pub type ArgMetadataFn = fn() -> Option<clap::Command>;
 /// (required by `inventory`).
 /// UI mode hint — tasks can declare a preferred execution mode.
 ///
-/// When set on a `TaskDef`, the CLI dispatch will use this mode instead of
-/// the user's `--ui` flag. Useful for utility tasks (like `list`) that
-/// should always run in CLI mode regardless of the default.
+/// When set on a `TaskDef`, the CLI dispatch will use this mode unless the
+/// user passes an explicit `--tui` / `--cli` flag. Useful for utility tasks
+/// (like `list`) that should always run in CLI mode regardless of the default.
 #[derive(Clone, Copy, Debug)]
 pub enum UiHint {
     /// Interactive TUI with log viewer
@@ -133,7 +133,7 @@ pub struct TaskDef {
     pub func: TaskFnKind,
     pub arg_metadata: ArgMetadataFn,
     /// Optional UI mode override. When set, the CLI dispatch uses this
-    /// instead of the user's `--ui` flag.
+    /// unless the user passes an explicit `--tui` / `--cli` flag.
     pub ui_hint: Option<UiHint>,
 }
 

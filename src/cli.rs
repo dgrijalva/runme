@@ -1,9 +1,9 @@
 //! CLI argument model and dispatch logic.
 //!
-//! The two-stage model: `RnmeArgs` captures global flags (`--ui`, `--format`,
-//! `--timeout`, `--filter`) and a trailing `rest` vector. The first element of
-//! `rest` is the task name; everything after it is forwarded to the task's own
-//! argument parser.
+//! The two-stage model: `RnmeArgs` captures global flags (`--tui`, `--cli`,
+//! `--format`, `--timeout`, `--filter`) and a trailing `rest` vector. The first
+//! element of `rest` is the task name; everything after it is forwarded to the
+//! task's own argument parser.
 //!
 //! `cli::run()` is the single entry point called by the generated runner binary.
 //! All dispatch logic lives here rather than in generated code.
@@ -44,14 +44,22 @@ pub enum OutputFormat {
 /// Global flags are parsed first; the trailing `rest` vector carries the task
 /// name and any task-specific arguments that are forwarded to the task's own
 /// parser.
+///
+/// UI mode is selected by bare flags (`--tui`, `--cli`). At most one may be
+/// passed; if none is set, the mode is resolved from the task hint and terminal
+/// state. (`--mcp` is reserved for the upcoming MCP server mode.)
 #[derive(Parser)]
 #[command(name = "runme")]
 pub struct RnmeArgs {
-    /// UI mode (defaults to tui when a terminal is available, or the task's default_ui)
-    #[arg(long)]
-    pub ui: Option<UiMode>,
+    /// Force interactive TUI mode.
+    #[arg(long, conflicts_with_all = ["cli"])]
+    pub tui: bool,
 
-    /// Output format (for cli and agent modes)
+    /// Force direct CLI execution with stdio output.
+    #[arg(long, conflicts_with_all = ["tui"])]
+    pub cli: bool,
+
+    /// Output format (for cli mode)
     #[arg(long, default_value = "text")]
     pub format: OutputFormat,
 
@@ -68,6 +76,20 @@ pub struct RnmeArgs {
     pub rest: Vec<String>,
 }
 
+impl RnmeArgs {
+    /// Translate the bare UI-mode flags into an explicit `UiMode` selection.
+    ///
+    /// Clap's `conflicts_with_all` already rejects multiple flags being set at
+    /// parse time, so we just need to map a single set bit to a mode.
+    pub fn explicit_ui_mode(&self) -> Option<UiMode> {
+        match (self.tui, self.cli) {
+            (true, false) => Some(UiMode::Tui),
+            (false, true) => Some(UiMode::Cli),
+            _ => None,
+        }
+    }
+}
+
 /// Main dispatch function called by the generated runner binary.
 ///
 /// Parses CLI arguments, resolves the task, and dispatches to the appropriate
@@ -75,10 +97,11 @@ pub struct RnmeArgs {
 pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) {
     let args = RnmeArgs::parse();
     let has_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let explicit_ui = args.explicit_ui_mode();
 
     if args.rest.is_empty() {
         // No task specified — resolve UI mode without a task hint
-        let ui = resolve_ui_mode(args.ui, None, has_terminal);
+        let ui = resolve_ui_mode(explicit_ui.clone(), None, has_terminal);
         match ui {
             UiMode::Tui => {
                 let tasks = registry.list().to_vec();
@@ -94,7 +117,7 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
                 }
             }
             _ => {
-                eprintln!("No task specified. Use --ui tui for the interactive picker.");
+                eprintln!("No task specified. Use --tui for the interactive picker.");
                 std::process::exit(1);
             }
         }
@@ -118,7 +141,7 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
     let ui = if task_wants_help {
         UiMode::Cli
     } else {
-        resolve_ui_mode(args.ui, task.ui_hint, has_terminal)
+        resolve_ui_mode(explicit_ui, task.ui_hint, has_terminal)
     };
 
     // Parse `--timeout`. Accepts humantime strings ("30s", "5m", "1h30m")
@@ -424,7 +447,7 @@ async fn run_agent(
 
 /// Resolve the effective UI mode from explicit flag, task hint, and terminal state.
 ///
-/// Priority: explicit `--ui` flag > task's `ui_hint` > terminal detection.
+/// Priority: explicit `--tui`/`--cli` flag > task's `ui_hint` > terminal detection.
 pub fn resolve_ui_mode(
     explicit: Option<UiMode>,
     task_hint: Option<crate::task::UiHint>,

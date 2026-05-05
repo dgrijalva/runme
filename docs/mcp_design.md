@@ -17,8 +17,10 @@ agent ─stdio─▶ rnme --mcp ─WebSocket on 127.0.0.1:N─▶ rnme --rpc (en
 
 Two new dispatch arms in `cli.rs`:
 
-- **`--ui rpc`** — engine + WebSocket server bound to `127.0.0.1:0` (OS-assigned port). Headless. No TUI, no stdio forwarding. The "engine daemon" mode. On startup, prints connection info as a single JSON object on stdout (the _only_ thing it ever writes to stdout); errors go to stderr.
-- **`--ui mcp`** — MCP server on stdio (parent agent). Spawns a child `rnme --ui rpc`, reads its connection info, opens a WebSocket. Translates each MCP tool call into a WebSocket message. Watches RUNME.rs files; on change, kills the child and respawns. Child stderr is dropped (or forwarded later if useful).
+- **`--rpc`** — engine + WebSocket server bound to `127.0.0.1:0` (OS-assigned port). Headless. No TUI, no stdio forwarding. The "engine daemon" mode. On startup, prints connection info as a single JSON object on stdout (the _only_ thing it ever writes to stdout); errors go to stderr.
+- **`--mcp`** — MCP server on stdio (parent agent). Spawns a child `rnme --rpc`, reads its connection info, opens a WebSocket. Translates each MCP tool call into a WebSocket message. Watches RUNME.rs files; on change, kills the child and respawns. Child stderr is dropped (or forwarded later if useful).
+
+Like `--tui` and `--cli`, these are bare flags; passing more than one mode flag is rejected by the arg parser.
 
 ## Why this shape
 
@@ -27,7 +29,7 @@ The shape was reached by removing complexity from a more ambitious starting poin
 1. **One RPC layer, not two.** An earlier draft separated a "supervisor↔engine internal protocol" from a "public RPC for external consumers." There are no external consumers today — only MCP. A single internal-but-honest RPC, versioned with the rest of the crate, is enough. If a web UI or remote agent shows up later, that's the right time to think about stability and auth — not now.
 2. **No loopback abstraction.** macOS/Linux only. TCP `127.0.0.1` is fine; no Unix sockets, no Windows.
 3. **No streaming subscriptions over HTTP/SSE.** WebSocket is one persistent connection that handles request/response _and_ server-pushed events with the same message machinery. Avoids long-polling, avoids a separate streaming endpoint shape, avoids gRPC weight.
-4. **TUI stays in-process.** Tempting to make the TUI a client of the RPC for symmetry. Don't. The TUI's tight coupling to `watch::Receiver<GraphSnapshot>` and `broadcast::Receiver<LogEntry>` is a feature, not an accident. `rnme` (interactive) and `rnme --ui mcp` (headless+agent) are sibling entry points, not stacked.
+4. **TUI stays in-process.** Tempting to make the TUI a client of the RPC for symmetry. Don't. The TUI's tight coupling to `watch::Receiver<GraphSnapshot>` and `broadcast::Receiver<LogEntry>` is a feature, not an accident. `rnme` (interactive) and `rnme --mcp` (headless+agent) are sibling entry points, not stacked.
 5. **Engine-as-child for MCP, not in-process.** Restarting an MCP server without restarting the agent is unreliable in practice — many clients disable MCPs that exit. Keeping MCP alive across rebuilds means the engine has to be a separate process the supervisor can kill and respawn. The cost is one extra process + the RPC; the benefit is the agent never sees a disconnect when the user edits RUNME.rs.
 
 ## RPC protocol
@@ -91,7 +93,7 @@ Flow:
 supervisor startup:
   discover RUNME.rs files
   cargo build (cold)
-  spawn child with --ui rpc
+  spawn child with --rpc
   start notify watcher on RUNME.rs files (and sibling .rs files)
 
 on file event:
@@ -159,4 +161,4 @@ What survives a restart: nothing. IDs reset, logs gone, in-flight tasks die. Hon
 - **`LogStore` query helpers.** Range-by-seq and last-N methods for `get_logs`; filtered live subscription for `subscribe_logs`.
 - **`ctx.summary(s)` API.** Implementation is small; co-design with MCP.
 - **MCP framework.** `rmcp` (official SDK).
-- **Implementation order.** Land `--ui rpc` first; prove the protocol works against a websocket client. Then `--ui mcp` with the supervisor + watcher + MCP proxy on top.
+- **Implementation order.** Land `--rpc` first; prove the protocol works against a websocket client. Then `--mcp` with the supervisor + watcher + MCP proxy on top.

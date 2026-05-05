@@ -24,23 +24,30 @@ static KITCHEN_SINK: LazyLock<TempDir> = LazyLock::new(|| {
 
 // ---------------------------------------------------------------------------
 // Priority 1: Agent mode JSON output
+//
+// These tests target the internal `UiMode::Agent` (structured JSON output for
+// machine consumption). The `--ui` flag has been removed and `--mcp` has not
+// landed yet, so agent mode is unreachable from the CLI right now. Re-enable
+// these once the MCP entry point exists.
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "agent mode flag removed; will be re-enabled when --mcp lands"]
 fn agent_json_success() {
     let out = harness::run_rnme(
         KITCHEN_SINK.path(),
-        &["--ui", "agent", "--format", "json", "succeed"],
+        &["--format", "json", "succeed"],
     );
     out.assert_success();
     out.assert_json_ok("succeed");
 }
 
 #[test]
+#[ignore = "agent mode flag removed; will be re-enabled when --mcp lands"]
 fn agent_json_failure() {
     let out = harness::run_rnme(
         KITCHEN_SINK.path(),
-        &["--ui", "agent", "--format", "json", "fail_default"],
+        &["--format", "json", "fail_default"],
     );
     // fail_default returns Err("default failure".into()) → exit code 1
     assert_ne!(out.exit_code, 0, "expected non-zero exit for failing task");
@@ -60,10 +67,11 @@ fn agent_json_failure() {
 }
 
 #[test]
+#[ignore = "agent mode flag removed; will be re-enabled when --mcp lands"]
 fn agent_json_specific_exit_code() {
     let out = harness::run_rnme(
         KITCHEN_SINK.path(),
-        &["--ui", "agent", "--format", "json", "fail_with_code"],
+        &["--format", "json", "fail_with_code"],
     );
     out.assert_exit_code(42);
     out.assert_json_error("fail_with_code");
@@ -75,16 +83,25 @@ fn agent_json_specific_exit_code() {
 
 #[test]
 fn cli_mode_output() {
-    let out = harness::run_rnme(KITCHEN_SINK.path(), &["--ui", "cli", "produce_output"]);
+    let out = harness::run_rnme(KITCHEN_SINK.path(), &["--cli", "produce_output"]);
     out.assert_success();
     out.assert_stdout_contains("hello-from-produce-output");
 }
 
 #[test]
 fn cli_mode_failure() {
-    let out = harness::run_rnme(KITCHEN_SINK.path(), &["--ui", "cli", "fail_default"]);
+    let out = harness::run_rnme(KITCHEN_SINK.path(), &["--cli", "fail_default"]);
     assert_ne!(out.exit_code, 0, "expected non-zero exit for failing task");
     out.assert_stderr_contains("Error:");
+}
+
+#[test]
+fn ui_flags_conflict() {
+    let out = harness::run_rnme(KITCHEN_SINK.path(), &["--tui", "--cli", "succeed"]);
+    assert_ne!(
+        out.exit_code, 0,
+        "expected non-zero exit when both --tui and --cli are passed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -94,7 +111,7 @@ fn cli_mode_failure() {
 #[test]
 fn no_runme_found() {
     let empty = TempDir::new().expect("failed to create temp dir");
-    let out = harness::run_rnme(empty.path(), &["--ui", "cli", "anything"]);
+    let out = harness::run_rnme(empty.path(), &["--cli", "anything"]);
     assert_ne!(out.exit_code, 0, "expected non-zero exit when no RUNME.rs");
     out.assert_stderr_contains("no RUNME.rs found");
 }
@@ -103,11 +120,9 @@ fn no_runme_found() {
 fn task_not_found() {
     let out = harness::run_rnme(
         KITCHEN_SINK.path(),
-        &["--ui", "agent", "--format", "json", "nonexistent_task_xyz"],
+        &["--cli", "nonexistent_task_xyz"],
     );
     assert_ne!(out.exit_code, 0, "expected non-zero exit for unknown task");
-    // The error is printed to stderr by cli::run() before process::exit(1),
-    // and the agent JSON path is never reached because resolve() fails first.
     out.assert_stderr_contains("unknown task");
 }
 
@@ -120,12 +135,8 @@ fn nested_group_resolution() {
     harness::write_fixture(dir.path(), "services/RUNME.rs", harness::sub_dir_runme());
 
     // The sub task should be resolvable as "services:sub_task"
-    let out = harness::run_rnme(
-        dir.path(),
-        &["--ui", "agent", "--format", "json", "services:sub_task"],
-    );
+    let out = harness::run_rnme(dir.path(), &["--cli", "services:sub_task"]);
     out.assert_success();
-    out.assert_json_ok("sub_task");
 }
 
 // ---------------------------------------------------------------------------
@@ -134,18 +145,13 @@ fn nested_group_resolution() {
 
 #[test]
 fn arguments_forwarded_to_task() {
+    // `echo_args` declares `message: String` as a required positional/option
+    // arg. A successful exit proves clap parsed `--message hello-world` from
+    // the forwarded task args; the task body does nothing observable beyond
+    // an `info!` (which is order-racy under the engine's log forwarding).
     let out = harness::run_rnme(
         KITCHEN_SINK.path(),
-        &[
-            "--ui",
-            "agent",
-            "--format",
-            "json",
-            "echo_args",
-            "--message",
-            "hello-world",
-        ],
+        &["--cli", "echo_args", "--message", "hello-world"],
     );
     out.assert_success();
-    out.assert_json_ok("echo_args");
 }

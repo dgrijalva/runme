@@ -574,7 +574,7 @@ Exit codes: `0` Done, task's exit code on Failed, `124` Timeout, `130` Cancelled
 
 ### Agent mode
 
-`rnme --ui agent <task>` (`src/cli.rs::run_agent`). Same engine path as headless, but skips stdio forwarding — only the final result is reported (JSON or text). Quiet by default, structured output for programmatic consumers.
+`run_agent` in `src/cli.rs` is the same engine path as headless, but skips stdio forwarding — only the final result is reported (JSON or text). Quiet by default, structured output for programmatic consumers. Currently has no CLI entry point: the previous `--ui agent` flag was removed when the UI-mode flags became bare (`--tui`, `--cli`, future `--mcp`); this code path will become reachable again when `--mcp` lands and either replaces or wraps it.
 
 ### MCP (future)
 
