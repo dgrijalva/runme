@@ -81,25 +81,9 @@ Engine/state work first, UX layering on top:
 - *Assessment:* Fits naturally next to existing per-session state (`TaskStatus`, `processes`). The task is the right place to author this since only the task knows what's interesting in its own output. Summary is just a `String` (or maybe `Option<String>` + timestamp); no need for streaming/structure in v1
 - *Open questions:* Single summary or append-only stream? Overwrite semantics on re-run? Should summaries persist with completed tasks (probably yes, since logs do)? Does the TUI surface them anywhere, or are they purely for programmatic consumers?
 
-## MCP mode — rebuild-on-edit problem
+## ~~MCP mode — rebuild-on-edit problem~~ (SUPERSEDED)
 
-**Context:** Once the task graph / orchestration work settles, MCP mode is the next major direction. The shape of what it should *do* is getting clearer, but there's one architectural problem that doesn't have a good answer yet.
-
-**The problem:** Today `rnme` builds the user's RUNME.rs files into a binary at startup, then execs that binary. MCP servers, by contrast, are expected to live for the lifetime of the agent session. So if an agent edits a RUNME.rs file mid-session and then asks to run a task, the MCP process is still running the *pre-edit* compiled binary — the changes are invisible.
-
-**Why the obvious workarounds don't work:**
-- Quitting the MCP on file change and hoping the agent relaunches it is unreliable — many agents disable MCPs that crash/exit unexpectedly.
-- Restarting in-process means hot-swapping a compiled Rust binary, which isn't really a thing.
-
-**Candidate idea — engine-as-child-process:**
-- MCP mode becomes a thin supervisor: it owns the agent connection, but spawns the *real* engine (today's compiled RUNME.rs binary) as a child process.
-- On file change (or on demand), the supervisor rebuilds and restarts the child. MCP itself stays alive across rebuilds — the agent never sees a disconnect.
-- *Cost:* requires a control protocol between supervisor and engine — every operation the agent can drive (list tasks, spawn task, get summary, get logs, terminate, etc.) needs to be expressible over IPC. That's a non-trivial second API surface to design and maintain.
-
-**Things to figure out before committing:**
-- Check the MCP spec / community patterns — is there a sanctioned way to handle "the underlying tool got modified" that we're missing? Worth looking before inventing.
-- If we do go child-process, decide on the IPC shape early (stdin/stdout JSON-RPC? Unix socket? Shared memory for log streaming?) — this is the load-bearing decision.
-- Could the in-MCP "build" step just be `cargo build` + `dlopen`? Probably not worth the complexity vs. child process, but worth ruling out.
+Architecture decisions captured in `mcp_design.md`. Summary: `rnme --ui mcp` spawns `rnme --ui rpc` as a child, supervises it across RUNME.rs edits via a file watcher, and proxies MCP tool calls to the child over a loopback WebSocket. Single internal RPC, no second public API, no streaming-over-HTTP, no Windows.
 
 ## Carriage return (`\r`) progress output corrupts log display
 
