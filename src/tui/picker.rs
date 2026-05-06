@@ -8,10 +8,10 @@ use std::collections::HashMap;
 use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 use crate::theme::THEME;
@@ -29,6 +29,24 @@ pub struct PickerTask {
     pub qualified_name: String,
 }
 
+/// Which panel of the split picker has keyboard focus.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PickerFocus {
+    TaskList,
+    ArgsInput,
+}
+
+/// Result of validating the args input against a task's clap command.
+#[derive(Clone, Debug)]
+pub enum ArgsValidation {
+    /// No clap command on the task — we accept anything but can't validate.
+    NoMetadata,
+    /// shell_words::split or clap parsing failed.
+    Error(String),
+    /// Input parses cleanly.
+    Ok,
+}
+
 /// State for the task picker UI.
 pub struct PickerState {
     /// All available tasks with display info.
@@ -41,9 +59,34 @@ pub struct PickerState {
     pub selection: usize,
     /// Scroll offset for the visible list (top of viewport).
     pub scroll_offset: usize,
+    /// Which panel has focus.
+    pub focus: PickerFocus,
+    /// Argument input text (raw, shell-style).
+    pub args_input: String,
+    /// Cursor byte offset within `args_input`.
+    pub args_cursor: usize,
+    /// Vertical scroll offset for the help text.
+    pub args_help_scroll: u16,
+    /// Cached validation result for the current input.
+    pub args_validation: ArgsValidation,
+    /// Cached rendered help text for the currently-selected task.
+    pub cached_help: String,
+    /// Identity of the task whose help/args are currently cached. We use the
+    /// `&'static TaskDef` pointer so we can detect selection changes cheaply.
+    cached_for: Option<*const TaskDef>,
+    /// Last drawn screen rect of the right panel — used by mouse hit-testing
+    /// to direct scroll events to the help pane.
+    pub last_right_panel_rect: Option<Rect>,
+    /// Last drawn screen rect of the left panel — for symmetry / future use.
+    pub last_left_panel_rect: Option<Rect>,
     /// The fuzzy matcher instance.
     matcher: SkimMatcherV2,
 }
+
+// Safety: the `*const TaskDef` is only used for pointer-equality comparison
+// to detect selection changes; never dereferenced. Sound to send across.
+unsafe impl Send for PickerState {}
+unsafe impl Sync for PickerState {}
 
 impl PickerState {
     /// Create a new PickerState from task definitions and group name mappings.
@@ -80,14 +123,155 @@ impl PickerState {
                 .then(a.task.name.cmp(b.task.name))
         });
 
-        Self {
+        let mut picker = Self {
             tasks: picker_tasks,
             input: String::new(),
             cursor: 0,
             selection: 0,
             scroll_offset: 0,
+            focus: PickerFocus::TaskList,
+            args_input: String::new(),
+            args_cursor: 0,
+            args_help_scroll: 0,
+            args_validation: ArgsValidation::Ok,
+            cached_help: String::new(),
+            cached_for: None,
+            last_right_panel_rect: None,
+            last_left_panel_rect: None,
             matcher: SkimMatcherV2::default(),
+        };
+        // Initial selection lands on a group header in browse mode; snap it
+        // forward to the first real task so callers don't need to.
+        picker.snap_selection_to_first_task();
+        picker
+    }
+
+    /// Qualified name of the currently-selected task, for use as a key in
+    /// the per-session args memory. `None` if no task is selected.
+    pub fn selected_qualified_name(&self) -> Option<String> {
+        let items = self.visible_items();
+        if items.is_empty() {
+            return None;
         }
+        let idx = self.selection.min(items.len().saturating_sub(1));
+        match &items[idx] {
+            PickerItem::Task(pt) => Some(pt.qualified_name.clone()),
+            PickerItem::GroupHeader(_) => None,
+        }
+    }
+
+    /// Insert a character into the args input at the cursor.
+    pub fn insert_arg_char(&mut self, ch: char) {
+        self.args_input.insert(self.args_cursor, ch);
+        self.args_cursor += ch.len_utf8();
+    }
+
+    /// Delete the character before the args cursor.
+    pub fn delete_arg_char(&mut self) {
+        if self.args_cursor > 0 {
+            let prev = self.args_input[..self.args_cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.args_input.remove(prev);
+            self.args_cursor = prev;
+        }
+    }
+
+    /// Move the args cursor left by one character.
+    pub fn arg_cursor_left(&mut self) {
+        if self.args_cursor > 0 {
+            let prev = self.args_input[..self.args_cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.args_cursor = prev;
+        }
+    }
+
+    /// Move the args cursor right by one character.
+    pub fn arg_cursor_right(&mut self) {
+        if self.args_cursor < self.args_input.len() {
+            let next = self.args_input[self.args_cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| self.args_cursor + i)
+                .unwrap_or(self.args_input.len());
+            self.args_cursor = next;
+        }
+    }
+
+    /// Move the args cursor to the start of the input.
+    pub fn arg_cursor_home(&mut self) {
+        self.args_cursor = 0;
+    }
+
+    /// Move the args cursor to the end of the input.
+    pub fn arg_cursor_end(&mut self) {
+        self.args_cursor = self.args_input.len();
+    }
+
+    /// Scroll the help pane down by `n` lines, capped at the rendered
+    /// content height (best-effort — we don't pre-measure).
+    pub fn scroll_help_down(&mut self, n: u16) {
+        self.args_help_scroll = self.args_help_scroll.saturating_add(n);
+    }
+
+    /// Scroll the help pane up by `n` lines.
+    pub fn scroll_help_up(&mut self, n: u16) {
+        self.args_help_scroll = self.args_help_scroll.saturating_sub(n);
+    }
+
+    /// Re-cache the help text and recompute validation for the current
+    /// selection. Idempotent if the selection hasn't changed.
+    ///
+    /// Pulls any stored input from `task_args_memory` (keyed by qualified
+    /// name) and resets help scroll on selection change. Should be called
+    /// whenever the selection may have changed (after `move_up`/`move_down`,
+    /// after typing in the filter input, when opening the picker).
+    pub fn refresh_for_selection(&mut self, task_args_memory: &HashMap<String, String>) {
+        let task = self.selected_task();
+        let new_ptr = task.map(|t| t as *const TaskDef);
+        if self.cached_for == new_ptr {
+            // Selection unchanged. Re-validate (input may have changed).
+            self.args_validation = validate_args(task, &self.args_input);
+            return;
+        }
+
+        // Selection changed: save would-be input goes through caller; here we
+        // just load the new task's stored input.
+        self.cached_for = new_ptr;
+        self.args_help_scroll = 0;
+
+        if let Some(task) = task {
+            self.cached_help = match (task.arg_metadata)() {
+                Some(mut cmd) => cmd.render_help().to_string(),
+                None => "No arguments.".to_string(),
+            };
+            let key = self
+                .selected_qualified_name()
+                .unwrap_or_else(|| task.name.to_string());
+            self.args_input = task_args_memory.get(&key).cloned().unwrap_or_default();
+            self.args_cursor = self.args_input.len();
+        } else {
+            self.cached_help.clear();
+            self.args_input.clear();
+            self.args_cursor = 0;
+        }
+
+        self.args_validation = validate_args(task, &self.args_input);
+    }
+
+    /// Parse the current args input into argv. Returns the empty vec when
+    /// the input is empty or fails to split (we let the launch attempt
+    /// surface the error).
+    pub fn parsed_argv(&self) -> Vec<String> {
+        if self.args_input.trim().is_empty() {
+            return Vec::new();
+        }
+        shell_words::split(&self.args_input).unwrap_or_default()
     }
 
     /// Get the visible items — either the full grouped list (browse mode)
@@ -274,6 +458,39 @@ impl PickerState {
     }
 }
 
+/// Validate `input` against the task's clap command. Empty input is always
+/// `Ok`. Tasks without `arg_metadata` return `NoMetadata`.
+fn validate_args(task: Option<&'static TaskDef>, input: &str) -> ArgsValidation {
+    let Some(task) = task else {
+        return ArgsValidation::Ok;
+    };
+    let Some(cmd) = (task.arg_metadata)() else {
+        return ArgsValidation::NoMetadata;
+    };
+    if input.trim().is_empty() {
+        return ArgsValidation::Ok;
+    }
+    let argv = match shell_words::split(input) {
+        Ok(v) => v,
+        Err(e) => return ArgsValidation::Error(format!("invalid quoting: {e}")),
+    };
+    let mut full = Vec::with_capacity(argv.len() + 1);
+    full.push(task.name.to_string());
+    full.extend(argv);
+    match cmd.clone().try_get_matches_from(full) {
+        Ok(_) => ArgsValidation::Ok,
+        Err(e) => {
+            let msg = e
+                .to_string()
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("invalid arguments")
+                .to_string();
+            ArgsValidation::Error(msg)
+        }
+    }
+}
+
 /// An item in the picker list — either a group header or a task.
 #[derive(Clone)]
 pub enum PickerItem {
@@ -284,16 +501,34 @@ pub enum PickerItem {
 /// Render the task picker into the given area. Used by the frame as
 /// a centered overlay (decisions 1 + 8); the caller chooses the size
 /// and position.
+///
+/// The picker is split 50/50 horizontally: task list on the left,
+/// argument input + help on the right.
 pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut PickerState) {
-    // Ensure selection is within bounds and visible
-    picker.ensure_visible(area.height as usize);
+    frame.render_widget(Clear, area);
+
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let left = columns[0];
+    let right = columns[1];
+
+    picker.last_left_panel_rect = Some(left);
+    picker.last_right_panel_rect = Some(right);
+
+    render_task_list(frame, left, picker);
+    render_args_panel(frame, right, picker);
+}
+
+/// Render the left half: the task list panel.
+fn render_task_list(frame: &mut ratatui::Frame, area: Rect, picker: &mut PickerState) {
+    // Ensure selection is within bounds and visible. Reserve 2 rows for
+    // the outer block borders and 1 row for the input bar.
+    picker.ensure_visible(area.height.saturating_sub(2) as usize);
 
     let items = picker.visible_items();
 
-    // Clear the area
-    frame.render_widget(Clear, area);
-
-    // Build the lines for the list
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Input bar at the top
@@ -317,9 +552,10 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
             Style::default().fg(THEME.dim),
         )));
     } else {
-        // Render visible items with scroll offset
+        // Render visible items with scroll offset.
+        // Available height = area.height - 2 (block borders) - 1 (input bar).
         let visible_start = picker.scroll_offset;
-        let visible_count = (area.height as usize).saturating_sub(1); // -1 for input bar
+        let visible_count = (area.height as usize).saturating_sub(3);
 
         for (idx, item) in items
             .iter()
@@ -378,17 +614,136 @@ pub fn render_picker(frame: &mut ratatui::Frame, area: Rect, picker: &mut Picker
         }
     }
 
+    let focused = picker.focus == PickerFocus::TaskList;
+    let title_style = if focused {
+        Style::default()
+            .fg(THEME.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(THEME.dim)
+    };
+    let border_style = if focused {
+        Style::default().fg(THEME.accent)
+    } else {
+        Style::default().fg(THEME.border)
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Pick a task ")
-        .title_style(
-            Style::default()
-                .fg(THEME.accent)
-                .add_modifier(Modifier::BOLD),
-        )
-        .border_style(Style::default().fg(THEME.border));
+        .title_style(title_style)
+        .border_style(border_style);
 
     let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+/// Render the right half: argument input box, validation line, and
+/// scrollable help text.
+fn render_args_panel(frame: &mut ratatui::Frame, area: Rect, picker: &mut PickerState) {
+    let focused = picker.focus == PickerFocus::ArgsInput;
+    let title_style = if focused {
+        Style::default()
+            .fg(THEME.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(THEME.dim)
+    };
+    let outer_border_style = if focused {
+        Style::default().fg(THEME.accent)
+    } else {
+        Style::default().fg(THEME.border)
+    };
+
+    // Outer block — wraps the whole right panel.
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" args ")
+        .title_style(title_style)
+        .border_style(outer_border_style);
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+
+    // Stack: input box (3 rows), validation line (1 row), help (rest).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    render_args_input(frame, chunks[0], picker);
+    render_args_validation(frame, chunks[1], picker);
+    render_args_help(frame, chunks[2], picker);
+}
+
+fn render_args_input(frame: &mut ratatui::Frame, area: Rect, picker: &PickerState) {
+    let (border_color, hint_color) = match &picker.args_validation {
+        ArgsValidation::Ok => (THEME.level_info, THEME.dim),
+        ArgsValidation::NoMetadata => (THEME.border, THEME.dim),
+        ArgsValidation::Error(_) => (THEME.level_error, THEME.dim),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color));
+
+    let line: Line<'static> = if picker.args_input.is_empty() {
+        Line::from(Span::styled(
+            "type args, e.g. --flag value",
+            Style::default().fg(hint_color),
+        ))
+    } else {
+        // Draw the cursor as a reverse-video block. Ratatui doesn't manage
+        // a real terminal cursor inside a Paragraph, so we splice one in.
+        let cursor = picker.args_cursor;
+        let before = picker.args_input[..cursor].to_string();
+        let (cursor_char, after) = match picker.args_input[cursor..].chars().next() {
+            Some(c) => {
+                let next = cursor + c.len_utf8();
+                (c.to_string(), picker.args_input[next..].to_string())
+            }
+            None => (" ".to_string(), String::new()),
+        };
+        Line::from(vec![
+            Span::styled(before, Style::default().fg(Color::White)),
+            Span::styled(
+                cursor_char,
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
+            Span::styled(after, Style::default().fg(Color::White)),
+        ])
+    };
+
+    let paragraph = Paragraph::new(line).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_args_validation(frame: &mut ratatui::Frame, area: Rect, picker: &PickerState) {
+    let (text, color) = match &picker.args_validation {
+        ArgsValidation::Ok => ("ok".to_string(), THEME.level_info),
+        ArgsValidation::NoMetadata => (String::new(), THEME.dim),
+        ArgsValidation::Error(msg) => (msg.clone(), THEME.level_error),
+    };
+    let line = Line::from(Span::styled(text, Style::default().fg(color)));
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+fn render_args_help(frame: &mut ratatui::Frame, area: Rect, picker: &PickerState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" help ")
+        .title_style(Style::default().fg(THEME.dim))
+        .border_style(Style::default().fg(THEME.border));
+
+    let paragraph = Paragraph::new(picker.cached_help.clone())
+        .block(block)
+        .style(Style::default().fg(THEME.dim))
+        .wrap(Wrap { trim: false })
+        .scroll((picker.args_help_scroll, 0));
+
     frame.render_widget(paragraph, area);
 }
 
@@ -403,6 +758,33 @@ mod tests {
     fn no_arg_metadata() -> Option<clap::Command> {
         None
     }
+
+    fn greet_arg_metadata() -> Option<clap::Command> {
+        Some(
+            clap::Command::new("greet")
+                .arg(
+                    clap::Arg::new("name")
+                        .long("name")
+                        .required(true)
+                        .num_args(1),
+                )
+                .arg(
+                    clap::Arg::new("count")
+                        .long("count")
+                        .num_args(1)
+                        .default_value("1"),
+                ),
+        )
+    }
+
+    static TEST_TASK_GREET: TaskDef = TaskDef {
+        name: "greet",
+        description: Some("Greet someone"),
+        group: "",
+        func: TaskFnKind::Static(dummy_task),
+        arg_metadata: greet_arg_metadata,
+        ui_hint: None,
+    };
 
     fn dummy_task<'a>(
         _ctx: &'a TaskContext,
@@ -615,5 +997,96 @@ mod tests {
             .filter(|i| matches!(i, PickerItem::Task(_)))
             .count();
         assert_eq!(task_count, 4);
+    }
+
+    #[test]
+    fn validate_args_empty_input_is_ok() {
+        assert!(matches!(
+            validate_args(Some(&TEST_TASK_GREET), ""),
+            ArgsValidation::Ok
+        ));
+    }
+
+    #[test]
+    fn validate_args_missing_required_is_error() {
+        let result = validate_args(Some(&TEST_TASK_GREET), "--count 3");
+        assert!(matches!(result, ArgsValidation::Error(_)));
+    }
+
+    #[test]
+    fn validate_args_valid_input_is_ok() {
+        assert!(matches!(
+            validate_args(Some(&TEST_TASK_GREET), "--name world --count 3"),
+            ArgsValidation::Ok
+        ));
+    }
+
+    #[test]
+    fn validate_args_no_metadata() {
+        assert!(matches!(
+            validate_args(Some(&TEST_TASK_A), "anything"),
+            ArgsValidation::NoMetadata
+        ));
+    }
+
+    #[test]
+    fn validate_args_unbalanced_quotes_is_error() {
+        let result = validate_args(Some(&TEST_TASK_GREET), "--name 'unclosed");
+        assert!(matches!(result, ArgsValidation::Error(_)));
+    }
+
+    #[test]
+    fn refresh_for_selection_loads_input_from_memory() {
+        let tasks: Vec<&'static TaskDef> = vec![&TEST_TASK_GREET];
+        let mut group_names = HashMap::new();
+        group_names.insert("".to_string(), ".".to_string());
+        let mut picker = PickerState::new(&tasks, &group_names);
+
+        let mut memory = HashMap::new();
+        memory.insert("greet".to_string(), "--name world".to_string());
+
+        picker.refresh_for_selection(&memory);
+
+        assert_eq!(picker.args_input, "--name world");
+        assert!(matches!(picker.args_validation, ArgsValidation::Ok));
+        assert!(picker.cached_help.contains("--name"));
+    }
+
+    #[test]
+    fn refresh_for_selection_resets_help_scroll_on_change() {
+        let tasks: Vec<&'static TaskDef> = vec![&TEST_TASK_GREET, &TEST_TASK_A];
+        let mut group_names = HashMap::new();
+        group_names.insert("".to_string(), ".".to_string());
+        let mut picker = PickerState::new(&tasks, &group_names);
+        picker.refresh_for_selection(&HashMap::new());
+        picker.args_help_scroll = 10;
+
+        // Move to next task
+        picker.move_down();
+        picker.refresh_for_selection(&HashMap::new());
+        assert_eq!(picker.args_help_scroll, 0);
+    }
+
+    #[test]
+    fn parsed_argv_splits_input() {
+        let tasks: Vec<&'static TaskDef> = vec![&TEST_TASK_GREET];
+        let mut group_names = HashMap::new();
+        group_names.insert("".to_string(), ".".to_string());
+        let mut picker = PickerState::new(&tasks, &group_names);
+        picker.args_input = "--name world --count 3".to_string();
+        picker.args_cursor = picker.args_input.len();
+        let argv = picker.parsed_argv();
+        assert_eq!(argv, vec!["--name", "world", "--count", "3"]);
+    }
+
+    #[test]
+    fn parsed_argv_handles_quoted_values() {
+        let tasks: Vec<&'static TaskDef> = vec![&TEST_TASK_GREET];
+        let mut group_names = HashMap::new();
+        group_names.insert("".to_string(), ".".to_string());
+        let mut picker = PickerState::new(&tasks, &group_names);
+        picker.args_input = "--name 'hello world'".to_string();
+        let argv = picker.parsed_argv();
+        assert_eq!(argv, vec!["--name", "hello world"]);
     }
 }

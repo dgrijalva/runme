@@ -329,49 +329,95 @@ pub(super) fn handle_log_viewer_key(
 /// loop spawns it (the new task appears in the sidebar) and the
 /// overlay closes.
 pub(super) fn handle_picker_key(key: KeyEvent, state: &mut AppState) {
+    // Common: Esc closes, Ctrl-C quits, Tab/Shift-Tab toggles focus.
     match key.code {
-        // Esc: close overlay without quitting.
         KeyCode::Esc => {
+            // Persist current input to memory before closing.
+            save_picker_input(state);
             state.close_picker();
+            return;
         }
-
-        // Ctrl-C: quit the TUI entirely.
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.running = false;
+            return;
         }
+        KeyCode::Tab | KeyCode::BackTab => {
+            if let Some(ref mut picker) = state.picker {
+                picker.focus = match picker.focus {
+                    super::picker::PickerFocus::TaskList => super::picker::PickerFocus::ArgsInput,
+                    super::picker::PickerFocus::ArgsInput => super::picker::PickerFocus::TaskList,
+                };
+            }
+            return;
+        }
+        _ => {}
+    }
 
-        // Enter: launch selected task. Caller (event loop) spawns it via
-        // the engine; the overlay closes once the spawn completes.
+    let focus = match state.picker.as_ref() {
+        Some(p) => p.focus,
+        None => return,
+    };
+    match focus {
+        super::picker::PickerFocus::TaskList => handle_picker_task_list_key(key, state),
+        super::picker::PickerFocus::ArgsInput => handle_picker_args_input_key(key, state),
+    }
+}
+
+/// Save the picker's current args input to per-task memory.
+fn save_picker_input(state: &mut AppState) {
+    let Some(ref picker) = state.picker else {
+        return;
+    };
+    let Some(name) = picker.selected_qualified_name() else {
+        return;
+    };
+    state.task_args.insert(name, picker.args_input.clone());
+}
+
+/// Refresh picker derived state (cached help, validation, args input) for
+/// the currently-selected task. Call after any selection change.
+fn refresh_picker_selection(state: &mut AppState) {
+    let memory = state.task_args.clone();
+    if let Some(ref mut picker) = state.picker {
+        picker.refresh_for_selection(&memory);
+    }
+}
+
+fn handle_picker_task_list_key(key: KeyEvent, state: &mut AppState) {
+    match key.code {
+        // Enter: launch selected task with the args currently typed in
+        // the right panel (which may have been pre-filled from memory).
         KeyCode::Enter => {
+            save_picker_input(state);
             if let Some(ref picker) = state.picker
                 && let Some(task) = picker.selected_task()
             {
-                state.pending_task = Some(task);
+                let argv = picker.parsed_argv();
+                state.pending_task = Some((task, argv));
             }
         }
 
-        // Down: move selection down (no j-binding — `j` types into filter)
         KeyCode::Down => {
             if let Some(ref mut picker) = state.picker {
                 picker.move_down();
             }
+            refresh_picker_selection(state);
         }
-
-        // Up: move selection up (no k-binding — `k` types into filter)
         KeyCode::Up => {
             if let Some(ref mut picker) = state.picker {
                 picker.move_up();
             }
+            refresh_picker_selection(state);
         }
 
-        // Backspace: delete last char of input
         KeyCode::Backspace => {
             if let Some(ref mut picker) = state.picker {
                 picker.delete_char();
             }
+            refresh_picker_selection(state);
         }
 
-        // Ctrl-u: clear input
+        // Ctrl-u: clear filter input
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if let Some(ref mut picker) = state.picker {
                 picker.input.clear();
@@ -379,17 +425,88 @@ pub(super) fn handle_picker_key(key: KeyEvent, state: &mut AppState) {
                 picker.selection = 0;
                 picker.scroll_offset = 0;
             }
+            refresh_picker_selection(state);
         }
 
-        // Any other character: insert into fuzzy input
         KeyCode::Char(ch) => {
             if let Some(ref mut picker) = state.picker {
                 picker.insert_char(ch);
             }
+            refresh_picker_selection(state);
         }
 
         _ => {}
     }
+}
+
+fn handle_picker_args_input_key(key: KeyEvent, state: &mut AppState) {
+    let Some(ref mut picker) = state.picker else {
+        return;
+    };
+    match key.code {
+        // Ctrl-]: scroll help down. Ctrl-[ collides with Esc on most
+        // terminals (Esc is the C0 escape), so we also accept PageUp/
+        // PageDown as portable fallbacks.
+        KeyCode::Char(']') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.scroll_help_down(5);
+            return;
+        }
+        KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.scroll_help_up(5);
+            return;
+        }
+        KeyCode::PageDown => {
+            picker.scroll_help_down(5);
+            return;
+        }
+        KeyCode::PageUp => {
+            picker.scroll_help_up(5);
+            return;
+        }
+
+        KeyCode::Enter => {
+            // Save and launch.
+            let qual = picker.selected_qualified_name();
+            let argv = picker.parsed_argv();
+            let task = picker.selected_task();
+            if let (Some(name), Some(task)) = (qual, task) {
+                state
+                    .task_args
+                    .insert(name, state.picker.as_ref().unwrap().args_input.clone());
+                state.pending_task = Some((task, argv));
+            }
+            return;
+        }
+
+        KeyCode::Backspace => {
+            picker.delete_arg_char();
+        }
+        KeyCode::Left => {
+            picker.arg_cursor_left();
+        }
+        KeyCode::Right => {
+            picker.arg_cursor_right();
+        }
+        KeyCode::Home => {
+            picker.arg_cursor_home();
+        }
+        KeyCode::End => {
+            picker.arg_cursor_end();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            picker.args_input.clear();
+            picker.args_cursor = 0;
+        }
+        KeyCode::Char(ch) => {
+            picker.insert_arg_char(ch);
+        }
+        _ => {
+            return;
+        }
+    }
+
+    // After mutating args input, re-validate.
+    refresh_picker_selection(state);
 }
 
 /// Handle keys when in filter input mode.

@@ -76,31 +76,56 @@ Source identity is unified: every task and every process has a `TaskId` from the
 `t` opens the picker over the existing TUI shell. The picker is **always an overlay**, never a full-screen mode — sidebar and logs stay rendered behind it. Re-entrant from any state. On startup with no task, the shell is empty (just "All tasks" in the sidebar) and the picker opens automatically; visually identical to opening it later.
 
 ```
-+--[ pick a task ]---------------------------------------------------+
-| > web                                                              |
-|                                                                    |
-| .                                                                  |
-|   start              Start all services                            |
-|   clean              Clean all build artifacts                     |
-|                                                                    |
-| services/auth                                                      |
-|   build              Build the auth service                        |
-|   test               Run auth service tests                        |
-|                                                                    |
-| web-app                                                            |
-|   dev                Start webpack dev server                      |
-|   build              Production build                              |
-+--------------------------------------------------------------------+
++--[ pick a task ]---------------------------+--[ args ]--------------+
+| > web                                      | --port 8080 --verbose  |
+|                                            +------------------------+
+| .                                          | ok                     |
+|   start         Start all services         +------------------------+
+|   clean         Clean build artifacts      | Usage: dev [OPTIONS]   |
+|                                            |                        |
+| services/auth                              | Options:               |
+|   build         Build the auth service     |   --port <PORT>        |
+|   test          Run auth service tests     |       Listen port      |
+|                                            |   --verbose            |
+| web-app                                    |       Verbose output   |
+|   dev           Start webpack dev server   |   -h, --help           |
+|   build         Production build           |                        |
++--------------------------------------------+------------------------+
 ```
 
 Tasks are grouped by `TaskDef.group`. Display name comes from `GroupDef.display_name` (defaults to relative path; overridable via `#[rnme::init]::set_group_name`). Root group renders as `.`.
 
+The picker has two panels — task list on the left, argument input on the right — with a 50/50 width split. `Tab` toggles focus between them.
+
+**Left panel (task list)**
+
 - **Browse**: the full hierarchy. Navigate with `j`/`k`.
 - **Fuzzy search**: typing filters across task names, descriptions, group names. Matches the fully qualified name, so `auth build` finds `services/auth > build`.
-- **Enter**: launches the selected task by emitting `EngineHandle::spawn_task(def, args)`. The new child appears in the sidebar; the overlay closes.
+- **Enter**: launches the selected task by emitting `EngineHandle::spawn_task(def, args)` with whatever input is currently in the args panel (which may have been pre-filled from a prior launch this session). The new child appears in the sidebar; the overlay closes.
 - **Esc**: closes the overlay without launching. **Ctrl-C** quits the TUI entirely. **`q` is just text** in the picker, not a quit.
 
-The picker is designed to grow a split layout for an argument-input form when launching tasks that take args — that's not built yet but the overlay shape accommodates it.
+**Right panel (args)**
+
+The args panel has three regions stacked vertically:
+
+1. **Input box** — single-line text field where the user types arguments exactly as they would on the command line. Border colored by validation state (green = valid, red = invalid).
+2. **Validation line** — clap's first error message, or `ok` when the input parses cleanly. Empty input always parses (no required args check at this stage; clap will catch missing required args at launch time).
+3. **Help text** — scrollable, read-only render of the task's `clap::Command::render_help()`. Tasks whose `arg_metadata()` returns `None` show `No arguments` here; the input still accepts whatever is typed and forwards it to the task.
+
+Args are validated live: each keystroke runs `shell_words::split` on the input, then `cmd.clone().try_get_matches_from(...)`. The first error string (or `ok`) goes to the validation line. Invalid input doesn't block `Enter` — the task launcher can decide what to do with malformed input (currently: it'll fail when the task itself parses).
+
+**Per-session memory**: the picker stores the input string per task (keyed by qualified task name) in `AppState.task_args`. When the highlighted task changes, the input box reloads from the map and help scroll resets to 0. When the user launches, the current input is saved before the picker closes. Memory is session-scoped only — lost on TUI exit. Persistence to disk is a separate concern.
+
+**Right-panel keys**
+
+| Key | Action |
+|-----|--------|
+| typing / Backspace / Left / Right / Home / End | Edit input |
+| `Enter` | Launch with current input (saves to per-task map) |
+| `Tab` / `Shift-Tab` | Focus task list |
+| `Esc` | Close picker |
+| `Ctrl-]` / `Ctrl-[` | Scroll help down / up by half-pane |
+| Mouse wheel (over right panel) | Scroll help |
 
 ## App State Model
 
@@ -341,9 +366,9 @@ Key points:
 These are TUI-specific items that haven't earned a design pass yet:
 
 1. **Sidebar redesign**: with multiple tasks each spawning multiple processes, the entry list gets dense. Collapsing / grouping / a separate "completed" section all need real-use validation before locking down a layout.
-2. **Picker → argument form**: split layout for tasks that take args. Designed to fit; not built.
-3. **Keybinding redesign**: current scheme is a flat per-mode match. LazyGit / LazyDocker / k9s patterns (numbered pane focus, multi-stage menus, footer hints, `?` cheatsheet) are inspirations. See `open_issues.md`.
-4. **Theme/color configuration**: hardcoded dark theme today. Validate across terminal palettes; design a config system later.
-5. **Mouse support**: scroll, click-to-select, click-sidebar-to-toggle. Significant QoL.
-6. **Carriage-return progress output**: commands using `\r` to update a progress line in place produce garbled output today. See `open_issues.md`.
-7. **Per-task UI mode**: `UiHint` lets tasks declare a preferred mode; could also let them declare a TUI quit preference (auto-close on success, stay open). Probably subsumed by the existing mode hint in practice.
+2. **Keybinding redesign**: current scheme is a flat per-mode match. LazyGit / LazyDocker / k9s patterns (numbered pane focus, multi-stage menus, footer hints, `?` cheatsheet) are inspirations. See `open_issues.md`.
+3. **Theme/color configuration**: hardcoded dark theme today. Validate across terminal palettes; design a config system later.
+4. **Mouse support**: scroll, click-to-select, click-sidebar-to-toggle. Significant QoL.
+5. **Carriage-return progress output**: commands using `\r` to update a progress line in place produce garbled output today. See `open_issues.md`.
+6. **Per-task UI mode**: `UiHint` lets tasks declare a preferred mode; could also let them declare a TUI quit preference (auto-close on success, stay open). Probably subsumed by the existing mode hint in practice.
+7. **Args persistence**: the picker remembers per-task argument input within a session, but loses it on TUI exit. Disk persistence (and possibly a workspace-scoped state file) is a separate design item.

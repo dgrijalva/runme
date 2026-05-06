@@ -146,7 +146,12 @@ pub struct AppState {
     /// Group name mapping for display (group_key -> display_name).
     pub group_names: HashMap<String, String>,
     /// Task selected from the picker, pending launch by the event loop.
-    pub pending_task: Option<&'static TaskDef>,
+    /// The `Vec<String>` is the parsed argv from the picker's args input.
+    pub pending_task: Option<(&'static TaskDef, Vec<String>)>,
+    /// Per-session memory of task argument input strings, keyed by qualified
+    /// task name. Pre-populates the picker's args input on revisit. Lost on
+    /// TUI exit.
+    pub task_args: HashMap<String, String>,
     /// Engine handle. Cloned from the engine started in the binary entry.
     /// `None` only briefly during construction; populated before the
     /// event loop runs.
@@ -220,6 +225,7 @@ impl AppState {
             all_tasks: Vec::new(),
             group_names: HashMap::new(),
             pending_task: None,
+            task_args: HashMap::new(),
             engine: None,
             current_task_id: None,
             process_detail_index: None,
@@ -399,12 +405,15 @@ impl AppState {
 
     /// Open the task picker overlay. Re-entrant from Normal mode at any
     /// time (decision 1 + 8). Builds picker state from the cached task
-    /// list / group names.
+    /// list / group names, then primes the args panel from per-session
+    /// memory for the initially-selected task.
     pub fn open_picker(&mut self) {
         if self.all_tasks.is_empty() {
             return;
         }
-        self.picker = Some(PickerState::new(&self.all_tasks, &self.group_names));
+        let mut picker = PickerState::new(&self.all_tasks, &self.group_names);
+        picker.refresh_for_selection(&self.task_args);
+        self.picker = Some(picker);
         self.picker_open = true;
         self.dirty = true;
     }
@@ -465,8 +474,9 @@ impl App {
         registry: Arc<Registry>,
         engine: EngineHandle,
     ) -> Self {
-        let picker = PickerState::new(&tasks, &group_names);
+        let mut picker = PickerState::new(&tasks, &group_names);
         let mut state = AppState::new();
+        picker.refresh_for_selection(&state.task_args);
         state.mode = AppMode::Normal;
         state.picker = Some(picker);
         state.picker_open = true;
@@ -489,6 +499,14 @@ impl App {
         engine: EngineHandle,
     ) -> Self {
         let mut state = AppState::new();
+        // Seed per-session args memory with what the user passed on the
+        // CLI, keyed by the task's qualified name (matching the picker's
+        // own keying so a later `t` shows the same prefill).
+        let qualified = qualified_name_for(task, &group_names);
+        let joined = shell_words::join(task_args.iter().map(|s| s.as_str()));
+        if !joined.is_empty() {
+            state.task_args.insert(qualified, joined);
+        }
         state.all_tasks = tasks;
         state.group_names = group_names;
         state.registry = Some(registry);
@@ -534,6 +552,21 @@ fn restore_terminal() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
     Ok(())
+}
+
+/// Compute the picker's qualified-name key for a task, matching how the
+/// picker builds its own keys. Used to seed the per-session args memory
+/// when launching from the CLI.
+fn qualified_name_for(task: &TaskDef, group_names: &HashMap<String, String>) -> String {
+    if task.group.is_empty() {
+        task.name.to_string()
+    } else {
+        let display = group_names
+            .get(task.group)
+            .cloned()
+            .unwrap_or_else(|| task.group.to_string());
+        format!("{} > {}", display, task.name)
+    }
 }
 
 #[cfg(test)]

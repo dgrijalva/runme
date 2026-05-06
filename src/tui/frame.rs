@@ -631,17 +631,17 @@ fn render_picker_overlay(
 ) {
     use ratatui::widgets::Clear;
 
-    // Picker takes ~80% of width and height, capped at sensible bounds,
-    // centered. Leaves the shell visible at the edges.
-    let picker_width = ((area.width as u32 * 80 / 100) as u16).clamp(40, 100);
-    let picker_height = ((area.height as u32 * 80 / 100) as u16).clamp(10, 40);
-    let picker_width = picker_width.min(area.width);
-    let picker_height = picker_height.min(area.height);
-
-    let x = area.width.saturating_sub(picker_width) / 2;
-    let y = area.height.saturating_sub(picker_height) / 2;
-    let popup_area =
-        ratatui::layout::Rect::new(area.x + x, area.y + y, picker_width, picker_height);
+    // Picker fills the screen with 2 cells of padding on every side, so
+    // the args panel and help text have room to breathe.
+    let pad: u16 = 2;
+    let picker_width = area.width.saturating_sub(pad * 2);
+    let picker_height = area.height.saturating_sub(pad * 2);
+    let popup_area = ratatui::layout::Rect::new(
+        area.x + pad,
+        area.y + pad,
+        picker_width,
+        picker_height,
+    );
 
     frame.render_widget(Clear, popup_area);
     picker::render_picker(frame, popup_area, picker);

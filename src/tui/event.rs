@@ -86,8 +86,8 @@ pub async fn run_event_loop(
                         }
                         handle_event(event, state, terminal);
 
-                        if let Some(task) = state.pending_task.take() {
-                            state.launch_picked_task(task, Vec::new()).await;
+                        if let Some((task, args)) = state.pending_task.take() {
+                            state.launch_picked_task(task, args).await;
                         }
 
                         if let Some(req) = state.pending_restart.take()
@@ -509,7 +509,35 @@ fn handle_mouse(
     state: &mut AppState,
     terminal: &Terminal<CrosstermBackend<io::Stdout>>,
 ) {
-    if state.picker_open || state.quit_confirm {
+    // Picker handles its own mouse events (scroll wheel over the help pane).
+    if state.picker_open {
+        if let Some(ref mut picker) = state.picker {
+            let in_help = picker
+                .last_right_panel_rect
+                .map(|r| {
+                    mouse.column >= r.x
+                        && mouse.column < r.x + r.width
+                        && mouse.row >= r.y
+                        && mouse.row < r.y + r.height
+                })
+                .unwrap_or(false);
+            if in_help {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        picker.scroll_help_up(2);
+                        state.dirty = true;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        picker.scroll_help_down(2);
+                        state.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        return;
+    }
+    if state.quit_confirm {
         return;
     }
     if matches!(

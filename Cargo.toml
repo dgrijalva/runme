@@ -41,6 +41,7 @@ clap = { version = "4", features = ["derive"] }
 itertools = "0.14.0"
 futures = "0.3.32"
 humantime = "2"
+shell-words = "1"
 # CLI-only deps
 ignore = "0.4"
 sha2 = "0.10"
