@@ -159,8 +159,17 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
 
     match ui {
         UiMode::Tui => {
+            let tasks = registry.list().to_vec();
             let (engine, handle) = crate::execution::Engine::start(registry.clone());
-            let mut app = App::with_task(task, task_args, registry.clone(), handle.clone()).await;
+            let mut app = App::with_task(
+                task,
+                task_args,
+                tasks,
+                group_names,
+                registry.clone(),
+                handle.clone(),
+            )
+            .await;
             let result = app.run().await;
             let _ = handle.quit().await;
             engine.shutdown().await;

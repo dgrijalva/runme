@@ -483,10 +483,14 @@ impl App {
     pub async fn with_task(
         task: &'static TaskDef,
         task_args: Vec<String>,
+        tasks: Vec<&'static TaskDef>,
+        group_names: HashMap<String, String>,
         registry: Arc<Registry>,
         engine: EngineHandle,
     ) -> Self {
         let mut state = AppState::new();
+        state.all_tasks = tasks;
+        state.group_names = group_names;
         state.registry = Some(registry);
         state.log_store = engine.log_store.clone();
         state.engine = Some(engine);
