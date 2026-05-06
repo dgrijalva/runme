@@ -10,7 +10,7 @@ use crate::prelude::*;
 const __RNME_GROUP: &str = "builtin";
 
 /// List available tasks
-#[rnme::task]
+#[rnme::task(mode = cli)]
 async fn list(ctx: &TaskContext) -> TaskResult {
     if let Some(query) = ctx.tasks() {
         for task in query.all() {
@@ -29,7 +29,7 @@ async fn list(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Format RUNME.rs files with rustfmt
-#[rnme::task]
+#[rnme::task(mode = cli)]
 async fn fmt(ctx: &TaskContext) -> TaskResult {
     let files = runme_files()?;
     if files.is_empty() {
@@ -47,7 +47,7 @@ async fn fmt(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Type-check the generated workspace with cargo check
-#[rnme::task]
+#[rnme::task(mode = cli)]
 async fn check(ctx: &TaskContext) -> TaskResult {
     let cache_dir = cache_dir()?;
     ctx.exec(Cmd::new("cargo").arg("check").cwd(&cache_dir))
@@ -57,7 +57,7 @@ async fn check(ctx: &TaskContext) -> TaskResult {
 }
 
 /// Clean the generated workspace's build artifacts
-#[rnme::task]
+#[rnme::task(mode = cli)]
 async fn clean(ctx: &TaskContext) -> TaskResult {
     let cache_dir = cache_dir()?;
     ctx.exec(Cmd::new("cargo").arg("clean").cwd(&cache_dir))
