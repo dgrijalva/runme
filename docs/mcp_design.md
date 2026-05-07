@@ -11,19 +11,24 @@ A second use case lands for free once that surface exists: tasks are structurall
 ## Topology
 
 ```
-agent ─stdio─▶ rnme --mcp ─┬─TCP/JSONL─▶ rnme --engine  (gen 1, retiring as tasks drain)
+agent ─stdio─▶ rnme --mcp ─┬─TCP/JSONL─▶ rnme --engine  (gen 1, kept alive — logs queryable)
                   │         ├─TCP/JSONL─▶ rnme --engine  (gen 2, latest — receives new spawns)
                   │         └─TCP/JSONL─▶ rnme --engine  (gen N, spawned on next rebuild)
                   │
                   │  on RUNME.rs change: spawn next `rnme --engine` (which compiles
                   │                      itself); on success route new spawns there;
-                  │                      old gens retire when their tasks complete
+                  │                      old gens stay alive for the supervisor's lifetime
 ```
 
-Two new dispatch arms in `cli.rs`:
+Two new mode flags. They live at different layers because their needs are different:
 
 - **`--engine`** — engine + TCP JSONL server bound to `127.0.0.1:0` (OS-assigned port). Headless. No TUI, no stdio forwarding. The "engine daemon" mode. On startup, prints `{"port": <u16>}` as a single line on stdout (the _only_ thing it ever writes to stdout); errors go to stderr. Accepts `--start-task-id N` to set the starting `TaskId` counter; defaults to 1 (the standalone case). The supervisor passes a starting id past anything previously used so live engines occupy disjoint id ranges and top-task ids stay globally unique.
+
+  Dispatched in the **runner binary** (`src/cli.rs`) like `--tui` / `--cli`, because the engine needs the registry baked in via `inventory` from the user's compiled RUNME.rs files.
+
 - **`--mcp`** — MCP server on stdio (parent agent), implemented with `rmcp`. Maintains a map from top-task id to engine (and the underlying `rnme --engine` children). Parses dotted addresses on incoming MCP tool calls (see Identifiers and routing), looks up the engine that owns the address's `<top>`, forwards the request to that engine's TCP connection. Watches RUNME.rs files; on change, spawns a new engine and routes new top-level spawns there. Child stderr is dropped (or forwarded later if useful).
+
+  Dispatched in the **outer driver** (`src/bin/rnme/main.rs`), short-circuited *before* `compile_workspace()`. The supervisor runs in the outer process — no discover, no compile, no exec into a runner. The supervisor has no need for the user's task code; it's a pure proxy/router. From inside the supervisor, `std::env::current_exe()` returns the outer `rnme` binary, so `Command::new(current_exe()).arg("--engine")` re-enters the outer driver, which transparently does discover+compile+exec into a runner with `--engine` (the engine daemon).
 
 Like `--tui` and `--cli`, these are bare flags; passing more than one mode flag is rejected by the arg parser.
 
@@ -57,16 +62,19 @@ file event → debounce 200ms → spawn `rnme --engine` (gen N+1)
                  spawn / list_tasks / run_task call
 
 per-gen retirement:
-  - latest gen is never retired by task completion
-  - a gen that had tasks: when ALL its tasks are terminal AND it is not latest,
-    start a cooldown timer (default 15 min, --gen-cooldown on --mcp).
-    any access (get_task, get_logs, kill_task, etc.) resets the timer.
-    on expiry, kill the child and drop supervisor-side state.
+  - latest gen is never retired.
+  - a gen with running tasks: never retired.
+  - a gen whose tasks are all terminal AND is not latest: stays alive for the
+    supervisor's lifetime. The agent can keep querying its logs and reports for
+    as long as the MCP session is open.
   - a gen that never had tasks (spawned, then immediately eclipsed by another
-    build): retire immediately — no logs worth keeping.
+    rebuild before any task spawned through it): retire immediately — no logs
+    of value, no reason to keep the process around.
 ```
 
-The latest gen is never retired by tasks completing — there's always a current gen ready for new spawns. Older gens drain into a cooldown window so the natural "run a task, immediately ask about it" agent flow doesn't lose data. The sliding TTL means an agent actively reading a gen's logs keeps it alive; one that walked away lets it retire.
+**The MCP session is the retention boundary, not a timer.** Old gens whose tasks have completed sit in memory with their `LogStore` intact; the agent can come back to a completed task five minutes or five hours later and still get its logs and rendered report. This is the user pain point the generations system exists to solve — losing data because of an unrelated edit is the failure mode we're avoiding, and a timer-based eviction recreates a softer version of that failure. The cost is one process and one TCP connection per edit cycle, bounded by how many times the user edits during a single MCP session, which in practice is small enough not to matter.
+
+When the supervisor exits (MCP session ends), all gens shut down via the EOF-cleanup path — see "Engine cleanup on disconnect" below.
 
 ### Identifiers and routing
 
@@ -83,18 +91,18 @@ Strings over packed integers because they read cleanly in agent-facing tools —
 - **Tool calls that take an id** (`kill_task`, `get_task`, `get_logs`, `kill_process`, etc.) — supervisor parses the dotted form, looks up the engine that owns `<top>` in its top-task→engine map, forwards `task_id: <task>` (and `seq: <seq>` if any) on that engine's TCP connection.
 - **Snapshots and log entries flowing from an engine back to the supervisor** — supervisor walks each engine's snapshot, identifies the top-level ancestor of every node, formats embedded ids as `"<top>.<task>"` before passing them to the agent.
 - **Graph view** — `get_graph` returns a flat list of live top-level tasks (with their subtrees) merged across all engines, ordered by top-task id ascending. No supervisor-level meta-root, no reserved id.
-- **Stale ids** — an id whose `<top>` references a retired engine returns `not_found` from the supervisor without crossing the TCP boundary. Same for log cursors.
+- **Stale ids** — an id whose `<top>` references a never-had-tasks gen that retired (or any other supervisor-side miss) returns `not_found` without crossing the TCP boundary. Same for log cursors. In practice this is rare during a session: gens with tasks stay alive for the session's lifetime, so the only `not_found` paths are malformed/unknown ids and ids from gens that retired immediately for having no tasks.
 - **Malformed ids** — anything that doesn't parse as `<u64>(\.<u64>(\.<u64>)?)?` returns `bad_request`.
 
 This means **no engine code change** beyond what's needed for the TCP/JSONL transport itself. Engine-ownership tracking, snapshot merging, and address parsing all live entirely in the supervisor.
 
-### What survives a generation's retirement: nothing
+### Retention model
 
-When a gen finally retires (cooldown expired, no recent activity), its `LogStore` and graph state die with the child process. Tasks that were running in it are already terminal; their final reports and logs vanish. Agent queries against ids whose top-task lived in a retired engine get `not_found`.
+State on a gen survives as long as the gen does, and gens with tasks live for the supervisor's lifetime. So in practical terms: **once a task has run during an MCP session, its logs and rendered report stay queryable for that whole session.** This matches the in-process "completed tasks stay forever" property of the standalone engine — "forever" is just bounded by the session.
 
-This is a real semantic change from today's "completed tasks stay forever" property: completed tasks stay only until their gen's cooldown expires. The cooldown is the safety net for the common "run a task, ask about it shortly after" pattern; an agent that needs longer-term retention should call `get_task` and capture the rendered report while the gen is still live (or keep accessing the gen, which extends the TTL).
+The supervisor exits → all gens exit via EOF-cleanup → all `LogStore` / graph state is dropped. Cross-session retention is out of scope for v1; an agent that needs durable history of a task should capture `get_task` output (the rendered report) into its own notes during the session.
 
-A future supervisor feature could mirror retired-gen state (final reports + log tails) into supervisor memory for unbounded retention. Not v1.
+A future supervisor feature could persist gen state to disk on shutdown for cross-session retention. Not v1.
 
 ### Engine cleanup on disconnect
 
@@ -368,25 +376,20 @@ on file event:
   debounce 200ms
   spawn next gen with --engine --start-task-id <past last used>; state = Rebuilding
   watch for port line OR child exit, same as startup
-    on success: promote to "latest"; older gens stay alive until their tasks drain
+    on success: promote to "latest"; older gens stay alive (with their LogStores)
     on failure: state = LastBuildFailed; existing live gens are unaffected
   re-discover RUNME.rs files for the watcher; rebuild watch set if any appeared/disappeared
   (the child engine does its own discovery for compilation; supervisor discovery
   is purely for the file watcher's input)
 
 on gen event (from any live gen's graph stream):
-  if all of that gen's tasks are terminal AND it is not the latest gen:
-    if the gen had tasks: start/refresh its cooldown timer
-    if the gen never had tasks: retire immediately
-
-on cooldown expiry:
-  kill child, drop supervisor-side state for the gen
-
-on tool call that targets a cooldown-pending gen:
-  reset its cooldown timer (sliding TTL)
+  if the gen never had tasks AND a newer gen has been promoted to latest:
+    retire it immediately (it's holding nothing of value).
+  otherwise: leave it alive — its tasks are the only retention we have.
 
 on tool call (request from agent):
-  if request carries an id whose <top> is in a retired engine: return not_found
+  if request carries an id whose <top> is in a (rare) retired never-had-tasks
+      engine, or is unknown to the supervisor: return not_found
   if request carries an id whose <top> is in a live engine: route to that engine
   if request is a new spawn (spawn_task / run_task):
     if rebuilding: block until done
@@ -463,7 +466,7 @@ The binary embeds the directory tree via `include_dir!` (or equivalent) so insta
 
 Two entrypoints share one implementation in `src/mcp/skills.rs`:
 
-- **`rnme :install-skills <target>`** — builtin task. Human-driven; runs from a terminal during project setup. Routes to the same `install_to(path)` library function as the MCP tool.
+- **`rnme :install_skills <target>`** — builtin task. Human-driven; runs from a terminal during project setup. Routes to the same `install_to(path)` library function as the MCP tool. (Underscore, not hyphen — the `#[rnme::task]` macro derives the registered task name from the function ident, and Rust function names cannot contain hyphens.)
 - **MCP tool `install_skills(target_dir)`** — agent-driven; called after connecting to `rnme --mcp`.
 
 Both copy the embedded tree to `<target>/rnme/<skill>/`. The `rnme/` namespace dir scopes the install — uninstall is `rm -rf <target>/rnme/`, and skill names can't collide with skills the user wrote themselves. Re-running overwrites, so re-installing on each rnme upgrade keeps the installed skills in sync with the binary version.
@@ -505,4 +508,4 @@ The supervisor populates the standard `instructions` slot in its `initialize` re
 
 ## Open / next
 
-- **Reference the manual from `CLAUDE.md`.** Once `docs/manual/` has at least skeleton content, update the project `CLAUDE.md` to point at it as the source-of-truth reference for RUNME.rs authoring and MCP usage, and to mention `rnme :install-skills` as the way to materialize the manual as agent skills.
+- **Reference the manual from `CLAUDE.md`.** Once `docs/manual/` has at least skeleton content, update the project `CLAUDE.md` to point at it as the source-of-truth reference for RUNME.rs authoring and MCP usage, and to mention `rnme :install_skills` as the way to materialize the manual as agent skills.
