@@ -39,6 +39,7 @@ pub(crate) const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 /// multiple `Engine::start` calls (a `Once` gates the install).
 fn install_global_tracing_subscriber() {
     use std::sync::Once;
+    use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::registry::Registry;
 
@@ -46,7 +47,10 @@ fn install_global_tracing_subscriber() {
 
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let subscriber = Registry::default().with(LogEntryLayer::new());
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let subscriber = Registry::default()
+            .with(filter)
+            .with(LogEntryLayer::new());
         let dispatch = tracing::dispatcher::Dispatch::new(subscriber);
         let _ = tracing::dispatcher::set_global_default(dispatch);
     });
@@ -225,6 +229,10 @@ pub struct EngineInternals {
     /// `Engine::start`; the root body takes it on first run.
     pub(crate) control_rx_slot: Mutex<Option<mpsc::UnboundedReceiver<Control>>>,
     pub registry: Arc<Registry>,
+    /// Output format hint set at runtime by `TaskContext::default_format()`.
+    /// First writer wins. The CLI forwarder reads this when the user did
+    /// not pass `--format` explicitly.
+    pub format_hint: Arc<std::sync::OnceLock<crate::output::OutputFormat>>,
 }
 
 impl EngineInternals {
@@ -675,6 +683,13 @@ impl EngineHandle {
         rx.await.map_err(|_| EngineError::ShuttingDown)?
     }
 
+    /// Shared cell holding the runtime format hint set by
+    /// `TaskContext::default_format()`. The CLI forwarder reads this
+    /// when `--format` was not passed explicitly.
+    pub fn format_hint(&self) -> Arc<std::sync::OnceLock<crate::output::OutputFormat>> {
+        self.internals.format_hint.clone()
+    }
+
     /// Subscribe to log entries from any task or process.
     ///
     /// Synchronous per arch.md §5: the only contention path is
@@ -803,6 +818,7 @@ impl Engine {
                 control_tx: control_tx.clone(),
                 control_rx_slot: Mutex::new(Some(control_rx)),
                 registry: registry.clone(),
+                format_hint: Arc::new(std::sync::OnceLock::new()),
             }
         });
 

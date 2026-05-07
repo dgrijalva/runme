@@ -335,6 +335,20 @@ impl TaskContext {
         buffer.lock().await.push(entry);
     }
 
+    /// Hint the preferred CLI output format for this run.
+    ///
+    /// Honored only in CLI mode and only when the user did not pass
+    /// `--format` on the command line. First call wins; subsequent calls
+    /// (and calls from outside the engine, e.g. tests) are silent no-ops.
+    ///
+    /// Useful for tasks that emit a clean report via `ctx.println()` and
+    /// want their output to bypass the structured-text decoration.
+    pub fn default_format(&self, format: crate::output::OutputFormat) {
+        if let Some(internals) = self.engine.as_ref().and_then(|w| w.upgrade()) {
+            let _ = internals.format_hint.set(format);
+        }
+    }
+
     /// Set the tracing output buffer (used by TaskRunner to inject the
     /// buffer that LogEntryLayer writes to).
     pub fn set_tracing_output(&mut self, buffer: Arc<Mutex<OutputBuffer>>) {
@@ -911,7 +925,7 @@ pub struct TaskGuard {
 
 impl TaskGuard {
     fn new(name: &str) -> Self {
-        tracing::info!(task = name, event = "task_start", "task started");
+        tracing::debug!(task = name, event = "task_start", "task started");
         Self {
             name: name.to_string(),
         }
@@ -920,7 +934,7 @@ impl TaskGuard {
 
 impl Drop for TaskGuard {
     fn drop(&mut self) {
-        tracing::info!(task = %self.name, event = "task_end", "task ended");
+        tracing::debug!(task = %self.name, event = "task_end", "task ended");
     }
 }
 

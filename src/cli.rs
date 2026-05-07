@@ -28,16 +28,7 @@ pub enum UiMode {
     Agent,
 }
 
-/// Output format for CLI and Agent modes.
-#[derive(Clone, Debug, clap::ValueEnum)]
-pub enum OutputFormat {
-    /// Human-readable text (structured columns)
-    Text,
-    /// Structured JSON
-    Json,
-    /// Raw process output (unformatted, good for piping)
-    Raw,
-}
+pub use crate::output::OutputFormat;
 
 /// Top-level CLI arguments for the generated runner binary.
 ///
@@ -60,8 +51,8 @@ pub struct RnmeArgs {
     pub cli: bool,
 
     /// Output format (for cli mode)
-    #[arg(long, default_value = "text")]
-    pub format: OutputFormat,
+    #[arg(long)]
+    pub format: Option<OutputFormat>,
 
     /// Timeout (seconds, or with suffix: 10m, 1h)
     #[arg(long)]
@@ -179,10 +170,12 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
             }
         }
         UiMode::Cli => {
-            run_cli(task, &task_args, &registry, &args.format, timeout).await;
+            run_cli(task, &task_args, &registry, args.format, timeout).await;
         }
         UiMode::Agent => {
-            run_agent(task, &task_args, &registry, &args.format, timeout).await;
+            // Agent mode has no `default_format` story yet; fall back to Text.
+            let fmt = args.format.unwrap_or(OutputFormat::Text);
+            run_agent(task, &task_args, &registry, &fmt, timeout).await;
         }
     }
 }
@@ -209,19 +202,27 @@ async fn run_cli(
     task: &'static crate::task::TaskDef,
     args: &[String],
     registry: &Arc<Registry>,
-    format: &OutputFormat,
+    explicit_format: Option<OutputFormat>,
     timeout: Option<Duration>,
 ) {
     use crate::execution::{Engine, TaskStatus};
 
     let (engine, handle) = Engine::start(registry.clone());
 
-    // Subscribe to LogStore → stdio BEFORE launching the task.
+    // Subscribe to LogStore → stdio BEFORE launching the task. Format is
+    // resolved per-entry: explicit `--format` wins; otherwise the task's
+    // `ctx.default_format()` hint (if any) wins; otherwise Text.
     let rx = handle.subscribe_logs();
-    let use_raw = matches!(format, OutputFormat::Raw);
     let use_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let graph_rx = handle.graph.clone();
-    tokio::spawn(forward_output_to_stdio(rx, use_raw, use_color, graph_rx));
+    let format_hint = handle.format_hint();
+    tokio::spawn(forward_output_to_stdio(
+        rx,
+        explicit_format,
+        format_hint,
+        use_color,
+        graph_rx,
+    ));
 
     // Spawn the task through the engine.
     let mut builder = handle.spawn_task(task, args.to_vec());
@@ -299,16 +300,23 @@ async fn run_cli(
 
 /// Forward log entries from a broadcast receiver to stdout/stderr.
 ///
-/// Color handling by mode:
-/// - Text (`raw=false`): colored columns if `color=true`, plain if not.
-/// - Raw (`raw=true`): ANSI passthrough if `color=true`, stripped if not.
+/// Format is resolved per-entry: `explicit_format` (from `--format`)
+/// always wins; otherwise the task's `ctx.default_format()` hint wins
+/// if set; otherwise Text. This lets a task call `default_format(Raw)`
+/// at the top of its body and have output formatted accordingly, even
+/// for entries already in flight.
+///
+/// Color handling:
+/// - Text: colored columns if `color=true`, plain if not.
+/// - Raw: ANSI passthrough if `color=true`, stripped if not.
 ///
 /// `graph_rx` is read on every entry to resolve `TaskId -> [N] label` for
 /// the source column. The graph is updated in-place by the engine; this
 /// only borrows the latest snapshot.
 async fn forward_output_to_stdio(
     mut rx: tokio::sync::broadcast::Receiver<LogEntry>,
-    raw: bool,
+    explicit_format: Option<OutputFormat>,
+    format_hint: Arc<std::sync::OnceLock<OutputFormat>>,
     color: bool,
     graph_rx: tokio::sync::watch::Receiver<crate::execution::GraphSnapshot>,
 ) {
@@ -319,6 +327,10 @@ async fn forward_output_to_stdio(
     let stderr = std::io::stderr();
     let mut source_colors = SourceColors::new();
     while let Ok(entry) = rx.recv().await {
+        let format = explicit_format
+            .or_else(|| format_hint.get().copied())
+            .unwrap_or(OutputFormat::Text);
+        let raw = matches!(format, OutputFormat::Raw);
         // Build labels from the latest graph snapshot. Cheap — the
         // snapshot Arc-clones the task table and we just walk it once.
         let labels = graph_rx.borrow().source_labels();

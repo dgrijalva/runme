@@ -31,6 +31,7 @@ pub use crate::log::parse::{
     RecordParser, RustPanicParser,
 };
 pub use crate::log::{ExtractedFields, LogEntry, ParseResult, ParsedContent, RawRecord, Stream};
+pub use crate::output::OutputFormat;
 pub use crate::process::{
     Output, ProcessError, ProcessHandle, ProcessResult, ReadinessCondition, SpawnBuilder,
     Termination,
