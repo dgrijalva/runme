@@ -15,8 +15,8 @@ agent ─stdio─▶ rnme --mcp ─┬─TCP/JSONL─▶ rnme --engine  (gen 1, 
                   │         ├─TCP/JSONL─▶ rnme --engine  (gen 2, latest — receives new spawns)
                   │         └─TCP/JSONL─▶ rnme --engine  (gen N, spawned on next rebuild)
                   │
-                  │  on RUNME.rs change: rebuild cargo, spawn next gen,
-                  │                      route new spawns there;
+                  │  on RUNME.rs change: spawn next `rnme --engine` (which compiles
+                  │                      itself); on success route new spawns there;
                   │                      old gens retire when their tasks complete
 ```
 
@@ -50,9 +50,11 @@ The cost is contained to the supervisor: engine code is unchanged, and the agent
 ### Lifecycle
 
 ```
-file event → debounce 200ms → cargo rebuild
-  on success: spawn gen N+1; it becomes "latest"; new spawns route there
-  on failure: keep current latest gen; surface error on next tool response
+file event → debounce 200ms → spawn `rnme --engine` (gen N+1)
+  child runs discover/compile internally
+  on port-line: gen N+1 becomes "latest"; new spawns route there
+  on early-exit: keep current latest gen; surface stderr (cargo errors) on next
+                 spawn / list_tasks / run_task call
 
 per-gen retirement:
   - latest gen is never retired by task completion
@@ -356,18 +358,21 @@ Flow:
 
 ```
 supervisor startup:
-  discover RUNME.rs files
-  cargo build (cold)
-  spawn gen 1 with --engine; mark it "latest"
+  spawn gen 1 with --engine --start-task-id 1; state = Rebuilding
+  watch for {"port": N} on stdout OR child exit
+    on port line: open TCP; promote to "latest"; state = Idle
+    on early exit: capture stderr; state = LastBuildFailed
   start notify watcher on RUNME.rs files (and sibling .rs files)
 
 on file event:
   debounce 200ms
-  rebuild via existing compile.rs path
-  if success: spawn next gen with --engine; promote it to "latest"
-              older gens stay alive until their tasks drain
-  if failure: keep current latest gen as-is; surface error on next tool response
-  re-discover and rebuild watch set if RUNME.rs files appeared/disappeared
+  spawn next gen with --engine --start-task-id <past last used>; state = Rebuilding
+  watch for port line OR child exit, same as startup
+    on success: promote to "latest"; older gens stay alive until their tasks drain
+    on failure: state = LastBuildFailed; existing live gens are unaffected
+  re-discover RUNME.rs files for the watcher; rebuild watch set if any appeared/disappeared
+  (the child engine does its own discovery for compilation; supervisor discovery
+  is purely for the file watcher's input)
 
 on gen event (from any live gen's graph stream):
   if all of that gen's tasks are terminal AND it is not the latest gen:
@@ -407,17 +412,24 @@ on tool call (request from agent):
 
 The supervisor has a single build state, separate from per-engine lifecycle. Only **spawn-shaped calls** (`spawn_task`, `run_task`) care about it; calls that target an existing top-task (`kill_task`, `get_task`, `get_logs`, etc.) route directly to the owning engine and don't wait for a build.
 
-| State           | spawn / run_task                          | Other tools (get_task, get_logs, kill_task, list_tasks, get_build_status) |
-| --------------- | ----------------------------------------- | ------------------------------------------------------------------------- |
-| Idle            | Forward to latest engine.                 | Route normally by `<top>`.                                                |
-| Rebuilding      | Block until transition.                   | Route normally.                                                           |
-| LastBuildFailed | **Return error with cargo output head** (~12 lines, with hint to call `get_build_status` for full output). No fallback to a previous build. | Route normally.                                                           |
+Tools split into two groups based on whether they need the current build:
+
+- **Need-current-build:** `spawn_task`, `run_task`, `list_tasks`. These reflect what the user's current RUNME.rs files define — the agent has to see live code, not stale code.
+- **Existing-state:** `kill_task`, `kill_process`, `kill_all`, `get_task`, `get_logs`, `grep_logs`, `get_graph`. These reference already-running tasks in still-live engines; they're indifferent to whether the latest build compiles.
+
+`get_build_status` is always available regardless of state. `install_skills` doesn't touch engines at all.
+
+| State           | Need-current-build (spawn, run_task, list_tasks) | Existing-state tools                  |
+| --------------- | ------------------------------------------------ | ------------------------------------- |
+| Idle            | Forward to latest engine.                        | Route normally by `<top>`.            |
+| Rebuilding      | Block until transition.                          | Route normally.                       |
+| LastBuildFailed | **Return error with cargo output head** (~12 lines, with hint to call `get_build_status` for full output). No fallback to a previous build. | Route normally. |
 
 Transitions:
 
-- `Idle` → `Rebuilding` on debounced file event.
-- `Rebuilding` → `Idle` on successful build + new engine spawned + connected (wait for `{"port": <u16>}` line on the child's stdout — 5s timeout, kill child and surface stderr on timeout/early-exit — open TCP connection, mark new engine as latest).
-- `Rebuilding` → `LastBuildFailed` on cargo failure. Latest engine is unchanged; existing live engines are unaffected.
+- `Idle` → `Rebuilding` on debounced file event (or on initial startup, before any engine has connected).
+- `Rebuilding` → `Idle` when the spawned `rnme --engine` child prints `{"port": <u16>}` on stdout. Supervisor opens TCP, marks new engine as latest. The engine handles its own discover/compile/exec internally; from the supervisor's view this is just "spawn child, watch stdout for port line or child exit."
+- `Rebuilding` → `LastBuildFailed` when the child exits before printing the port line. Supervisor captures the child's stderr (cargo errors, panics, whatever it produced) into `last_failure_output`. Existing live engines are unaffected.
 - `LastBuildFailed` → `Rebuilding` on next file event.
 - `LastBuildFailed` → `Idle` on subsequent rebuild success.
 
