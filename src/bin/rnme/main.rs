@@ -38,6 +38,31 @@ fn main() {
         }
     }
 
+    // `--mcp` short-circuits compilation entirely. The supervisor runs in
+    // this outer process, owns stdio (rmcp will plug in during phase 6),
+    // and spawns child engines by re-entering `current_exe()` with
+    // `--engine`. From the child's perspective, that re-entry hits this
+    // same `main.rs`, which falls through to the normal discover+compile
+    // path with `--engine` in the pass-through args.
+    //
+    // We accept `--mcp` anywhere in argv (not just position 1) so it can
+    // coexist with the other RnmeArgs flags the runner consumes. clap is
+    // not in play yet at this point in the outer driver.
+    if args.iter().skip(1).any(|a| a == "--mcp") {
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("rnme: tokio init failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        rt.block_on(rnme::mcp::supervisor::run());
+        return;
+    }
+
     let discovery_result = discover(&cwd);
     if discovery_result.nearest.is_none() {
         eprintln!("rnme: no RUNME.rs found (searched from {})", cwd.display());
