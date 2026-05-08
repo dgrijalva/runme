@@ -357,6 +357,42 @@ impl LogStore {
         matched
     }
 
+    /// Count entries by stream class for a set of sources.
+    ///
+    /// `task_sources` identifies the subset of `all_sources` that are
+    /// task ids (vs process ids). Stdout/Stderr counts come from any
+    /// source in `all_sources`; events come from `task_sources` whose
+    /// `entry.stream` is `None`. Stream-tagged entries from a task
+    /// source (rare in practice) count as Stdout/Stderr, not events —
+    /// matching the report renderer's classification.
+    pub fn count_by_stream(
+        &self,
+        all_sources: &[TaskId],
+        task_sources: &[TaskId],
+    ) -> (u64, u64, u64) {
+        use std::collections::HashSet;
+        let all: HashSet<TaskId> = all_sources.iter().copied().collect();
+        let tasks: HashSet<TaskId> = task_sources.iter().copied().collect();
+        let mut stdout = 0u64;
+        let mut stderr = 0u64;
+        let mut events = 0u64;
+        for (id, v) in self.sources.iter() {
+            if !all.contains(id) {
+                continue;
+            }
+            let is_task = tasks.contains(id);
+            for e in v.iter() {
+                match e.stream {
+                    Some(crate::log::Stream::Stdout) => stdout += 1,
+                    Some(crate::log::Stream::Stderr) => stderr += 1,
+                    None if is_task => events += 1,
+                    None => {}
+                }
+            }
+        }
+        (stdout, stderr, events)
+    }
+
     /// Subscribe to a filtered, replay-then-live stream.
     ///
     /// Yields all stored entries with `seq > from_seq` matching `sources`

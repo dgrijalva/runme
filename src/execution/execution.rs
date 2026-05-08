@@ -272,6 +272,14 @@ pub struct TaskExecution {
     /// `TaskContext::summary`. Last write wins. Shared with the running
     /// `TaskContext` (mirrors the `task_status` sharing pattern).
     pub summary: Arc<Mutex<Option<String>>>,
+    /// If set by the cancel/timeout ladder before the body's tokio task
+    /// observed cancellation, the body completion handler will use this
+    /// status (Cancelled / Timeout) instead of the body's natural exit
+    /// (Done / Failed). This makes user-requested kill/timeout
+    /// "winning" over a cooperative `Ok(())` return — without this, a
+    /// task that uses `ctx.cancellation_signal()` and returns Ok races
+    /// the engine and reports `completed (exit 0)` despite the kill.
+    pub terminal_override: Arc<OnceLock<TaskStatus>>,
 }
 
 impl TaskExecution {
@@ -323,6 +331,7 @@ impl TaskExecution {
             started_at: Arc::new(OnceLock::new()),
             ended_at: Arc::new(OnceLock::new()),
             summary: Arc::new(Mutex::new(None)),
+            terminal_override: Arc::new(OnceLock::new()),
         }
     }
 
@@ -387,6 +396,7 @@ impl TaskExecution {
         let task_id = self.id;
         let tracing_buf_for_body = tracing_buffer.clone();
         let ended_at_for_body = self.ended_at.clone();
+        let terminal_override_for_body = self.terminal_override.clone();
 
         // Mark the start of the task body. `set` is called exactly once
         // per `TaskExecution` because `spawn_body` itself runs once.
@@ -406,18 +416,26 @@ impl TaskExecution {
 
             {
                 let mut s = task_status.lock().await;
-                match &result {
-                    Ok(()) => {
-                        *s = TaskStatus::Done;
-                    }
-                    Err(task_err) => {
-                        let failure = TaskFailure {
-                            message: task_err.to_string(),
-                            exit_code: task_err.exit_code(),
-                            output_json: task_err.output().to_string(),
-                        };
-                        tracing::error!("task failed: {}", failure.message);
-                        *s = TaskStatus::Failed(failure);
+                // If the cancel or timeout ladder requested a terminal
+                // override before/while the body was running, honor it
+                // — the user asked for a kill, even if the body
+                // cooperated and returned `Ok(())`.
+                if let Some(forced) = terminal_override_for_body.get() {
+                    *s = forced.clone();
+                } else {
+                    match &result {
+                        Ok(()) => {
+                            *s = TaskStatus::Done;
+                        }
+                        Err(task_err) => {
+                            let failure = TaskFailure {
+                                message: task_err.to_string(),
+                                exit_code: task_err.exit_code(),
+                                output_json: task_err.output().to_string(),
+                            };
+                            tracing::error!("task failed: {}", failure.message);
+                            *s = TaskStatus::Failed(failure);
+                        }
                     }
                 }
                 let _ = ended_at_for_body.set(chrono::Local::now());

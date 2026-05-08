@@ -453,6 +453,13 @@ impl EngineInternals {
             h.abort();
         }
 
+        // Record intent: even if the body cooperatively returns Ok
+        // before our terminal-status write below, the body completion
+        // handler will see this override and write Cancelled instead
+        // of Done. Set BEFORE we signal cancellation so the body's
+        // Ok-path can't beat us.
+        let _ = exec.terminal_override.set(TaskStatus::Cancelled);
+
         // 1. Signal the token (cooperative, no-op if no opt-in observer).
         exec.cancellation.cancel();
 
@@ -474,7 +481,10 @@ impl EngineInternals {
             }
         }
 
-        // 5. Mark Cancelled (only if not already terminal).
+        // 5. Mark Cancelled. The terminal_override set at entry guarantees
+        //    the body completion path also writes Cancelled if it raced us.
+        //    We still write here for the path where the body never reached
+        //    its completion handler (e.g. abort-killed before line 407).
         {
             let mut s = exec.task_status().lock().await;
             if matches!(*s, TaskStatus::Setup | TaskStatus::Ready) {
@@ -533,6 +543,9 @@ impl EngineInternals {
         let Some(exec) = self.lookup(id) else {
             return;
         };
+        // Same intent-record as cancel_task_with: ensure the body's
+        // cooperative Ok-path doesn't beat us to writing Done.
+        let _ = exec.terminal_override.set(TaskStatus::Timeout);
         // Don't re-abort the watchdog here — it is the caller.
         exec.cancellation.cancel();
         if let Some(ctx) = exec.task_context().await {
@@ -775,6 +788,25 @@ impl EngineHandle {
             for proc in &node.processes {
                 out.push(proc.id);
             }
+            for &child in &node.children {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    /// `task_id` and every descendant *task* — but NOT process source ids.
+    /// Used to identify "events" (tracing macros, `ctx.println`) which
+    /// emit under a task source rather than a process source.
+    pub fn task_only_source_ids(&self, task_id: TaskId) -> Vec<TaskId> {
+        let snapshot = self.graph.borrow().clone();
+        let mut out = Vec::new();
+        let mut stack = vec![task_id];
+        while let Some(id) = stack.pop() {
+            let Some(node) = snapshot.tasks.get(&id) else {
+                continue;
+            };
+            out.push(node.id);
             for &child in &node.children {
                 stack.push(child);
             }

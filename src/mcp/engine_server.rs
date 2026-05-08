@@ -473,6 +473,25 @@ async fn handle_request(
                 ))),
             }
         }
+
+        Request::CountLogs { task_id } => {
+            let all_sources = handle.source_ids_for(task_id);
+            if all_sources.is_empty() {
+                return Err(RpcError::NotFound(format!(
+                    "task {task_id} not in graph"
+                )));
+            }
+            let task_sources = handle.task_only_source_ids(task_id);
+            let (stdout, stderr, events) = {
+                let store = handle.log_store.lock().await;
+                store.count_by_stream(&all_sources, &task_sources)
+            };
+            Ok(Response::CountLogs(crate::mcp::wire::LogCounts {
+                stdout,
+                stderr,
+                events,
+            }))
+        }
     }
 }
 

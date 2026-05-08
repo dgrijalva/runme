@@ -129,8 +129,9 @@ async fn test_list_tasks(peer: &rmcp::Peer<rmcp::RoleClient>) {
     let result = call(peer, "list_tasks", None).await;
     let value = structured(&result);
     let arr = value
-        .as_array()
-        .unwrap_or_else(|| panic!("list_tasks not array: {value}"));
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .unwrap_or_else(|| panic!("list_tasks structuredContent missing `tasks` array: {value}"));
     let task_names: Vec<String> = arr
         .iter()
         .filter_map(|v| v.get("qualified_name").and_then(|n| n.as_str()))

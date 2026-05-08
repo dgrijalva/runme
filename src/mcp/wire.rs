@@ -114,6 +114,12 @@ pub enum Request {
     UnsubscribeLogs {
         subscription_id: SubscriptionId,
     },
+    /// Count log entries by stream class for a task and its descendants.
+    /// Used by the report renderer (so counts don't depend on the
+    /// `tail_n` slice the renderer happens to receive).
+    CountLogs {
+        task_id: TaskId,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -147,6 +153,17 @@ pub enum Response {
         subscription_id: SubscriptionId,
     },
     UnsubscribeLogs,
+    CountLogs(LogCounts),
+}
+
+/// Per-stream log entry counts for a task subtree. Stdout and stderr are
+/// totals across descendant *processes*; events are totals across
+/// task-source ids (tracing macros, `ctx.println`).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct LogCounts {
+    pub stdout: u64,
+    pub stderr: u64,
+    pub events: u64,
 }
 
 // ---------------------------------------------------------------------------

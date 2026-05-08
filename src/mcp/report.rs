@@ -18,6 +18,7 @@ use crate::execution::TaskId;
 use crate::execution::engine::GraphSnapshot;
 use crate::execution::execution::TaskStatus;
 use crate::log::{LogEntry, ParsedContent, Stream};
+use crate::mcp::wire::LogCounts;
 
 /// Default tail size when the caller doesn't specify `tail_n`.
 pub const DEFAULT_TAIL_N: usize = 50;
@@ -31,8 +32,12 @@ pub const MAX_TAIL_N: usize = 1000;
 /// `snapshot` is a single graph snapshot taken at any time (the engine's
 /// `watch::Receiver<GraphSnapshot>::borrow()`, or the supervisor's
 /// cached copy). `log_entries` must already be filtered to the
-/// descendant source set (caller-fetched). `tail_n` controls the
-/// "Last n lines:" fallback when no `Summary` is set.
+/// descendant source set (caller-fetched) and is the tail used for the
+/// "Last n lines:" rendering. `counts` carries the *true* totals across
+/// the whole task subtree — separate from `log_entries` because the tail
+/// is bounded but the counts must reflect everything emitted, not just
+/// what fit in the tail. `tail_n` controls the "Last n lines:" fallback
+/// when no `Summary` is set.
 ///
 /// If `top_id` doesn't appear in the snapshot, a single-line report is
 /// produced (`Task t<id> ? - unknown`) so the caller has *something* to
@@ -41,6 +46,7 @@ pub fn render(
     snapshot: &GraphSnapshot,
     top_id: TaskId,
     log_entries: &[LogEntry],
+    counts: LogCounts,
     tail_n: usize,
 ) -> String {
     let tail_n = tail_n.min(MAX_TAIL_N);
@@ -50,7 +56,6 @@ pub fn render(
     };
 
     let descendants: HashSet<TaskId> = snapshot.descendant_source_ids(top_id);
-    let task_sources: HashSet<TaskId> = task_only_sources(snapshot, top_id);
 
     let mut out = String::new();
 
@@ -66,20 +71,16 @@ pub fn render(
     let (started_str, runtime_str) = format_started_and_runtime(node);
     out.push_str(&format!("Started: {}  Run time: {}\n", started_str, runtime_str));
 
-    // Stdout / Stderr counts with format-detection suffix.
-    let stdout_count = count_with_stream(log_entries, &descendants, Stream::Stdout);
-    let stderr_count = count_with_stream(log_entries, &descendants, Stream::Stderr);
+    // Stdout / Stderr counts come from the engine-wide totals (`counts`);
+    // format detection runs over the tail slice we have on hand. The
+    // detection suffix is best-effort: if the tail is dominated by JSON
+    // we say so even if the totals include older PlainText entries we
+    // didn't fetch.
     let stdout_suffix = format_kind_suffix(log_entries, &descendants, Some(Stream::Stdout));
     let stderr_suffix = format_kind_suffix(log_entries, &descendants, Some(Stream::Stderr));
-    out.push_str(&format!("Stdout: {} lines{}\n", stdout_count, stdout_suffix));
-    out.push_str(&format!("Stderr: {} lines{}\n", stderr_count, stderr_suffix));
-
-    // Events — entries from task-source ids (not process ids).
-    let events_count = log_entries
-        .iter()
-        .filter(|e| task_sources.contains(&e.source))
-        .count();
-    out.push_str(&format!("Events: {} lines\n", events_count));
+    out.push_str(&format!("Stdout: {} lines{}\n", counts.stdout, stdout_suffix));
+    out.push_str(&format!("Stderr: {} lines{}\n", counts.stderr, stderr_suffix));
+    out.push_str(&format!("Events: {} lines\n", counts.events));
 
     // Summary OR "Last n lines:" fallback.
     if let Some(summary) = &node.summary {
@@ -98,12 +99,25 @@ pub fn render(
         let start = sorted.len().saturating_sub(tail_n);
         let labels = snapshot.source_labels();
         for entry in &sorted[start..] {
-            out.push_str(&crate::log::format::format_entry(entry, &labels));
+            let line = crate::log::format::format_entry(entry, &labels);
+            out.push_str(&strip_ansi(&line));
             out.push('\n');
         }
     }
 
     out
+}
+
+/// Strip ANSI CSI escape sequences (color, formatting) from a string.
+/// MCP responses go to agents, not terminals; ANSI is just noise.
+fn strip_ansi(s: &str) -> String {
+    static ANSI_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = ANSI_RE.get_or_init(|| {
+        // Matches ANSI CSI (Control Sequence Introducer) escapes:
+        // ESC '[' <params> <final-byte>. Covers SGR (color), cursor moves, etc.
+        regex::Regex::new(r"\x1b\[[0-9;?]*[A-Za-z]").expect("valid ANSI regex")
+    });
+    re.replace_all(s, "").into_owned()
 }
 
 /// Status formatter per design §"Task report".
@@ -145,34 +159,6 @@ fn format_started_and_runtime(node: &crate::execution::engine::TaskNode) -> (Str
         runtime_str.push_str(" (running)");
     }
     (started_str, runtime_str)
-}
-
-/// Count log entries whose source is in `sources` and whose stream is
-/// `stream`.
-fn count_with_stream(entries: &[LogEntry], sources: &HashSet<TaskId>, stream: Stream) -> usize {
-    entries
-        .iter()
-        .filter(|e| sources.contains(&e.source))
-        .filter(|e| e.stream == Some(stream))
-        .count()
-}
-
-/// Walk the snapshot subtree rooted at `top_id`, collecting only TaskNode
-/// ids (no process ids). Used to identify "Events" — entries authored by
-/// task code via `tracing` macros or `ctx.println`.
-fn task_only_sources(snapshot: &GraphSnapshot, top_id: TaskId) -> HashSet<TaskId> {
-    let mut out = HashSet::new();
-    let mut stack = vec![top_id];
-    while let Some(id) = stack.pop() {
-        let Some(node) = snapshot.tasks.get(&id) else {
-            continue;
-        };
-        out.insert(node.id);
-        for &child in &node.children {
-            stack.push(child);
-        }
-    }
-    out
 }
 
 /// Build the `, JSON 91%` style suffix for `Stdout:` / `Stderr:` lines.
@@ -311,7 +297,7 @@ mod tests {
         node.parent = Some(TaskId::ROOT);
         let snap = snapshot_with(node);
 
-        let report = render(&snap, id, &[], 50);
+        let report = render(&snap, id, &[], LogCounts::default(), 50);
 
         assert!(
             report.starts_with("Task t42 my-task - completed (exit 0)\n"),
@@ -338,7 +324,7 @@ mod tests {
             make_entry(id, 3, "third line", None),
         ];
 
-        let report = render(&snap, id, &entries, 50);
+        let report = render(&snap, id, &entries, LogCounts::default(), 50);
         assert!(report.contains("Last 50 lines:\n"), "no Last block:\n{report}");
         assert!(report.contains("first line"), "missing first:\n{report}");
         assert!(report.contains("second line"), "missing second:\n{report}");
@@ -360,7 +346,7 @@ mod tests {
         for (status, expected) in cases {
             let node = task_node(id, "t", Some(TaskId::ROOT), status.clone(), None);
             let snap = snapshot_with(node);
-            let report = render(&snap, id, &[], 50);
+            let report = render(&snap, id, &[], LogCounts::default(), 50);
             assert!(
                 report.contains(expected),
                 "expected {expected:?} in:\n{report}"
@@ -375,7 +361,7 @@ mod tests {
         };
         let node = task_node(id, "t", Some(TaskId::ROOT), TaskStatus::Failed(failure), None);
         let snap = snapshot_with(node);
-        let report = render(&snap, id, &[], 50);
+        let report = render(&snap, id, &[], LogCounts::default(), 50);
         assert!(
             report.contains("failed: boom"),
             "expected 'failed: boom' in:\n{report}"
@@ -389,7 +375,7 @@ mod tests {
         // Simulate a still-running task: ended_at must be None.
         node.ended_at = None;
         let snap = snapshot_with(node);
-        let report = render(&snap, id, &[], 50);
+        let report = render(&snap, id, &[], LogCounts::default(), 50);
         assert!(
             report.contains("(running)"),
             "expected (running) suffix in Run time line:\n{report}"
@@ -418,7 +404,8 @@ mod tests {
             .map(|i| make_json_entry(process_id, i + 1, Stream::Stdout))
             .collect();
 
-        let report = render(&snap, id, &entries, 50);
+        let counts = LogCounts { stdout: 100, stderr: 0, events: 0 };
+        let report = render(&snap, id, &entries, counts, 50);
         // Dominant kind clears 60%; the suffix uses integer-divided %.
         assert!(
             report.contains("Stdout: 100 lines, JSON 100%"),
@@ -450,7 +437,8 @@ mod tests {
             entries.push(make_entry(process_id, i + 1, "plain", Some(Stream::Stdout)));
         }
 
-        let report = render(&snap, id, &entries, 50);
+        let counts = LogCounts { stdout: 100, stderr: 0, events: 0 };
+        let report = render(&snap, id, &entries, counts, 50);
         // 50% JSON < 60% threshold → no suffix.
         assert!(
             report.contains("Stdout: 100 lines\n"),
@@ -488,7 +476,8 @@ mod tests {
             ));
         }
 
-        let report = render(&snap, id, &entries, 50);
+        let counts = LogCounts { stdout: 3, stderr: 0, events: 5 };
+        let report = render(&snap, id, &entries, counts, 50);
         assert!(
             report.contains("Events: 5 lines"),
             "expected Events: 5 lines:\n{report}"
@@ -498,7 +487,7 @@ mod tests {
     #[test]
     fn unknown_top_id_renders_unknown_line() {
         let snap = GraphSnapshot::default();
-        let report = render(&snap, TaskId(999), &[], 50);
+        let report = render(&snap, TaskId(999), &[], LogCounts::default(), 50);
         assert!(
             report.starts_with("Task t999 ? - unknown"),
             "expected unknown line; got:\n{report}"
@@ -511,7 +500,7 @@ mod tests {
         let node = task_node(id, "t", Some(TaskId::ROOT), TaskStatus::Done, None);
         let snap = snapshot_with(node);
         // tail_n way over MAX should still produce a capped header.
-        let report = render(&snap, id, &[], 1_000_000);
+        let report = render(&snap, id, &[], LogCounts::default(), 1_000_000);
         assert!(
             report.contains(&format!("Last {} lines:", MAX_TAIL_N)),
             "tail_n was not capped to MAX_TAIL_N:\n{report}"

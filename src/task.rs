@@ -889,7 +889,7 @@ impl TaskContext {
 /// Unlike `TaskDef` (which carries a function pointer and is `'static`),
 /// `TaskInfo` is an owned value suitable for serialization, display, or
 /// passing across API boundaries.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct TaskInfo {
     pub name: String,
     pub group: String,

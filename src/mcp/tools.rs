@@ -178,8 +178,9 @@ impl McpServer {
             .list_tasks()
             .await
             .map_err(map_rpc_error)?;
-        let value = serde_json::to_value(&resp)
-            .map_err(|e| internal(format!("serialize ListTasks: {e}")))?;
+        // MCP `structuredContent` requires a JSON object at the top level —
+        // not a bare array — so we wrap the Vec in `{ "tasks": [...] }`.
+        let value = serde_json::json!({ "tasks": resp });
         Ok(CallToolResult::structured(value))
     }
 
@@ -536,12 +537,28 @@ async fn render_task_report(
         ))),
     };
 
+    // Fetch the engine-wide totals separately so the count lines reflect
+    // the whole subtree, not just the tail we have on hand.
+    let counts_resp = sup
+        .request_addr(address, |a| Request::CountLogs {
+            task_id: TaskId(a.task),
+        })
+        .await
+        .map_err(map_rpc_error)?;
+    let counts = match counts_resp {
+        Response::CountLogs(c) => c,
+        other => return Err(internal(format!(
+            "unexpected response while counting logs: {other:?}"
+        ))),
+    };
+
     drop(sup);
 
     Ok(crate::mcp::report::render(
         &snapshot,
         TaskId(addr.task),
         &entries,
+        counts,
         tail_n,
     ))
 }

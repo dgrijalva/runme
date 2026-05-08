@@ -57,11 +57,14 @@ async fn list_tasks_returns_structured_payload() {
         .structured_content
         .clone()
         .expect("structured content present");
-    // ListTasks → engine returns a Vec<TaskInfo> (serializes as a JSON array).
-    assert!(value.is_array(), "expected array, got {value:?}");
-    let arr = value.as_array().unwrap();
+    // MCP `structuredContent` requires a top-level object; we wrap the
+    // task list under `tasks`.
+    assert!(value.is_object(), "expected object, got {value:?}");
+    let arr = value
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .expect("expected `tasks` array on the structuredContent object");
     assert!(!arr.is_empty(), "expected at least one task (`:list` builtin)");
-    // At least one entry should be the :list builtin.
     let names: Vec<&str> = arr
         .iter()
         .filter_map(|v| v.get("name")?.as_str())
