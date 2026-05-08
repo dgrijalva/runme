@@ -218,6 +218,9 @@ async fn check_can_spawn_blocks_during_rebuild_then_resolves() {
                 rnme::mcp::build::BuildState::LastBuildFailed { .. } => {
                     return Err("failed".into())
                 }
+                rnme::mcp::build::BuildState::NoTaskFile { .. } => {
+                    return Err("no_task_file".into())
+                }
                 rnme::mcp::build::BuildState::Rebuilding => notified.await,
             }
         }

@@ -72,9 +72,13 @@ pub async fn run() {
         }
     };
 
-    let cwd = std::env::current_dir().unwrap_or_else(|e| {
-        tracing::error!("supervisor: could not determine current dir: {e}");
-        std::process::exit(1);
+    // Reuse the cwd captured at construction so the watcher and the
+    // discover-in-rebuild logic agree on the root.
+    let cwd = supervisor.cwd().cloned().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|e| {
+            tracing::error!("supervisor: could not determine current dir: {e}");
+            std::process::exit(1);
+        })
     });
     if let Err(e) = supervisor.start_watcher(cwd) {
         tracing::warn!("supervisor: file watcher failed to start: {e}");
@@ -315,6 +319,12 @@ pub struct Supervisor {
     /// Owned by the supervisor between `start_watcher` and the first
     /// driver-loop iteration; tests can take it via [`Supervisor::take_rebuild_rx`].
     rebuild_rx: Option<mpsc::Receiver<()>>,
+    /// Working directory the supervisor was launched from. Used by the
+    /// rebuild driver to re-run discover when the file watcher fires —
+    /// in particular this is what lets the supervisor transition out of
+    /// `BuildState::NoTaskFile` once the user creates a `RUNME.rs`.
+    /// `None` for tests that bypass discover.
+    cwd: Option<PathBuf>,
 }
 
 /// Each generation gets a disjoint id range so engines never collide on
@@ -324,19 +334,71 @@ const ID_RANGE_PER_GEN: u64 = 1_000_000;
 impl Supervisor {
     /// Build a supervisor with the production process spawner and bring
     /// the initial generation up.
+    ///
+    /// Discovers RUNME.rs starting from the current working directory
+    /// before attempting to spawn an engine. If no RUNME.rs is found
+    /// anywhere up-tree from cwd, the supervisor enters
+    /// [`BuildState::NoTaskFile`] degraded mode rather than failing —
+    /// this is critical for the global-MCP-install case where the
+    /// supervisor may be launched in a directory that isn't an rnme
+    /// project. The watcher (if started) will pick up a freshly-created
+    /// RUNME.rs and transition to normal operation seamlessly.
     pub async fn new() -> Result<Self, SupervisorError> {
-        Self::new_with_spawner(Box::new(ProcessEngineSpawner)).await
+        let cwd = std::env::current_dir().map_err(SupervisorError::Connect)?;
+        Self::new_with_spawner_and_cwd(Box::new(ProcessEngineSpawner), cwd).await
     }
 
     /// Build a supervisor with a custom spawner. Used by tests to inject
     /// in-process engines.
+    ///
+    /// Skips the discover-first step — always tries to spawn an initial
+    /// generation immediately. Use this when the spawner is synthetic
+    /// (e.g. [`InProcessSpawner`]) and there's no real RUNME.rs to
+    /// discover. Production code should use [`Supervisor::new`] (or
+    /// [`Supervisor::new_with_spawner_and_cwd`]) so the NoTaskFile
+    /// degraded path is honored.
     ///
     /// Does NOT start the file watcher — call [`Supervisor::start_watcher`]
     /// separately. Tests that don't want a watcher skip that step.
     pub async fn new_with_spawner(
         spawner: Box<dyn EngineSpawner>,
     ) -> Result<Self, SupervisorError> {
-        let mut s = Supervisor {
+        let mut s = Self::empty(spawner, None);
+        s.spawn_initial_generation().await?;
+        Ok(s)
+    }
+
+    /// Build a supervisor with a custom spawner and a known cwd, doing
+    /// discover-first startup.
+    ///
+    /// If `cwd` (or any ancestor) contains a `RUNME.rs`, this spawns the
+    /// initial generation as usual. Otherwise the supervisor starts in
+    /// [`BuildState::NoTaskFile`] — no engine spawn is attempted; tool
+    /// calls will return a friendly error and the file watcher (when
+    /// started) will trigger a rebuild as soon as a `RUNME.rs` appears.
+    pub async fn new_with_spawner_and_cwd(
+        spawner: Box<dyn EngineSpawner>,
+        cwd: PathBuf,
+    ) -> Result<Self, SupervisorError> {
+        let mut s = Self::empty(spawner, Some(cwd.clone()));
+        let discovery = crate::discover::discover(&cwd);
+        if discovery.nearest.is_none() {
+            tracing::info!(
+                "rnme: no RUNME.rs found searching up from {}; running in degraded mode",
+                cwd.display()
+            );
+            *s.build_state.lock().await = BuildState::NoTaskFile {
+                searched_from: cwd,
+            };
+        } else {
+            s.spawn_initial_generation().await?;
+        }
+        Ok(s)
+    }
+
+    /// Construct an empty (no-gens) Supervisor.
+    fn empty(spawner: Box<dyn EngineSpawner>, cwd: Option<PathBuf>) -> Self {
+        Supervisor {
             gens: HashMap::new(),
             latest_gen: None,
             engine_map: EngineMap::new(),
@@ -348,9 +410,8 @@ impl Supervisor {
             build_state_changed: Arc::new(Notify::new()),
             watch_set: None,
             rebuild_rx: None,
-        };
-        s.spawn_initial_generation().await?;
-        Ok(s)
+            cwd,
+        }
     }
 
     /// Bring up the file watcher rooted at `cwd`. Discovers RUNME.rs
@@ -368,6 +429,13 @@ impl Supervisor {
         self.watch_set = Some(watch_set);
         self.rebuild_rx = Some(rebuild_rx);
         Ok(())
+    }
+
+    /// Working directory captured at construction time, if any. Production
+    /// supervisors always have one; in-process test supervisors built via
+    /// [`Supervisor::new_with_spawner`] don't.
+    pub fn cwd(&self) -> Option<&PathBuf> {
+        self.cwd.as_ref()
     }
 
     /// Take the rebuild receiver out of the supervisor. Used by callers
@@ -456,6 +524,24 @@ impl Supervisor {
     /// On success, the [`WatchSet`] (if any) is refreshed so newly
     /// added / removed RUNME.rs files take effect immediately.
     pub async fn handle_rebuild_signal(&mut self) -> Result<(), SupervisorError> {
+        // If we have a known cwd, re-run discover. Persistent NoTaskFile
+        // when nothing is found; flip to Rebuilding otherwise. (No cwd
+        // means we're in a test path that bypasses discover entirely —
+        // skip straight to Rebuilding.)
+        if let Some(cwd) = self.cwd.clone() {
+            let discovery = crate::discover::discover(&cwd);
+            if discovery.nearest.is_none() {
+                {
+                    let mut s = self.build_state.lock().await;
+                    *s = BuildState::NoTaskFile {
+                        searched_from: cwd,
+                    };
+                }
+                self.build_state_changed.notify_waiters();
+                return Ok(());
+            }
+        }
+
         // Transition → Rebuilding and notify any waiters.
         {
             let mut s = self.build_state.lock().await;
@@ -534,6 +620,12 @@ impl Supervisor {
                     let head = head_of_failure(&last_failure_output, FAILURE_HEAD_LINES);
                     return Err(RpcError::BadRequest(format!(
                         "build failed; call get_build_status for full output\n{head}"
+                    )));
+                }
+                BuildState::NoTaskFile { searched_from } => {
+                    return Err(RpcError::BadRequest(format!(
+                        "no RUNME.rs found searching up from {}; create one with `rnme --init` to use task tools",
+                        searched_from.display()
                     )));
                 }
                 BuildState::Rebuilding => {
@@ -715,6 +807,9 @@ impl Supervisor {
 
     /// List tasks registered on the latest gen. Uses `Request::ListTasks`.
     pub async fn list_tasks(&self) -> Result<Vec<TaskInfo>, RpcError> {
+        // Surface the same friendly error spawn-shaped tools see when in
+        // NoTaskFile / LastBuildFailed mode rather than a bare Internal.
+        self.check_can_spawn().await?;
         let gen_id = self.latest_gen.ok_or_else(|| {
             RpcError::Internal("no live generation to list against".to_string())
         })?;

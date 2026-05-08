@@ -400,6 +400,7 @@ impl McpServer {
         let value = serde_json::json!({
             "state": info.state,
             "last_failure_output": info.last_failure_output,
+            "searched_from": info.searched_from,
         });
         Ok(CallToolResult::structured(value))
     }

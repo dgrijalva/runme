@@ -62,11 +62,17 @@ use crate::discover::{RUNME_FILENAME, discover};
 ///   a new generation failed (engine exited before printing its port).
 ///   Existing generations are unaffected; new spawns are refused with the
 ///   captured stderr until the next successful rebuild.
+/// - [`BuildState::NoTaskFile`] — no RUNME.rs was found at startup (or
+///   after the last rebuild attempt) in the cwd or any ancestor. The
+///   supervisor is in a degraded mode: tool calls return a friendly
+///   "no RUNME.rs" message; the file watcher monitors `cwd` for new
+///   `RUNME.rs` files and rebuilds the moment one shows up.
 #[derive(Debug, Clone)]
 pub enum BuildState {
     Idle,
     Rebuilding,
     LastBuildFailed { last_failure_output: String },
+    NoTaskFile { searched_from: PathBuf },
 }
 
 impl BuildState {
@@ -76,6 +82,7 @@ impl BuildState {
             BuildState::Idle => "idle",
             BuildState::Rebuilding => "rebuilding",
             BuildState::LastBuildFailed { .. } => "last_build_failed",
+            BuildState::NoTaskFile { .. } => "no_task_file",
         }
     }
 }
@@ -85,6 +92,9 @@ impl BuildState {
 pub struct BuildStatusInfo {
     pub state: &'static str,
     pub last_failure_output: Option<String>,
+    /// For `BuildState::NoTaskFile`, the directory we searched up from.
+    /// `None` for every other state.
+    pub searched_from: Option<String>,
 }
 
 impl From<&BuildState> for BuildStatusInfo {
@@ -95,10 +105,17 @@ impl From<&BuildState> for BuildStatusInfo {
             } => BuildStatusInfo {
                 state: s.tag(),
                 last_failure_output: Some(last_failure_output.clone()),
+                searched_from: None,
+            },
+            BuildState::NoTaskFile { searched_from } => BuildStatusInfo {
+                state: s.tag(),
+                last_failure_output: None,
+                searched_from: Some(searched_from.display().to_string()),
             },
             _ => BuildStatusInfo {
                 state: s.tag(),
                 last_failure_output: None,
+                searched_from: None,
             },
         }
     }
@@ -287,10 +304,15 @@ impl WatchSet {
         for c in &result.children {
             runme_paths.insert(c.clone());
         }
-        let watched_dirs: HashSet<PathBuf> = runme_paths
+        let mut watched_dirs: HashSet<PathBuf> = runme_paths
             .iter()
             .filter_map(|p| p.parent().map(Path::to_path_buf))
             .collect();
+
+        // Always watch cwd as well so we notice a freshly-created
+        // RUNME.rs even when none was discovered (degraded NoTaskFile
+        // mode). Cheap when cwd is already in the set.
+        watched_dirs.insert(self.cwd.clone());
 
         // Build a gitignore matcher rooted at the nearest RUNME.rs's
         // directory. Falling back to cwd if there's no RUNME.rs yet
