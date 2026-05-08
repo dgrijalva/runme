@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 use tracing::Subscriber;
@@ -16,7 +15,7 @@ use tracing_subscriber::layer::Context;
 
 use crate::execution::TaskId;
 use crate::log::buffer::OutputBuffer;
-use crate::log::{LogEntry, ParsedContent};
+use crate::log::{LogEntry, ParsedContent, SeqGen};
 
 tokio::task_local! {
     /// Per-task context populated by the engine before invoking a task's
@@ -38,14 +37,28 @@ pub struct TaskTracingCtx {
 /// into the per-task `OutputBuffer` selected by `TASK_TRACING_CTX`. When
 /// no task-local context is set (events emitted outside any task body),
 /// the event is silently dropped.
+///
+/// The layer pulls its `SeqGen` from the per-task `TASK_TRACING_CTX` so
+/// seqs share the engine-global counter regardless of which engine
+/// generation owns the task. The layer itself holds a fallback `SeqGen`
+/// used only when a context exposes no generator (degenerate test path).
 pub struct LogEntryLayer {
-    seq: AtomicU64,
+    fallback_seq_gen: SeqGen,
 }
 
 impl LogEntryLayer {
+    /// Create a layer with a fresh fallback `SeqGen`. Used by the globally-
+    /// installed subscriber: at event time, the layer pulls the actual
+    /// engine-global `SeqGen` from the per-task `TASK_TRACING_CTX`'s buffer.
     pub fn new() -> Self {
+        Self::with_seq_gen(SeqGen::new())
+    }
+
+    /// Create a layer with an explicit fallback `SeqGen` (for tests that
+    /// want a known seq stream).
+    pub fn with_seq_gen(seq_gen: SeqGen) -> Self {
         Self {
-            seq: AtomicU64::new(0),
+            fallback_seq_gen: seq_gen,
         }
     }
 }
@@ -179,7 +192,17 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
             )
         };
 
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        // Pull the engine-global SeqGen out of the per-task buffer so all
+        // entries — including process output and println output — share one
+        // monotonic counter. If the buffer is contended, fall back to the
+        // layer's own SeqGen (which keeps stamping going at the cost of
+        // local-only ordering for that one entry — vastly preferable to
+        // pushing a seq=0 entry that would trip LogStore's debug_assert).
+        let buffer = task_ctx.buffer.clone();
+        let seq = match buffer.try_lock() {
+            Ok(buf) => buf.seq_gen().next(),
+            Err(_) => self.fallback_seq_gen.next(),
+        };
 
         let entry = LogEntry::new(
             raw,
@@ -192,7 +215,6 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
             collector.fields,
         );
 
-        let buffer = task_ctx.buffer.clone();
         if let Ok(mut buf) = buffer.try_lock() {
             buf.push(entry);
         } else {
@@ -237,7 +259,8 @@ mod tests {
         assert_eq!(entry.level.as_deref(), Some("info"));
         assert_eq!(entry.message.as_deref(), Some("hello"));
         assert!(matches!(entry.parsed, ParsedContent::PlainText));
-        assert_eq!(entry.seq, 0);
+        // Seq is engine-global and monotonic; only assert it was stamped.
+        assert!(entry.seq > 0);
         assert_eq!(
             entry.fields.get("key"),
             Some(&serde_json::Value::String("val".to_string()))
@@ -246,8 +269,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_tracing_layer_multiple_levels() {
-        let buffer = Arc::new(Mutex::new(OutputBuffer::new(100)));
-        let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
+        // Share the SeqGen between the OutputBuffer and the layer so seqs are
+        // strictly monotonic across emitted entries.
+        let seq_gen = SeqGen::new();
+        let buffer = Arc::new(Mutex::new(OutputBuffer::with_seq_gen(100, seq_gen.clone())));
+        let subscriber =
+            tracing_subscriber::registry().with(LogEntryLayer::with_seq_gen(seq_gen));
         let _guard = tracing::subscriber::set_default(subscriber);
 
         TASK_TRACING_CTX
@@ -267,10 +294,11 @@ mod tests {
         assert_eq!(entries[1].level.as_deref(), Some("warn"));
         assert_eq!(entries[2].level.as_deref(), Some("debug"));
         assert_eq!(entries[3].level.as_deref(), Some("trace"));
-        assert_eq!(entries[0].seq, 0);
-        assert_eq!(entries[1].seq, 1);
-        assert_eq!(entries[2].seq, 2);
-        assert_eq!(entries[3].seq, 3);
+        // Strict monotonicity (engine-global seq).
+        assert!(entries[0].seq > 0);
+        assert!(entries[1].seq > entries[0].seq);
+        assert!(entries[2].seq > entries[1].seq);
+        assert!(entries[3].seq > entries[2].seq);
     }
 
     #[tokio::test]

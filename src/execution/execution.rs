@@ -10,7 +10,7 @@
 //! provided so the eventual `Engine` (slice 4) can own a single store
 //! shared across the whole graph.
 
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use nix::sys::signal;
 use nix::unistd::Pid;
@@ -38,7 +38,7 @@ use super::task_id::TaskId;
 /// writes them after the cancel ladder (slice 4) finishes. They land in
 /// slice 2 alongside the rest of the status reshape so consumers (TUI
 /// rendering, status transitions) only need to be updated once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskStatus {
     /// Task function is still executing (spawning processes, doing setup).
     Setup,
@@ -60,7 +60,7 @@ pub enum TaskStatus {
 ///
 /// Preserves the structured error output and exit code from `TaskError`
 /// so that Agent mode can report them faithfully.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskFailure {
     /// Human-readable error message (from `TaskError::to_string()`).
     pub message: String,
@@ -72,7 +72,7 @@ pub struct TaskFailure {
 }
 
 /// Status of an individual spawned process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProcessStatus {
     /// Process is currently running.
     Running,
@@ -258,6 +258,28 @@ pub struct TaskExecution {
     /// `None` for the synthetic root.
     pub task_def: Option<&'static TaskDef>,
     pub task_args: Vec<String>,
+
+    // ── Reporting (timestamps + summary) ──────────────────────────
+    /// Timestamp at which the task body began running. Set exactly once
+    /// in `spawn_body` immediately before the body's tokio task is
+    /// launched. `OnceLock::get()` returns `None` until set.
+    pub started_at: Arc<OnceLock<chrono::DateTime<chrono::Local>>>,
+    /// Timestamp at which the task reached a terminal status (Done /
+    /// Failed / Cancelled / Timeout). Set exactly once at each terminal
+    /// status writer.
+    pub ended_at: Arc<OnceLock<chrono::DateTime<chrono::Local>>>,
+    /// Optional human-readable summary written by the task body via
+    /// `TaskContext::summary`. Last write wins. Shared with the running
+    /// `TaskContext` (mirrors the `task_status` sharing pattern).
+    pub summary: Arc<Mutex<Option<String>>>,
+    /// If set by the cancel/timeout ladder before the body's tokio task
+    /// observed cancellation, the body completion handler will use this
+    /// status (Cancelled / Timeout) instead of the body's natural exit
+    /// (Done / Failed). This makes user-requested kill/timeout
+    /// "winning" over a cooperative `Ok(())` return — without this, a
+    /// task that uses `ctx.cancellation_signal()` and returns Ok races
+    /// the engine and reports `completed (exit 0)` despite the kill.
+    pub terminal_override: Arc<OnceLock<TaskStatus>>,
 }
 
 impl TaskExecution {
@@ -269,6 +291,7 @@ impl TaskExecution {
     pub fn with_log_store_and_engine(
         id: TaskId,
         log_store: Arc<Mutex<LogStore>>,
+        seq_gen: crate::log::SeqGen,
         engine: Weak<EngineInternals>,
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
@@ -301,10 +324,14 @@ impl TaskExecution {
             spawn_tx,
             task_ctx: Mutex::new(None),
             log_store,
-            tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
+            tracing_buffer: Arc::new(Mutex::new(OutputBuffer::with_seq_gen(10_000, seq_gen))),
             registry: None,
             task_def: None,
             task_args: Vec::new(),
+            started_at: Arc::new(OnceLock::new()),
+            ended_at: Arc::new(OnceLock::new()),
+            summary: Arc::new(Mutex::new(None)),
+            terminal_override: Arc::new(OnceLock::new()),
         }
     }
 
@@ -332,9 +359,35 @@ impl TaskExecution {
         let log_store = self.log_store.clone();
         let spawn_tx = self.spawn_tx.clone();
 
+        // The tracing buffer was constructed with the engine-global SeqGen
+        // when this TaskExecution was created. Pull a clone so we can hand
+        // the same generator to the TaskContext's exec/spawn output buffer
+        // below — otherwise subprocess output gets per-buffer-local seqs,
+        // breaking engine-global ordering and `since_seq` subscription.
+        let engine_seq_gen = {
+            let buf = tracing_buffer
+                .try_lock()
+                .expect("tracing buffer not locked at spawn_body");
+            buf.seq_gen()
+        };
+
         let mut ctx = TaskContext::new(task.name);
+        // Swap in the engine-global SeqGen so `ctx.exec()` / `ctx.spawn()`
+        // subprocess output stamps with engine-global seqs (matches the
+        // tracing buffer + LogStore invariant). Two places need it:
+        //   1. The TaskContext's `output` buffer (used by `exec`'s pipeline
+        //      and the rare direct-output paths).
+        //   2. Each subprocess buffer constructed lazily inside
+        //      `ctx.spawn(...)` — done by stashing the SeqGen as a field
+        //      so every spawn call clones it.
+        ctx.output_buffer()
+            .try_lock()
+            .expect("ctx output buffer uncontended at launch")
+            .set_seq_gen(engine_seq_gen.clone());
+        ctx.set_seq_gen(engine_seq_gen);
         ctx.set_spawn_notifier(spawn_tx);
         ctx.set_task_status(self.task_status.clone());
+        ctx.set_summary(self.summary.clone());
         if let Some(ref registry) = self.registry {
             ctx.set_registry(registry.clone());
         }
@@ -367,6 +420,12 @@ impl TaskExecution {
         let task_name_owned = task.name.to_string();
         let task_id = self.id;
         let tracing_buf_for_body = tracing_buffer.clone();
+        let ended_at_for_body = self.ended_at.clone();
+        let terminal_override_for_body = self.terminal_override.clone();
+
+        // Mark the start of the task body. `set` is called exactly once
+        // per `TaskExecution` because `spawn_body` itself runs once.
+        let _ = self.started_at.set(chrono::Local::now());
 
         let handle: JoinHandle<TaskResult> = tokio::spawn(async move {
             let tracing_ctx = TaskTracingCtx {
@@ -382,20 +441,29 @@ impl TaskExecution {
 
             {
                 let mut s = task_status.lock().await;
-                match &result {
-                    Ok(()) => {
-                        *s = TaskStatus::Done;
-                    }
-                    Err(task_err) => {
-                        let failure = TaskFailure {
-                            message: task_err.to_string(),
-                            exit_code: task_err.exit_code(),
-                            output_json: task_err.output().to_string(),
-                        };
-                        tracing::error!("task failed: {}", failure.message);
-                        *s = TaskStatus::Failed(failure);
+                // If the cancel or timeout ladder requested a terminal
+                // override before/while the body was running, honor it
+                // — the user asked for a kill, even if the body
+                // cooperated and returned `Ok(())`.
+                if let Some(forced) = terminal_override_for_body.get() {
+                    *s = forced.clone();
+                } else {
+                    match &result {
+                        Ok(()) => {
+                            *s = TaskStatus::Done;
+                        }
+                        Err(task_err) => {
+                            let failure = TaskFailure {
+                                message: task_err.to_string(),
+                                exit_code: task_err.exit_code(),
+                                output_json: task_err.output().to_string(),
+                            };
+                            tracing::error!("task failed: {}", failure.message);
+                            *s = TaskStatus::Failed(failure);
+                        }
                     }
                 }
+                let _ = ended_at_for_body.set(chrono::Local::now());
             }
 
             if let Some(eng) = body_engine.upgrade() {

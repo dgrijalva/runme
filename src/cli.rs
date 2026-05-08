@@ -43,12 +43,22 @@ pub use crate::output::OutputFormat;
 #[command(name = "runme")]
 pub struct RnmeArgs {
     /// Force interactive TUI mode.
-    #[arg(long, conflicts_with_all = ["cli"])]
+    #[arg(long, conflicts_with_all = ["cli", "engine"])]
     pub tui: bool,
 
     /// Force direct CLI execution with stdio output.
-    #[arg(long, conflicts_with_all = ["tui"])]
+    #[arg(long, conflicts_with_all = ["tui", "engine"])]
     pub cli: bool,
+
+    /// Run as headless engine daemon (TCP JSONL on 127.0.0.1:0).
+    /// Prints `{"port": <u16>}` on stdout and accepts a single
+    /// supervisor connection.
+    #[arg(long, conflicts_with_all = ["tui", "cli"])]
+    pub engine: bool,
+
+    /// Starting TaskId counter for `--engine` (defaults to 1).
+    #[arg(long, requires = "engine")]
+    pub start_task_id: Option<u64>,
 
     /// Output format (for cli mode)
     #[arg(long)]
@@ -87,6 +97,14 @@ impl RnmeArgs {
 /// UI mode (TUI, CLI, or Agent).
 pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) {
     let args = RnmeArgs::parse();
+
+    // `--engine` short-circuits everything else: spawn the headless
+    // engine daemon and never return.
+    if args.engine {
+        let _ = group_names; // engine mode doesn't render group display names
+        crate::mcp::engine_server::run(registry, args.start_task_id.unwrap_or(1)).await;
+    }
+
     let has_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let explicit_ui = args.explicit_ui_mode();
 

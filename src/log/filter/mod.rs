@@ -35,16 +35,9 @@ mod tests {
     /// Helper to create a simple LogEntry for testing.
     fn make_entry(raw: &str) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
-            raw: raw.to_string(),
-            parsed: ParsedContent::PlainText,
+            raw: raw.into(),
             source: tid("test"),
-            seq: 0,
-            timestamp: None,
-            level: None,
-            message: None,
-            fields: HashMap::new(),
-            stream: None,
+            ..Default::default()
         }
     }
 

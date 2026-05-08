@@ -18,6 +18,49 @@
 - _Assessment:_ Fits naturally next to existing per-session state (`TaskStatus`, `processes`). The task is the right place to author this since only the task knows what's interesting in its own output. Summary is just a `String` (or maybe `Option<String>` + timestamp); no need for streaming/structure in v1
 - _Open questions:_ Single summary or append-only stream? Overwrite semantics on re-run? Should summaries persist with completed tasks (probably yes, since logs do)? Does the TUI surface them anywhere, or are they purely for programmatic consumers?
 
+## Filter occasionally collapses to a single result
+
+**14:17** — Applying a filter expression in the TUI sometimes shows only one matching line even when multiple entries clearly match. Repro conditions unknown.
+
+- _Effort:_ Needs dedicated exploration — repro is the hard part
+- _Assessment:_ Filter pipeline is `App::visible_line_indices()` / `visible_log_lines()` (src/tui/app.rs:301, src/tui/app.rs:323), which composes focus filter + manual hides + `log_filter::matches(expr, entry)`. Worth checking: (a) is `effective_visible_sources()` returning a stale/over-narrow set when sources arrive after the filter is applied? (b) does the viewport's visible-index list get out of sync with `log_lines` after a re-filter, so it renders one line rather than scrolling? (c) is search vs filter being conflated — `n`/`N` jumps to next match and could leave the viewport on a single-line slice
+- _Concern:_ Hard to fix without a repro. Next time it happens, capture: filter expr, source set in sidebar, whether focus filter is active, whether search was used recently
+
+## Soft vs hard restart
+
+**14:17** — Two restart modes. `r` = soft restart: a cooperative signal the task can opt into. `R` = hard restart: current behavior (kill + respawn). Mechanism: `TaskContext` exposes a restart channel/signal that the task can `take()`. If taken, soft restart sends through that channel and the task decides what to do (e.g., reload config, re-exec a child, drain). If not taken, soft and hard behave identically. CLI mode could map `SIGHUP` to soft restart on the same principle.
+
+- _Effort:_ Moderate — new `TaskContext` API surface, restart routing in the runner, TUI key wiring, and signal handling in CLI mode
+- _Assessment:_ Fits the existing `TaskContext` shape (it already owns process lifecycle plumbing). Restart channel is probably a `oneshot`-per-restart or a `tokio::sync::Notify` the task can `take()` once. "Take" semantics matter: only one consumer, and the runner needs to know whether it was taken so it can decide soft-vs-hard fallback. CLI mode parallel is clean since `SIGHUP` is the conventional cooperative-reload signal anyway
+- _Open questions:_ What does "the task" mean for soft restart — the top-level task fn, or any spawned child it owns? Is the signal one-shot per restart, or a stream the task subscribes to for the lifetime of the run? Does soft restart wait for the task to finish handling, or fire-and-forget? What happens if the task takes the signal but never responds — timeout into hard restart?
+
+## Bare `spawn!` macro with auto-traced context
+
+**14:17** — Add a `spawn!` macro to the prelude that wraps `tokio::spawn` (or equivalent) and automatically threads tracing context through, so logs emitted from the spawned future are correctly attributed to the originating task/source.
+
+- _Effort:_ Small-to-moderate — proc macro or `macro_rules!` in `rnme-macros` or the prelude, plus integration with the existing `tracing_layer.rs`
+- _Assessment:_ Existing `src/tracing_layer.rs` already does source attribution for the log engine. The macro just needs to capture the current `tracing::Span` (or whatever context the layer keys on) and `.instrument()` the spawned future — standard tracing-tokio pattern. Likely a thin `macro_rules!` is enough; no proc macro needed unless we want to also rewrite the body. Prelude export keeps it ergonomic from RUNME.rs files
+- _Open questions:_ Does this wrap `tokio::spawn` only, or also `ctx.spawn()` (process spawn)? They're different beasts — process spawn already has source attribution via the runner; the gap is in-process `tokio::spawn` for ad-hoc async work inside a task. Probably this macro is specifically for the latter
+
+## Speed up runner build time
+
+**15:16** — Build time of the generated runner crate is the dominant contributor to launch time. Already building in debug. Application perf doesn't matter — `rnme` is a supervisor. Look at what Bevy recommends for fast iteration builds and pull what applies.
+
+- _Effort:_ Small per-knob, but the search space is wide — likely a series of experiments rather than one fix. Some options need a Linux-only path (mold/lld) so cross-platform care matters
+- _Assessment:_ Generated workspace in `src/bin/rnme/` currently does a vanilla `cargo build` with no custom `[profile.dev]` overrides (no `opt-level`, `codegen-units`, `debug`, `lto`, `incremental` set in the generated `Cargo.toml`). Lots of headroom. Concrete levers worth trying, roughly in order of expected ROI:
+    - **`debug = 0`** (or `"line-tables-only"`) in the generated dev profile — debuginfo is a huge fraction of debug-build wall time and we don't run a debugger on the runner
+    - **`codegen-units = 256`** for the runner crate — already the default in dev (256), but verify; pin it explicitly so a user-level config can't override
+    - **Cranelift backend** (`-Zcodegen-backend=cranelift` on nightly, or stable via `cargo-codegen-backend`) — Bevy's biggest single-knob win for dev builds, often 30-50% faster codegen
+    - **`rnme` as `dylib`** — Bevy's `dynamic_linking` trick. The runner depends on `rnme` (the library); link it dynamically so each rebuild only relinks the runner, not the whole `rnme` crate graph
+    - **`share-generics = true`** (`-Zshare-generics=y`) — less monomorphization duplication across the workspace's lib crates
+    - **Faster linker** — `lld` on macOS (already default-ish on recent Xcode), `mold` on Linux. `rustflags = ["-C", "link-arg=-fuse-ld=lld"]` in the generated `.cargo/config.toml`
+    - **`incremental = true`** — already default in dev, but double-check we're not accidentally disabling it via env (e.g. `CARGO_INCREMENTAL=0` from somewhere)
+    - **Strip the runner crate down** — anything we can move from per-RUNME-lib-crate compile work into `rnme` core (compiled once, cached forever) is pure win
+    - **Persistent target cache** — already cache-dir-keyed; verify nothing invalidates it on every run (e.g. timestamp-bumping a generated source file with identical content)
+    - **Pre-warmed `rnme` crate** — ship a precompiled `rnme` rlib that the runner workspace just links against, so first-time-after-version-bump pain is bounded
+- _Concern:_ Some knobs are nightly-only (`-Z share-generics`, cranelift via `-Z`). Acceptable for `rnme` since we already require nightly for edition 2024. Linker choice needs OS-specific config in the generated `.cargo/config.toml`
+- _Inspiration:_ Bevy's "fast compiles" config (https://bevy.org/learn/quick-start/getting-started/setup/), the Rust compile-time perf book
+
 ## Carriage return (`\r`) progress output corrupts log display
 
 Commands that use `\r` to update a progress line in-place (e.g., `aws s3 cp`, `curl` progress bars) produce garbled output in the TUI log viewer. The record parser splits on `\n` but `\r`-delimited progress chunks don't end with `\n`, resulting in partial line overwrites rendering as separate log entries that stomp on each other.

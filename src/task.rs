@@ -173,6 +173,9 @@ pub struct TaskContext {
     /// Shared task status, injected by `TaskExecution::spawn_body()`.
     /// Used by `bind_ready()` and `mark_ready()` to set `TaskStatus::Ready`.
     task_status: Option<Arc<Mutex<crate::execution::TaskStatus>>>,
+    /// Shared summary slot, injected by `TaskExecution::spawn_body()`.
+    /// Written by `TaskContext::summary` (last write wins).
+    summary: Option<Arc<Mutex<Option<String>>>>,
     /// Identity of the running task (slice 3). `None` outside the engine
     /// (e.g. tests using `TaskContext::new` directly).
     task_id: Option<TaskId>,
@@ -188,6 +191,12 @@ pub struct TaskContext {
     /// Engine-owned `LogStore` (slice 3 inherits the parent's). Slice 4
     /// will hoist this into `Weak<EngineInternals>::log_store`.
     log_store: Option<Arc<Mutex<LogStore>>>,
+    /// Engine-global SeqGen. Set by `TaskExecution::spawn_body`. Used by
+    /// `ctx.spawn()` to construct each subprocess's `OutputBuffer` so
+    /// every entry stamps with engine-global seqs. `None` outside the
+    /// runtime (tests using `TaskContext::new` directly), in which case
+    /// `ctx.spawn()` falls back to a fresh per-spawn generator.
+    seq_gen: Option<crate::log::SeqGen>,
     /// Weak ref to the engine internals. Set by `EngineInternals::spawn_child`
     /// at task launch. Used by `ctx.run` (via `TaskBuilder`) to funnel
     /// child spawns through `engine.spawn_child`, by `TaskHandle::Drop`
@@ -256,11 +265,13 @@ impl TaskContext {
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             registry: None,
             task_status: None,
+            summary: None,
             task_id: None,
             cancellation: None,
             task_exec: None,
             log_store: None,
             engine: None,
+            seq_gen: None,
         }
     }
 
@@ -276,12 +287,21 @@ impl TaskContext {
             watch_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             registry: None,
             task_status: None,
+            summary: None,
             task_id: None,
             cancellation: None,
             task_exec: None,
             log_store: None,
             engine: None,
+            seq_gen: None,
         }
+    }
+
+    /// Inject the engine-global `SeqGen` so subprocess output buffers
+    /// constructed inside [`TaskContext::spawn`] stamp with engine-global
+    /// seqs. Called from `TaskExecution::spawn_body`.
+    pub fn set_seq_gen(&mut self, seq_gen: crate::log::SeqGen) {
+        self.seq_gen = Some(seq_gen);
     }
 
     /// Set a channel sender that will be notified whenever `spawn()` is called.
@@ -329,10 +349,14 @@ impl TaskContext {
         // source bucket. Falls back to ROOT for tests built via
         // `TaskContext::new` directly.
         let source = self.task_id.unwrap_or(TaskId::ROOT);
-        let entry = LogEntry::raw(&text, source);
+        let mut entry = LogEntry::raw(&text, source);
         // Push to the tracing buffer if available (TUI mode), otherwise exec buffer
         let buffer = self.tracing_output.as_ref().unwrap_or(&self.output);
-        buffer.lock().await.push(entry);
+        let mut guard = buffer.lock().await;
+        // Stamp the entry's seq from the buffer's engine-global generator
+        // before pushing. `LogEntry::raw` sets `seq: 0` as a sentinel.
+        entry.seq = guard.seq_gen().next();
+        guard.push(entry);
     }
 
     /// Hint the preferred CLI output format for this run.
@@ -415,7 +439,15 @@ impl TaskContext {
     pub fn spawn(&self, command: impl Into<Cmd>) -> process::SpawnBuilder {
         let cmd: Cmd = command.into();
         let command_label = cmd.display_label();
-        let buffer = Arc::new(Mutex::new(OutputBuffer::new(10_000)));
+        // Use the engine-global SeqGen if injected (production path), so
+        // subprocess output stamps with engine-wide seqs. Tests using
+        // `TaskContext::new` directly fall back to a fresh per-spawn
+        // generator — they don't share a LogStore so collisions don't
+        // matter there.
+        let buffer = match &self.seq_gen {
+            Some(sg) => Arc::new(Mutex::new(OutputBuffer::with_seq_gen(10_000, sg.clone()))),
+            None => Arc::new(Mutex::new(OutputBuffer::new(10_000))),
+        };
 
         // Capture what the on_spawn callback needs
         let spawned_pgids = self.spawned_pgids.clone();
@@ -635,6 +667,13 @@ impl TaskContext {
         self.task_status = Some(status);
     }
 
+    /// Inject the shared summary slot (called by `TaskExecution::spawn_body`).
+    /// Used by `TaskContext::summary` to publish a summary value back to
+    /// the engine.
+    pub fn set_summary(&mut self, summary: Arc<Mutex<Option<String>>>) {
+        self.summary = Some(summary);
+    }
+
     /// Inject task identity + cancellation token + self-weak ref
     /// (called by `TaskExecution::spawn_body`). After this call the body
     /// can use `ctx.cancelled()`, `ctx.cancellation()`, and the
@@ -744,6 +783,34 @@ impl TaskContext {
         }
     }
 
+    /// Set a human-readable summary for this task's execution.
+    ///
+    /// Last write wins. The summary is published to the engine snapshot
+    /// so that frontends (TUI report renderer, MCP frontend) can show a
+    /// concise post-completion message — e.g. "200 OK in 1.2s",
+    /// "12 tests passed".
+    ///
+    /// Sync method (no `.await`); the snapshot publish is dispatched on
+    /// a detached tokio task. Mirrors the pattern used by `mark_ready`.
+    pub fn summary(&self, s: impl Into<String>) {
+        let value = s.into();
+        let Some(slot) = self.summary.clone() else {
+            return;
+        };
+        let engine_weak = self.engine.clone();
+        tokio::spawn(async move {
+            {
+                let mut guard = slot.lock().await;
+                *guard = Some(value);
+            }
+            if let Some(weak) = engine_weak
+                && let Some(eng) = weak.upgrade()
+            {
+                eng.publish_snapshot().await;
+            }
+        });
+    }
+
     /// Manually mark this task as ready.
     ///
     /// Sets the task status to `TaskStatus::Ready` if the task is still
@@ -845,12 +912,19 @@ impl TaskContext {
 /// Unlike `TaskDef` (which carries a function pointer and is `'static`),
 /// `TaskInfo` is an owned value suitable for serialization, display, or
 /// passing across API boundaries.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct TaskInfo {
-    pub name: &'static str,
-    pub group: &'static str,
-    pub description: Option<&'static str>,
+    pub name: String,
+    pub group: String,
+    pub description: Option<String>,
     /// Fully qualified name: "group:name" for grouped tasks, just "name" for root.
     pub qualified_name: String,
+    /// Rendered help text for task arguments, if the task accepts any.
+    ///
+    /// Produced by calling `(task_def.arg_metadata)()` and rendering the
+    /// resulting `clap::Command`'s long help. `None` when the task takes no
+    /// arguments.
+    pub args_help: Option<String>,
 }
 
 impl TaskInfo {
@@ -861,11 +935,13 @@ impl TaskInfo {
         } else {
             format!("{}:{}", def.group, def.name)
         };
+        let args_help = (def.arg_metadata)().map(|mut cmd| cmd.render_long_help().to_string());
         Self {
-            name: def.name,
-            group: def.group,
-            description: def.description,
+            name: def.name.to_string(),
+            group: def.group.to_string(),
+            description: def.description.map(|s| s.to_string()),
             qualified_name,
+            args_help,
         }
     }
 }
@@ -1017,6 +1093,16 @@ impl Registry {
 
     pub fn list(&self) -> &[&'static TaskDef] {
         &self.tasks
+    }
+
+    /// Return [`TaskInfo`] for every registered task, in the same order as
+    /// [`list`](Self::list).
+    ///
+    /// Suitable for serialization, display, or passing to an LLM consumer.
+    /// Arg help text is rendered via `clap`'s long-help formatter when the
+    /// task declares arguments; tasks with no arguments have `args_help: None`.
+    pub fn list_info(&self) -> Vec<TaskInfo> {
+        self.tasks.iter().map(|def| TaskInfo::from_def(def)).collect()
     }
 
     /// Look up a task by name, create a context, and call its function.
@@ -1501,7 +1587,7 @@ mod tests {
         };
         let all = query.all();
         assert_eq!(all.len(), 5);
-        let names: Vec<&str> = all.iter().map(|t| t.name).collect();
+        let names: Vec<&str> = all.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"build"));
         assert!(names.contains(&"deploy"));
         assert!(names.contains(&"list"));
@@ -1517,7 +1603,7 @@ mod tests {
         // Match all deploy tasks
         let deploys = query.matching("*:deploy");
         assert_eq!(deploys.len(), 2);
-        let groups: Vec<&str> = deploys.iter().map(|t| t.group).collect();
+        let groups: Vec<&str> = deploys.iter().map(|t| t.group.as_str()).collect();
         assert!(groups.contains(&"services/auth"));
         assert!(groups.contains(&"web"));
 

@@ -1,17 +1,38 @@
+//! RUNME.rs file discovery shared between the outer driver and the
+//! supervisor.
+//!
+//! The outer driver uses [`discover`] to locate the nearest RUNME.rs from
+//! a starting directory and any descendant RUNME.rs files (workspace
+//! members). The MCP supervisor uses the same logic so its file-watcher
+//! sees the exact same set of files the compile pipeline will.
+//!
+//! This module performs no I/O beyond filesystem reads: walking up looks
+//! at directory ancestors, and walking down delegates to the `ignore`
+//! crate so `.gitignore`, `.git/info/exclude`, and global ignore rules
+//! are respected.
+
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
-const RUNME_FILENAME: &str = "RUNME.rs";
+/// Standard filename rnme looks for to identify a tasks file.
+pub const RUNME_FILENAME: &str = "RUNME.rs";
 
 /// Result of RUNME.rs file discovery.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DiscoveryResult {
     /// The nearest RUNME.rs found (walking up from the starting directory).
     pub nearest: Option<PathBuf>,
     /// All RUNME.rs files found in the subtree rooted at the nearest RUNME.rs
     /// (walking down), excluding the nearest itself.
     pub children: Vec<PathBuf>,
+}
+
+impl DiscoveryResult {
+    /// Iterator over every discovered RUNME.rs (nearest + children).
+    pub fn all_files(&self) -> impl Iterator<Item = &PathBuf> {
+        self.nearest.iter().chain(self.children.iter())
+    }
 }
 
 /// Find RUNME.rs files relative to the given directory.
@@ -124,11 +145,9 @@ mod tests {
     #[test]
     fn test_walk_down_finds_children() {
         let tmp = TempDir::new().unwrap();
-        // Root RUNME.rs
         let root_runme = tmp.path().join(RUNME_FILENAME);
         fs::write(&root_runme, "// root").unwrap();
 
-        // Child RUNME.rs files
         let child_dir = tmp.path().join("services").join("auth");
         fs::create_dir_all(&child_dir).unwrap();
         let child_runme = child_dir.join(RUNME_FILENAME);
@@ -155,15 +174,12 @@ mod tests {
         // The ignore crate requires a .git directory to recognize .gitignore files
         fs::create_dir_all(tmp.path().join(".git")).unwrap();
 
-        // Create .gitignore that ignores "target/"
         fs::write(tmp.path().join(".gitignore"), "target/\n").unwrap();
 
-        // Put a RUNME.rs inside ignored directory
         let ignored_dir = tmp.path().join("target").join("debug");
         fs::create_dir_all(&ignored_dir).unwrap();
         fs::write(ignored_dir.join(RUNME_FILENAME), "// should be ignored").unwrap();
 
-        // Put a RUNME.rs in a normal directory
         let normal_dir = tmp.path().join("src");
         fs::create_dir_all(&normal_dir).unwrap();
         let normal_runme = normal_dir.join(RUNME_FILENAME);
@@ -185,12 +201,10 @@ mod tests {
         let child_runme = child_dir.join(RUNME_FILENAME);
         fs::write(&child_runme, "// sub").unwrap();
 
-        // Discover from a deeper subdirectory that has no RUNME.rs itself
         let deep_dir = tmp.path().join("sub").join("deep");
         fs::create_dir_all(&deep_dir).unwrap();
 
         let result = discover(&deep_dir);
-        // Should find the child RUNME.rs (nearest walking up)
         assert_eq!(result.nearest.as_deref(), Some(child_runme.as_path()));
     }
 }
