@@ -359,7 +359,28 @@ impl TaskExecution {
         let log_store = self.log_store.clone();
         let spawn_tx = self.spawn_tx.clone();
 
+        // The tracing buffer was constructed with the engine-global SeqGen
+        // when this TaskExecution was created. Pull a clone so we can hand
+        // the same generator to the TaskContext's exec/spawn output buffer
+        // below — otherwise subprocess output gets per-buffer-local seqs,
+        // breaking engine-global ordering and `since_seq` subscription.
+        let engine_seq_gen = {
+            let buf = tracing_buffer
+                .try_lock()
+                .expect("tracing buffer not locked at spawn_body");
+            buf.seq_gen()
+        };
+
         let mut ctx = TaskContext::new(task.name);
+        // Swap in the engine-global SeqGen so `ctx.exec()` / `ctx.spawn()`
+        // subprocess output stamps with engine-global seqs (matches the
+        // tracing buffer + LogStore invariant). The TaskContext's output
+        // buffer was just constructed with a fresh default `SeqGen`; no
+        // entries have been pushed yet, so swapping is safe.
+        ctx.output_buffer()
+            .try_lock()
+            .expect("ctx output buffer uncontended at launch")
+            .set_seq_gen(engine_seq_gen);
         ctx.set_spawn_notifier(spawn_tx);
         ctx.set_task_status(self.task_status.clone());
         ctx.set_summary(self.summary.clone());

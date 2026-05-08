@@ -87,6 +87,17 @@ impl OutputBuffer {
         self.seq_gen.clone()
     }
 
+    /// Replace the buffer's `SeqGen`. The engine wires per-task subprocess
+    /// output buffers up with `OutputBuffer::new` (default fresh `SeqGen`)
+    /// at `TaskContext::new` time, then swaps in the engine-global generator
+    /// inside `TaskExecution::spawn_body` once the engine context is known.
+    /// Without this swap, subprocess output (`exec`/`spawn`) seqs would be
+    /// per-buffer rather than engine-global, breaking `since_seq`-based
+    /// subscription and global cross-source ordering.
+    pub fn set_seq_gen(&mut self, seq_gen: SeqGen) {
+        self.seq_gen = seq_gen;
+    }
+
     /// Get a reference to the broadcast sender.
     ///
     /// Useful for passing to streaming utilities (e.g., `stream::tail()`).
