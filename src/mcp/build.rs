@@ -226,7 +226,7 @@ impl WatchSet {
     ///
     /// Returns the `WatchSet` plus the rebuild-signal receiver for the
     /// supervisor's driver loop.
-    pub fn build(cwd: PathBuf) -> notify::Result<WatchSetSetup> {
+    pub async fn build(cwd: PathBuf) -> notify::Result<WatchSetSetup> {
         // notify → tokio bridge. The closure runs on notify's worker
         // thread; `unbounded_channel::send` is non-blocking and safe to
         // call from any thread.
@@ -260,7 +260,7 @@ impl WatchSet {
         // Initial discovery + subscribe. Happens after the loop is
         // spawned so any startup events on freshly-watched dirs are
         // captured.
-        ws.refresh_blocking();
+        ws.refresh().await;
 
         Ok(WatchSetSetup {
             watch_set: ws,
@@ -275,19 +275,6 @@ impl WatchSet {
         let (runme_paths, watched_dirs, gitignore) = self.compute_state();
         self.sync_watch_set(&watched_dirs);
         let mut snap = self.filter.lock().await;
-        snap.runme_paths = runme_paths;
-        snap.watched_dirs = watched_dirs;
-        snap.gitignore = gitignore;
-    }
-
-    /// Synchronous initial refresh used during construction.
-    fn refresh_blocking(&mut self) {
-        let (runme_paths, watched_dirs, gitignore) = self.compute_state();
-        self.sync_watch_set(&watched_dirs);
-        // blocking_lock: the WatchSet was just constructed; no
-        // contention is possible because the loop hasn't observed any
-        // events yet.
-        let mut snap = self.filter.blocking_lock();
         snap.runme_paths = runme_paths;
         snap.watched_dirs = watched_dirs;
         snap.gitignore = gitignore;
@@ -337,10 +324,11 @@ impl WatchSet {
         // Read the previously-watched set without holding the mutex
         // across the (sync) watcher calls.
         let previous: HashSet<PathBuf> = {
-            // Use try_lock — this is called from refresh_blocking on
-            // construction (no contention) and from refresh() with the
-            // mutex briefly held above. If contended we fall back to
-            // empty (so we re-watch everything; safe but redundant).
+            // Use try_lock — `sync_watch_set` is called from `refresh()`
+            // before/after the mutex is held briefly. If contended (which
+            // shouldn't happen because we don't hold the mutex across the
+            // call), we fall back to empty: safe but redundant — we'll
+            // re-watch everything.
             self.filter
                 .try_lock()
                 .map(|s| s.watched_dirs.clone())

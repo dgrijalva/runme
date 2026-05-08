@@ -80,7 +80,7 @@ pub async fn run() {
             std::process::exit(1);
         })
     });
-    if let Err(e) = supervisor.start_watcher(cwd) {
+    if let Err(e) = supervisor.start_watcher(cwd).await {
         tracing::warn!("supervisor: file watcher failed to start: {e}");
     }
 
@@ -421,11 +421,11 @@ impl Supervisor {
     ///
     /// Returns `Err` if `notify::RecommendedWatcher::new` itself fails
     /// (rare — almost always an OS-level resource limit).
-    pub fn start_watcher(&mut self, cwd: PathBuf) -> notify::Result<()> {
+    pub async fn start_watcher(&mut self, cwd: PathBuf) -> notify::Result<()> {
         let WatchSetSetup {
             watch_set,
             rebuild_rx,
-        } = WatchSet::build(cwd)?;
+        } = WatchSet::build(cwd).await?;
         self.watch_set = Some(watch_set);
         self.rebuild_rx = Some(rebuild_rx);
         Ok(())
