@@ -1,5 +1,5 @@
 ---
-name: rnme-operate
+name: rnme
 description: Use this skill when you have access to the rnme MCP server and need to run, monitor, or manage tasks in a project. Covers list_tasks, spawn_task, run_task, get_task, get_logs, grep_logs, kill_task, and the rest of the rnme MCP tool surface — what each tool does, the address format for task IDs, how to read task reports, how to subscribe to logs, and which tool to reach for in common operating workflows.
 ---
 

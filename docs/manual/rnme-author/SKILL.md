@@ -7,7 +7,7 @@ description: Use this skill when extending or writing tasks in a project that us
 
 A `RUNME.rs` file is a plain Rust source file. Tasks are `async fn` items annotated with `#[rnme::task]`. There is no YAML, no DSL, and no `Cargo.toml` editing for normal use.
 
-If you only need to *run* tasks, see the `rnme-operate` skill instead.
+If you only need to *run* tasks, see the `rnme` skill instead.
 
 ## File anatomy
 
