@@ -374,13 +374,17 @@ impl TaskExecution {
         let mut ctx = TaskContext::new(task.name);
         // Swap in the engine-global SeqGen so `ctx.exec()` / `ctx.spawn()`
         // subprocess output stamps with engine-global seqs (matches the
-        // tracing buffer + LogStore invariant). The TaskContext's output
-        // buffer was just constructed with a fresh default `SeqGen`; no
-        // entries have been pushed yet, so swapping is safe.
+        // tracing buffer + LogStore invariant). Two places need it:
+        //   1. The TaskContext's `output` buffer (used by `exec`'s pipeline
+        //      and the rare direct-output paths).
+        //   2. Each subprocess buffer constructed lazily inside
+        //      `ctx.spawn(...)` — done by stashing the SeqGen as a field
+        //      so every spawn call clones it.
         ctx.output_buffer()
             .try_lock()
             .expect("ctx output buffer uncontended at launch")
-            .set_seq_gen(engine_seq_gen);
+            .set_seq_gen(engine_seq_gen.clone());
+        ctx.set_seq_gen(engine_seq_gen);
         ctx.set_spawn_notifier(spawn_tx);
         ctx.set_task_status(self.task_status.clone());
         ctx.set_summary(self.summary.clone());

@@ -191,6 +191,12 @@ pub struct TaskContext {
     /// Engine-owned `LogStore` (slice 3 inherits the parent's). Slice 4
     /// will hoist this into `Weak<EngineInternals>::log_store`.
     log_store: Option<Arc<Mutex<LogStore>>>,
+    /// Engine-global SeqGen. Set by `TaskExecution::spawn_body`. Used by
+    /// `ctx.spawn()` to construct each subprocess's `OutputBuffer` so
+    /// every entry stamps with engine-global seqs. `None` outside the
+    /// runtime (tests using `TaskContext::new` directly), in which case
+    /// `ctx.spawn()` falls back to a fresh per-spawn generator.
+    seq_gen: Option<crate::log::SeqGen>,
     /// Weak ref to the engine internals. Set by `EngineInternals::spawn_child`
     /// at task launch. Used by `ctx.run` (via `TaskBuilder`) to funnel
     /// child spawns through `engine.spawn_child`, by `TaskHandle::Drop`
@@ -265,6 +271,7 @@ impl TaskContext {
             task_exec: None,
             log_store: None,
             engine: None,
+            seq_gen: None,
         }
     }
 
@@ -286,7 +293,15 @@ impl TaskContext {
             task_exec: None,
             log_store: None,
             engine: None,
+            seq_gen: None,
         }
+    }
+
+    /// Inject the engine-global `SeqGen` so subprocess output buffers
+    /// constructed inside [`TaskContext::spawn`] stamp with engine-global
+    /// seqs. Called from `TaskExecution::spawn_body`.
+    pub fn set_seq_gen(&mut self, seq_gen: crate::log::SeqGen) {
+        self.seq_gen = Some(seq_gen);
     }
 
     /// Set a channel sender that will be notified whenever `spawn()` is called.
@@ -424,7 +439,15 @@ impl TaskContext {
     pub fn spawn(&self, command: impl Into<Cmd>) -> process::SpawnBuilder {
         let cmd: Cmd = command.into();
         let command_label = cmd.display_label();
-        let buffer = Arc::new(Mutex::new(OutputBuffer::new(10_000)));
+        // Use the engine-global SeqGen if injected (production path), so
+        // subprocess output stamps with engine-wide seqs. Tests using
+        // `TaskContext::new` directly fall back to a fresh per-spawn
+        // generator — they don't share a LogStore so collisions don't
+        // matter there.
+        let buffer = match &self.seq_gen {
+            Some(sg) => Arc::new(Mutex::new(OutputBuffer::with_seq_gen(10_000, sg.clone()))),
+            None => Arc::new(Mutex::new(OutputBuffer::new(10_000))),
+        };
 
         // Capture what the on_spawn callback needs
         let spawned_pgids = self.spawned_pgids.clone();
