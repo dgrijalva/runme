@@ -38,7 +38,7 @@ use super::task_id::TaskId;
 /// writes them after the cancel ladder (slice 4) finishes. They land in
 /// slice 2 alongside the rest of the status reshape so consumers (TUI
 /// rendering, status transitions) only need to be updated once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskStatus {
     /// Task function is still executing (spawning processes, doing setup).
     Setup,
@@ -60,7 +60,7 @@ pub enum TaskStatus {
 ///
 /// Preserves the structured error output and exit code from `TaskError`
 /// so that Agent mode can report them faithfully.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskFailure {
     /// Human-readable error message (from `TaskError::to_string()`).
     pub message: String,
@@ -72,7 +72,7 @@ pub struct TaskFailure {
 }
 
 /// Status of an individual spawned process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ProcessStatus {
     /// Process is currently running.
     Running,

@@ -80,13 +80,34 @@ impl std::fmt::Display for ProcessError {
 
 impl std::error::Error for ProcessError {}
 
+/// Serde helper module for `nix::sys::signal::Signal`.
+///
+/// `nix::sys::signal::Signal` is a `#[repr(i32)]` C-style enum and does not
+/// implement `serde::{Serialize, Deserialize}` directly. We serialize it as
+/// the underlying `i32` (`signal as i32`) and deserialize via
+/// `Signal::try_from(i32)`. Used by `Termination::Signaled` so the wire
+/// protocol can carry process termination state.
+mod signal_serde {
+    use nix::sys::signal::Signal;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(sig: &Signal, s: S) -> Result<S::Ok, S::Error> {
+        (*sig as i32).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Signal, D::Error> {
+        let raw = i32::deserialize(d)?;
+        Signal::try_from(raw).map_err(serde::de::Error::custom)
+    }
+}
+
 /// How a process terminated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Termination {
     /// Process exited normally with the given exit code.
     Exited(i32),
     /// Process was killed by a signal.
-    Signaled(Signal),
+    Signaled(#[serde(with = "signal_serde")] Signal),
     /// Process was killed because it exceeded its timeout.
     TimedOut,
 }

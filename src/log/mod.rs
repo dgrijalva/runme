@@ -9,7 +9,7 @@ pub mod store;
 pub mod stream;
 
 use chrono::{DateTime, Local, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,7 +44,7 @@ impl Default for SeqGen {
 }
 
 /// Which output stream a log entry originated from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stream {
     Stdout,
     Stderr,
@@ -67,7 +67,7 @@ pub struct RawRecord {
 }
 
 /// How the record was parsed.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ParsedContent {
     Json(serde_json::Value),
     Logfmt(Vec<(String, String)>),
@@ -85,7 +85,7 @@ pub struct ExtractedFields {
 /// The universal log record. Everything downstream works with this type.
 ///
 /// Must implement Clone (required by `tokio::broadcast`).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LogEntry {
     /// The raw text of the record, exactly as captured from the process.
     pub raw: String,

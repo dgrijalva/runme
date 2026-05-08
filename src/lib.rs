@@ -34,6 +34,7 @@ pub mod error;
 pub mod execution;
 pub mod init;
 pub mod log;
+pub mod mcp;
 pub mod output;
 pub mod prelude;
 pub mod process;

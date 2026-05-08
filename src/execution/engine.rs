@@ -62,7 +62,7 @@ fn install_global_tracing_subscriber() {
 /// snapshots are produced on every task lifecycle event (spawn, status
 /// change, process appeared, readiness flipped, process exited, cancel
 /// ladder finished).
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct GraphSnapshot {
     pub root: TaskId,
     pub tasks: Arc<HashMap<TaskId, TaskNode>>,
@@ -171,7 +171,7 @@ impl GraphSnapshot {
 }
 
 /// Snapshot of a single task in the graph.
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TaskNode {
     pub id: TaskId,
     pub name: String,
@@ -196,7 +196,7 @@ pub struct TaskNode {
 /// Snapshot-friendly view of a `ProcessInfo`. The buffer Arc is included
 /// so consumers can subscribe; the rest is the displayable lifecycle
 /// state.
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ProcessNodeInfo {
     /// Unique id in the unified TaskId space (arch.md decision 22).
     pub id: TaskId,

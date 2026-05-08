@@ -12,10 +12,10 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Process-lifetime monotonic identifier for a task or spawned process.
-#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize)]
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TaskId(pub u64);
 
