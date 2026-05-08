@@ -28,17 +28,17 @@ async fn list(ctx: &TaskContext) -> TaskResult {
     }
 
     // Bucket by group, sort tasks within each group.
-    let mut by_group: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+    let mut by_group: BTreeMap<String, Vec<_>> = BTreeMap::new();
     for t in tasks {
-        by_group.entry(t.group).or_default().push(t);
+        by_group.entry(t.group.clone()).or_default().push(t);
     }
     for v in by_group.values_mut() {
-        v.sort_by_key(|t| t.name);
+        v.sort_by(|a, b| a.name.cmp(&b.name));
     }
 
     // Group order: root ("") first, then user groups alphabetically, then
     // "builtin" last so the locally-meaningful tasks lead.
-    let mut groups: Vec<&str> = by_group.keys().copied().collect();
+    let mut groups: Vec<&str> = by_group.keys().map(|s| s.as_str()).collect();
     groups.sort_by_key(|g| match *g {
         "" => (0u8, ""),
         "builtin" => (2, ""),
@@ -74,7 +74,11 @@ async fn list(ctx: &TaskContext) -> TaskResult {
             ctx.println(format!("{accent}{BOLD}{group}{reset}")).await;
         }
         for t in &by_group[group] {
-            let desc = t.description.unwrap_or("").replace('\n', " ");
+            let desc = t
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .replace('\n', " ");
             let desc = truncate_chars(&desc, desc_width);
             ctx.println(format!(
                 "  {BOLD}{name:<width$}{reset}  {dim}{desc}{reset}",

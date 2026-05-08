@@ -204,14 +204,16 @@ mod tests {
         TaskId(h.finish())
     }
 
-    /// Helper to create a LogEntry for testing.
+    /// Helper to create a LogEntry for testing. The `seq` argument is shifted
+    /// by +1 internally so callers can keep using 0-based literals while the
+    /// stored entries satisfy the engine-global "seq != 0" invariant.
     fn make_entry(source: &str, seq: u64, raw: &str) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: tid(source),
-            seq,
+            seq: seq + 1,
             timestamp: None,
             level: None,
             message: None,
@@ -220,7 +222,8 @@ mod tests {
         }
     }
 
-    /// Helper to create a LogEntry with level and message.
+    /// Helper to create a LogEntry with level and message. Same `seq + 1`
+    /// shift as [`make_entry`].
     fn make_entry_full(
         source: &str,
         seq: u64,
@@ -233,7 +236,7 @@ mod tests {
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: tid(source),
-            seq,
+            seq: seq + 1,
             timestamp: None,
             level: level.map(|s| s.to_string()),
             message: message.map(|s| s.to_string()),
@@ -242,14 +245,15 @@ mod tests {
         }
     }
 
-    /// Helper to create a LogEntry with JSON parsed content.
+    /// Helper to create a LogEntry with JSON parsed content. Same `seq + 1`
+    /// shift as [`make_entry`].
     fn make_json_entry(source: &str, seq: u64, raw: &str, json: serde_json::Value) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::Json(json.clone()),
             source: tid(source),
-            seq,
+            seq: seq + 1,
             timestamp: None,
             level: json.get("level").and_then(|v| v.as_str()).map(String::from),
             message: json.get("msg").and_then(|v| v.as_str()).map(String::from),
@@ -349,7 +353,8 @@ mod tests {
         let mut rx = replay(entries);
         for i in 0..100u64 {
             let entry = rx.recv().await.unwrap();
-            assert_eq!(entry.seq, i);
+            // make_entry shifts seq by +1 to satisfy the engine-global seq != 0 invariant.
+            assert_eq!(entry.seq, i + 1);
             assert_eq!(entry.raw, format!("line {i}"));
         }
         assert!(rx.recv().await.is_none());
@@ -428,12 +433,14 @@ mod tests {
     async fn test_filtered_stream_custom_closure() {
         let (tx, _) = broadcast::channel::<LogEntry>(16);
         let rx = tx.subscribe();
-        // Filter: only even sequence numbers
+        // Filter: only even sequence numbers. `make_entry` shifts the seq by
+        // +1 to satisfy the engine-global seq != 0 invariant, so the input
+        // arguments below are chosen to land on the desired parities.
         let mut filtered = FilteredStream::new(rx, |e: &LogEntry| e.seq.is_multiple_of(2));
 
-        let _ = tx.send(make_entry("app", 0, "even"));
-        let _ = tx.send(make_entry("app", 1, "odd"));
-        let _ = tx.send(make_entry("app", 2, "even again"));
+        let _ = tx.send(make_entry("app", 1, "even")); // stored seq = 2
+        let _ = tx.send(make_entry("app", 2, "odd")); // stored seq = 3
+        let _ = tx.send(make_entry("app", 3, "even again")); // stored seq = 4
 
         assert_eq!(filtered.recv().await.unwrap().raw, "even");
         assert_eq!(filtered.recv().await.unwrap().raw, "even again");
@@ -513,14 +520,15 @@ mod tests {
         assert_eq!(lines.len(), 2);
 
         // Each line should be valid JSON. `source` is now an integer TaskId.
+        // make_entry shifts seq by +1 to satisfy the engine-global seq != 0 invariant.
         let parsed0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed0["raw"], "hello");
         assert!(parsed0["source"].is_u64());
-        assert_eq!(parsed0["seq"], 0);
+        assert_eq!(parsed0["seq"], 1);
 
         let parsed1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(parsed1["raw"], "world");
-        assert_eq!(parsed1["seq"], 1);
+        assert_eq!(parsed1["seq"], 2);
     }
 
     #[test]

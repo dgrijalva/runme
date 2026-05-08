@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use tokio::sync::broadcast;
 
-use super::LogEntry;
 use super::field_stats::FieldStats;
+use super::{LogEntry, SeqGen};
 use crate::execution::TaskId;
 
 /// A composition layer for log entries from multiple sources.
@@ -25,34 +25,62 @@ pub struct LogStore {
     tx: broadcast::Sender<LogEntry>,
     /// Per-source field importance stats, updated as entries arrive.
     field_stats: FieldStats,
+    /// Engine-global seq generator. Cloned to every `OutputBuffer` /
+    /// `LogEntryLayer` / producer so all entries get a strictly-monotonic
+    /// seq across all sources.
+    seq_gen: SeqGen,
 }
 
 impl LogStore {
-    /// Create a new LogStore with no capacity limit.
+    /// Create a new LogStore with no capacity limit and a fresh `SeqGen`.
     pub fn new() -> Self {
+        Self::with_seq_gen(SeqGen::new())
+    }
+
+    /// Create a new LogStore with no capacity limit, sharing the supplied `SeqGen`.
+    pub fn with_seq_gen(seq_gen: SeqGen) -> Self {
         let (tx, _) = broadcast::channel(1024);
         Self {
             sources: HashMap::new(),
             capacity: None,
             tx,
             field_stats: FieldStats::new(),
+            seq_gen,
         }
     }
 
-    /// Create a new LogStore with a maximum total entry count.
+    /// Create a new LogStore with a maximum total entry count and a fresh `SeqGen`.
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacity_and_seq_gen(capacity, SeqGen::new())
+    }
+
+    /// Create a new LogStore with a maximum total entry count, sharing the
+    /// supplied `SeqGen`.
+    pub fn with_capacity_and_seq_gen(capacity: usize, seq_gen: SeqGen) -> Self {
         let (tx, _) = broadcast::channel(capacity.max(16));
         Self {
             sources: HashMap::new(),
             capacity: Some(capacity),
             tx,
             field_stats: FieldStats::new(),
+            seq_gen,
         }
     }
 
+    /// Clone the store's `SeqGen`. Hand to producers (OutputBuffers, layers)
+    /// so every entry across the engine gets a globally-monotonic seq.
+    pub fn seq_gen(&self) -> SeqGen {
+        self.seq_gen.clone()
+    }
+
     /// Add a single entry. The entry's `source` field determines which source
-    /// bucket it lands in.
+    /// bucket it lands in. Trusts `entry.seq` — does not override.
     pub fn push(&mut self, entry: LogEntry) {
+        debug_assert!(
+            entry.seq != 0,
+            "LogStore::push received an entry with seq == 0 — \
+             producer must stamp via SeqGen::next() before pushing"
+        );
         // Broadcast to live subscribers (ignore errors -- no receivers is OK)
         let _ = self.tx.send(entry.clone());
 
@@ -231,6 +259,182 @@ impl LogStore {
         }
     }
 
+    /// Range query over the engine-global seq space.
+    ///
+    /// Returns `(entries, next_seq, has_more)` where:
+    /// - `since_seq` is **exclusive** (caller passes back the previous
+    ///   `next_seq` to continue paging).
+    /// - `until_seq` is **inclusive** (use `u64::MAX` for an open end).
+    /// - Empty `sources` means "all sources".
+    /// - `limit` caps the returned entries; `has_more` is true if more entries
+    ///   exist in the requested range beyond `limit`.
+    /// - `next_seq` = seq of the last returned entry (caller passes this back
+    ///   as the next `since_seq`), or the input `since_seq` if no entries
+    ///   matched.
+    /// - `filter` is applied before the limit, after the source/seq window.
+    pub fn get_range(
+        &self,
+        sources: &[TaskId],
+        since_seq: u64,
+        until_seq: u64,
+        limit: usize,
+        filter: Option<&dyn Fn(&LogEntry) -> bool>,
+    ) -> (Vec<LogEntry>, u64, bool) {
+        use std::collections::HashSet;
+
+        let want: Option<HashSet<TaskId>> = if sources.is_empty() {
+            None
+        } else {
+            Some(sources.iter().copied().collect())
+        };
+
+        // Collect all matching entries (within window + sources + filter).
+        let mut matched: Vec<LogEntry> = self
+            .sources
+            .iter()
+            .filter(|(id, _)| match &want {
+                Some(set) => set.contains(*id),
+                None => true,
+            })
+            .flat_map(|(_, v)| v.iter())
+            .filter(|e| e.seq > since_seq && e.seq <= until_seq)
+            .filter(|e| match filter {
+                Some(f) => f(e),
+                None => true,
+            })
+            .cloned()
+            .collect();
+
+        matched.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
+
+        let total = matched.len();
+        let has_more = total > limit;
+        if has_more {
+            matched.truncate(limit);
+        }
+
+        let next_seq = matched.last().map(|e| e.seq).unwrap_or(since_seq);
+
+        (matched, next_seq, has_more)
+    }
+
+    /// Regex search across stored entries.
+    ///
+    /// Matches against `entry.message` if present, otherwise falls back to
+    /// `entry.raw`. Empty `sources` means "all sources". Returns up to `limit`
+    /// matching entries in seq order.
+    pub fn grep(
+        &self,
+        sources: &[TaskId],
+        pattern: &regex::Regex,
+        limit: usize,
+    ) -> Vec<LogEntry> {
+        use std::collections::HashSet;
+
+        let want: Option<HashSet<TaskId>> = if sources.is_empty() {
+            None
+        } else {
+            Some(sources.iter().copied().collect())
+        };
+
+        let mut matched: Vec<LogEntry> = self
+            .sources
+            .iter()
+            .filter(|(id, _)| match &want {
+                Some(set) => set.contains(*id),
+                None => true,
+            })
+            .flat_map(|(_, v)| v.iter())
+            .filter(|e| {
+                let haystack: &str = e.message.as_deref().unwrap_or(&e.raw);
+                pattern.is_match(haystack)
+            })
+            .cloned()
+            .collect();
+
+        matched.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
+        matched.truncate(limit);
+        matched
+    }
+
+    /// Subscribe to a filtered, replay-then-live stream.
+    ///
+    /// Yields all stored entries with `seq > from_seq` matching `sources`
+    /// (empty = all) and `filter`, then continues with live entries from the
+    /// broadcast channel that match the same predicates.
+    ///
+    /// Takes `&mut self` so push is blocked while the snapshot is taken and
+    /// the subscription created — guaranteeing no dedup is required at the
+    /// historical-to-live boundary.
+    pub fn subscribe_with<F>(
+        &mut self,
+        sources: &[TaskId],
+        filter: F,
+        from_seq: u64,
+    ) -> impl futures::Stream<Item = LogEntry> + Send + 'static
+    where
+        F: Fn(&LogEntry) -> bool + Send + Sync + 'static,
+    {
+        use futures::StreamExt;
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use tokio_stream::wrappers::BroadcastStream;
+
+        let want: Option<HashSet<TaskId>> = if sources.is_empty() {
+            None
+        } else {
+            Some(sources.iter().copied().collect())
+        };
+
+        // Subscribe BEFORE snapshotting so we don't miss entries that arrive
+        // between the snapshot and the subscription. (We're holding `&mut
+        // self` here, so push can't run during this method, but the contract
+        // is robust either way.)
+        let rx = self.tx.subscribe();
+
+        // Snapshot of historical entries matching the predicates.
+        let mut historical: Vec<LogEntry> = self
+            .sources
+            .iter()
+            .filter(|(id, _)| match &want {
+                Some(set) => set.contains(*id),
+                None => true,
+            })
+            .flat_map(|(_, v)| v.iter())
+            .filter(|e| e.seq > from_seq && filter(e))
+            .cloned()
+            .collect();
+        historical
+            .sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
+
+        let filter = Arc::new(filter);
+        let want_live = want;
+        let filter_live = filter.clone();
+
+        let live = BroadcastStream::new(rx).filter_map(move |res| {
+            let want = want_live.clone();
+            let filter = filter_live.clone();
+            async move {
+                match res {
+                    Ok(entry) => {
+                        let source_ok = match &want {
+                            Some(set) => set.contains(&entry.source),
+                            None => true,
+                        };
+                        if source_ok && filter(&entry) {
+                            Some(entry)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None, // drop lag/closed errors silently
+                }
+            }
+        });
+
+        futures::stream::iter(historical).chain(live)
+    }
+
     /// Create an `Output` handle backed by a snapshot of all entries, with
     /// live forwarding of new entries.
     ///
@@ -238,7 +442,8 @@ impl LogStore {
     /// new entries as they are pushed into this LogStore.
     pub fn output(&self) -> crate::process::Output {
         let total = self.len();
-        let mut buffer = super::buffer::OutputBuffer::new(total.max(1024));
+        let mut buffer =
+            super::buffer::OutputBuffer::with_seq_gen(total.max(1024), self.seq_gen.clone());
         for entry in self.compose() {
             buffer.push(entry.clone());
         }
@@ -286,7 +491,10 @@ impl LogStore {
             .collect();
         existing.sort_by(|a, b| a.seq.cmp(&b.seq).then_with(|| a.source.0.cmp(&b.source.0)));
 
-        let mut buffer = super::buffer::OutputBuffer::new(existing.len().max(1024));
+        let mut buffer = super::buffer::OutputBuffer::with_seq_gen(
+            existing.len().max(1024),
+            self.seq_gen.clone(),
+        );
         for entry in existing {
             buffer.push(entry);
         }
@@ -358,14 +566,16 @@ mod tests {
     const TID_B: TaskId = TaskId(1002);
     const TID_C: TaskId = TaskId(1003);
 
-    /// Helper to create a LogEntry for testing.
+    /// Helper to create a LogEntry for testing. The `seq` argument is shifted
+    /// by +1 internally so callers can keep using 0-based literals while the
+    /// stored entries satisfy the engine-global "seq != 0" invariant.
     fn make_entry(source: TaskId, seq: u64, raw: &str) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source,
-            seq,
+            seq: seq + 1,
             timestamp: None,
             level: None,
             message: None,
@@ -374,14 +584,15 @@ mod tests {
         }
     }
 
-    /// Helper to create a LogEntry with a level.
+    /// Helper to create a LogEntry with a level. Same `seq + 1` shift as
+    /// [`make_entry`].
     fn make_entry_with_level(source: TaskId, seq: u64, raw: &str, level: &str) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source,
-            seq,
+            seq: seq + 1,
             timestamp: None,
             level: Some(level.to_string()),
             message: None,
@@ -425,19 +636,8 @@ mod tests {
         assert_eq!(composed[3].raw, "b3");
     }
 
-    #[test]
-    fn test_compose_same_seq_deterministic() {
-        let mut store = LogStore::new();
-        // Two entries with the same seq from different sources
-        store.push(make_entry(TID_B, 0, "b0"));
-        store.push(make_entry(TID_A, 0, "a0"));
-
-        let composed = store.compose();
-        assert_eq!(composed.len(), 2);
-        // Sorted by TaskId.0 numeric when seq is equal: TID_A=1001 < TID_B=1002
-        assert_eq!(composed[0].raw, "a0");
-        assert_eq!(composed[1].raw, "b0");
-    }
+    // (Removed: test_compose_same_seq_deterministic — same-seq-cross-source is
+    // structurally impossible under engine-global SeqGen.)
 
     #[test]
     fn test_compose_owned() {
@@ -774,5 +974,209 @@ mod tests {
         let store = LogStore::default();
         assert!(store.is_empty());
         assert_eq!(store.capacity(), None);
+    }
+
+    // ---------------------------------------------------------------
+    // get_range / grep / subscribe_with (engine-global seq migration)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_get_range_basic() {
+        let mut store = LogStore::new();
+        // Stored seqs are seq + 1 (per make_entry shift).
+        store.push(make_entry(TID_A, 0, "a0")); // seq 1
+        store.push(make_entry(TID_A, 1, "a1")); // seq 2
+        store.push(make_entry(TID_B, 2, "b0")); // seq 3
+        store.push(make_entry(TID_A, 3, "a2")); // seq 4
+
+        // since=0 (exclusive) means "everything from seq 1 onward".
+        let (entries, next_seq, has_more) = store.get_range(&[], 0, u64::MAX, 100, None);
+        assert_eq!(entries.len(), 4);
+        assert_eq!(next_seq, 4);
+        assert!(!has_more);
+        assert_eq!(entries[0].raw, "a0");
+        assert_eq!(entries[3].raw, "a2");
+    }
+
+    #[test]
+    fn test_get_range_pagination() {
+        let mut store = LogStore::new();
+        for i in 0..10 {
+            store.push(make_entry(TID_A, i, &format!("line{i}")));
+        }
+
+        // First page of 3.
+        let (page1, next1, has_more1) = store.get_range(&[], 0, u64::MAX, 3, None);
+        assert_eq!(page1.len(), 3);
+        assert!(has_more1);
+        assert_eq!(next1, 3);
+
+        // Second page of 3 starting at next1.
+        let (page2, next2, has_more2) = store.get_range(&[], next1, u64::MAX, 3, None);
+        assert_eq!(page2.len(), 3);
+        assert!(has_more2);
+        assert_eq!(page2[0].raw, "line3");
+        assert_eq!(next2, 6);
+
+        // Page beyond data.
+        let (page_none, next_none, has_more_none) = store.get_range(&[], 100, u64::MAX, 3, None);
+        assert!(page_none.is_empty());
+        assert_eq!(next_none, 100);
+        assert!(!has_more_none);
+    }
+
+    #[test]
+    fn test_get_range_sources_filter() {
+        let mut store = LogStore::new();
+        store.push(make_entry(TID_A, 0, "a0"));
+        store.push(make_entry(TID_B, 1, "b0"));
+        store.push(make_entry(TID_C, 2, "c0"));
+        store.push(make_entry(TID_A, 3, "a1"));
+
+        let (entries, _, _) = store.get_range(&[TID_A], 0, u64::MAX, 100, None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].raw, "a0");
+        assert_eq!(entries[1].raw, "a1");
+
+        let (entries_two, _, _) = store.get_range(&[TID_B, TID_C], 0, u64::MAX, 100, None);
+        assert_eq!(entries_two.len(), 2);
+    }
+
+    #[test]
+    fn test_get_range_until_seq_inclusive() {
+        let mut store = LogStore::new();
+        store.push(make_entry(TID_A, 0, "a0")); // seq 1
+        store.push(make_entry(TID_A, 1, "a1")); // seq 2
+        store.push(make_entry(TID_A, 2, "a2")); // seq 3
+
+        // until_seq=2 should include seqs 1 and 2 but exclude 3.
+        let (entries, _, _) = store.get_range(&[], 0, 2, 100, None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].raw, "a0");
+        assert_eq!(entries[1].raw, "a1");
+    }
+
+    #[test]
+    fn test_get_range_with_filter() {
+        let mut store = LogStore::new();
+        store.push(make_entry_with_level(TID_A, 0, "info1", "info"));
+        store.push(make_entry_with_level(TID_A, 1, "err1", "error"));
+        store.push(make_entry_with_level(TID_A, 2, "info2", "info"));
+        store.push(make_entry_with_level(TID_A, 3, "err2", "error"));
+
+        let f: &dyn Fn(&LogEntry) -> bool = &|e: &LogEntry| e.level.as_deref() == Some("error");
+        let (entries, _, _) = store.get_range(&[], 0, u64::MAX, 100, Some(f));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].raw, "err1");
+        assert_eq!(entries[1].raw, "err2");
+    }
+
+    #[test]
+    fn test_grep_basic() {
+        let mut store = LogStore::new();
+        store.push(make_entry(TID_A, 0, "hello world"));
+        store.push(make_entry(TID_A, 1, "goodbye world"));
+        store.push(make_entry(TID_A, 2, "hello there"));
+
+        let pat = regex::Regex::new("hello").unwrap();
+        let matched = store.grep(&[], &pat, 100);
+        assert_eq!(matched.len(), 2);
+        assert_eq!(matched[0].raw, "hello world");
+        assert_eq!(matched[1].raw, "hello there");
+    }
+
+    #[test]
+    fn test_grep_sources_filter_and_limit() {
+        let mut store = LogStore::new();
+        store.push(make_entry(TID_A, 0, "match-a"));
+        store.push(make_entry(TID_B, 1, "match-b"));
+        store.push(make_entry(TID_A, 2, "match-a2"));
+
+        let pat = regex::Regex::new("match").unwrap();
+        // sources filter
+        let only_a = store.grep(&[TID_A], &pat, 100);
+        assert_eq!(only_a.len(), 2);
+        // limit
+        let limited = store.grep(&[], &pat, 1);
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_with_replay_then_live() {
+        use futures::StreamExt;
+
+        let mut store = LogStore::new();
+        // Pre-populate.
+        store.push(make_entry(TID_A, 0, "old1")); // seq 1
+        store.push(make_entry(TID_B, 1, "old2")); // seq 2
+        store.push(make_entry(TID_A, 2, "old3")); // seq 3
+
+        // Subscribe from after seq=1, all sources, no extra filter.
+        let stream = store.subscribe_with(&[], |_e| true, 1);
+        let mut stream = Box::pin(stream);
+
+        // Expect old2 and old3 from history (seq > 1).
+        let e1 = stream.next().await.unwrap();
+        assert_eq!(e1.raw, "old2");
+        let e2 = stream.next().await.unwrap();
+        assert_eq!(e2.raw, "old3");
+
+        // Push a live entry.
+        store.push(make_entry(TID_A, 3, "live")); // seq 4
+        let e3 = stream.next().await.unwrap();
+        assert_eq!(e3.raw, "live");
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_with_sources_and_filter() {
+        use futures::StreamExt;
+
+        let mut store = LogStore::new();
+        store.push(make_entry_with_level(TID_A, 0, "a-info", "info"));
+        store.push(make_entry_with_level(TID_B, 1, "b-error", "error"));
+        store.push(make_entry_with_level(TID_A, 2, "a-error", "error"));
+
+        let stream = store.subscribe_with(
+            &[TID_A],
+            |e| e.level.as_deref() == Some("error"),
+            0,
+        );
+        let mut stream = Box::pin(stream);
+
+        // Only a-error matches sources=[A] and level=error.
+        let e1 = stream.next().await.unwrap();
+        assert_eq!(e1.raw, "a-error");
+    }
+
+    #[test]
+    fn test_log_store_seq_gen_shared() {
+        // Two stores constructed from a single SeqGen should share the
+        // underlying counter.
+        let seq_gen = SeqGen::new();
+        let store1 = LogStore::with_seq_gen(seq_gen.clone());
+        let store2 = LogStore::with_seq_gen(seq_gen);
+
+        let s1 = store1.seq_gen().next();
+        let s2 = store2.seq_gen().next();
+        assert!(s2 > s1);
+    }
+
+    #[test]
+    #[should_panic(expected = "seq == 0")]
+    fn test_push_rejects_unstamped_entry() {
+        let mut store = LogStore::new();
+        // make_entry(_, 0, _) shifts to seq=1, so go around it directly.
+        store.push(LogEntry {
+            received_at: chrono::Utc::now(),
+            raw: "unstamped".to_string(),
+            parsed: ParsedContent::PlainText,
+            source: TID_A,
+            seq: 0,
+            timestamp: None,
+            level: None,
+            message: None,
+            fields: HashMap::new(),
+            stream: None,
+        });
     }
 }

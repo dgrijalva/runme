@@ -388,7 +388,7 @@ async fn run_discovered_steps(ctx: &TaskContext) -> TaskResult {
 
     let mut ran = Vec::new();
     for step in &steps {
-        let result = ctx.run(step.name, &[]).await;
+        let result = ctx.run(&step.name, &[]).await;
         ran.push((step.name.to_string(), result.is_ok()));
     }
 
@@ -436,7 +436,7 @@ async fn run_matching_steps(ctx: &TaskContext) -> TaskResult {
     assert_eq!(steps.len(), 2, "should match exactly step_a and step_b");
 
     for step in &steps {
-        ctx.run(step.name, &[]).await?;
+        ctx.run(&step.name, &[]).await?;
     }
     Ok(())
 }

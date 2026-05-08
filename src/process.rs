@@ -236,11 +236,14 @@ impl ProcessResult {
 pub use crate::log::buffer::OutputBuffer;
 
 /// Build a LogEntry from a RawRecord and extracted fields.
+///
+/// Stamps the entry with the next seq from `seq_gen` at construction time —
+/// the engine-global ordering invariant lives here.
 fn build_log_entry(
     raw_record: super::log::RawRecord,
     extractor: &dyn FieldExtractor,
     source: crate::execution::TaskId,
-    seq: &mut u64,
+    seq_gen: &super::log::SeqGen,
     stream: Option<Stream>,
 ) -> LogEntry {
     let extracted = extractor.extract(&raw_record);
@@ -248,29 +251,27 @@ fn build_log_entry(
         raw_record.raw,
         raw_record.parsed,
         source,
-        *seq,
+        seq_gen.next(),
         extracted.timestamp,
         extracted.level,
         extracted.message,
         extracted.fields,
     );
     entry.stream = stream;
-    *seq += 1;
     entry
 }
 
 /// Drain records from a buffer using the parser, pushing entries into the output buffer.
-#[allow(clippy::too_many_arguments)]
 fn drain_records(
     buf: &mut BytesMut,
     eof: bool,
     parser: &mut dyn RecordParser,
     extractor: &dyn FieldExtractor,
     source: crate::execution::TaskId,
-    seq: &mut u64,
     output: &mut OutputBuffer,
     stream: Option<Stream>,
 ) {
+    let seq_gen = output.seq_gen();
     loop {
         if buf.is_empty() {
             break;
@@ -278,7 +279,7 @@ fn drain_records(
         match parser.feed(buf, eof) {
             ParseResult::Record(rec, consumed) => {
                 buf.advance(consumed);
-                let entry = build_log_entry(rec, extractor, source, seq, stream);
+                let entry = build_log_entry(rec, extractor, source, &seq_gen, stream);
                 output.push(entry);
                 // continue -- buffer may contain more records
             }
@@ -295,8 +296,8 @@ async fn drain_records_async(
     parser: &mut dyn RecordParser,
     extractor: &dyn FieldExtractor,
     source: crate::execution::TaskId,
-    seq: &mut u64,
     output: &std::sync::Arc<tokio::sync::Mutex<OutputBuffer>>,
+    seq_gen: &super::log::SeqGen,
     stream: Option<Stream>,
 ) {
     loop {
@@ -306,7 +307,7 @@ async fn drain_records_async(
         match parser.feed(buf, eof) {
             ParseResult::Record(rec, consumed) => {
                 buf.advance(consumed);
-                let entry = build_log_entry(rec, extractor, source, seq, stream);
+                let entry = build_log_entry(rec, extractor, source, seq_gen, stream);
                 output.lock().await.push(entry);
                 // continue -- buffer may contain more records
             }
@@ -602,7 +603,6 @@ pub async fn exec(
 
     let mut stdout_buf = BytesMut::new();
     let mut stderr_buf = BytesMut::new();
-    let mut seq: u64 = 0;
 
     let mut stdout_done = false;
     let mut stderr_done = false;
@@ -618,7 +618,7 @@ pub async fn exec(
                         drain_records(
                             &mut stdout_buf, true,
                             stdout_parser.as_mut(), extractor.as_ref(),
-                            process_id, &mut seq, buffer,
+                            process_id, buffer,
                             Some(Stream::Stdout),
                         );
                     }
@@ -627,7 +627,7 @@ pub async fn exec(
                         drain_records(
                             &mut stdout_buf, false,
                             stdout_parser.as_mut(), extractor.as_ref(),
-                            process_id, &mut seq, buffer,
+                            process_id, buffer,
                             Some(Stream::Stdout),
                         );
                     }
@@ -643,7 +643,7 @@ pub async fn exec(
                         drain_records(
                             &mut stderr_buf, true,
                             stderr_parser.as_mut(), extractor.as_ref(),
-                            process_id, &mut seq, buffer,
+                            process_id, buffer,
                             Some(Stream::Stderr),
                         );
                     }
@@ -651,7 +651,7 @@ pub async fn exec(
                         drain_records(
                             &mut stderr_buf, false,
                             stderr_parser.as_mut(), extractor.as_ref(),
-                            process_id, &mut seq, buffer,
+                            process_id, buffer,
                             Some(Stream::Stderr),
                         );
                     }
@@ -667,8 +667,9 @@ pub async fn exec(
     let termination = Termination::from_exit_status(status);
 
     // Wrap the buffer in an Output. For exec(), we create a new Arc<Mutex<OutputBuffer>>
-    // by moving the buffer contents into a fresh buffer.
-    let mut result_buffer = OutputBuffer::new(buffer.capacity());
+    // by moving the buffer contents into a fresh buffer that shares the
+    // input buffer's seq_gen so any forwarded entries remain consistent.
+    let mut result_buffer = OutputBuffer::with_seq_gen(buffer.capacity(), buffer.seq_gen());
     for entry in buffer.lines().iter() {
         result_buffer.push(entry.clone());
     }
@@ -722,13 +723,15 @@ pub async fn spawn(
     let stdout_parser = std::sync::Arc::new(tokio::sync::Mutex::new(stdout_parser));
     let stderr_parser = std::sync::Arc::new(tokio::sync::Mutex::new(stderr_parser));
     let extractor = std::sync::Arc::new(extractor);
-    let seq = std::sync::Arc::new(tokio::sync::Mutex::new(0u64));
+    // Seq generator is owned by the buffer (engine-global when wired);
+    // clone it once for each stream task.
+    let seq_gen = buffer.lock().await.seq_gen();
 
     // Background task: read stdout bytes into buffer
     let buf_clone = buffer.clone();
     let parser_clone = stdout_parser;
     let extractor_clone = extractor.clone();
-    let seq_clone = seq.clone();
+    let seq_gen_clone = seq_gen.clone();
     let stdout_task = tokio::spawn(async move {
         let mut byte_buf = BytesMut::new();
         while let Ok(n) = stdout.read_buf(&mut byte_buf).await {
@@ -736,15 +739,14 @@ pub async fn spawn(
 
             {
                 let mut p = parser_clone.lock().await;
-                let mut s = seq_clone.lock().await;
                 drain_records_async(
                     &mut byte_buf,
                     eof,
                     p.as_mut(),
                     extractor_clone.as_ref(),
                     process_id,
-                    &mut s,
                     &buf_clone,
+                    &seq_gen_clone,
                     Some(Stream::Stdout),
                 )
                 .await;
@@ -760,7 +762,7 @@ pub async fn spawn(
     let buf_clone = buffer.clone();
     let parser_clone = stderr_parser;
     let extractor_clone = extractor;
-    let seq_clone = seq;
+    let seq_gen_clone = seq_gen;
     let stderr_task = tokio::spawn(async move {
         let mut byte_buf = BytesMut::new();
         while let Ok(n) = stderr.read_buf(&mut byte_buf).await {
@@ -768,15 +770,14 @@ pub async fn spawn(
 
             {
                 let mut p = parser_clone.lock().await;
-                let mut s = seq_clone.lock().await;
                 drain_records_async(
                     &mut byte_buf,
                     eof,
                     p.as_mut(),
                     extractor_clone.as_ref(),
                     process_id,
-                    &mut s,
                     &buf_clone,
+                    &seq_gen_clone,
                     Some(Stream::Stderr),
                 )
                 .await;
@@ -1497,10 +1498,10 @@ mod tests {
         for entry in &entries {
             assert_eq!(entry.source, first_source);
         }
-        // Seq should be monotonically increasing
-        assert_eq!(entries[0].seq, 0);
-        assert_eq!(entries[1].seq, 1);
-        assert_eq!(entries[2].seq, 2);
+        // Seq is engine-global and strictly monotonic (never 0).
+        assert!(entries[0].seq > 0);
+        assert!(entries[1].seq > entries[0].seq);
+        assert!(entries[2].seq > entries[1].seq);
     }
 
     #[tokio::test]

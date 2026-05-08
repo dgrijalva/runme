@@ -11,8 +11,37 @@ pub mod stream;
 use chrono::{DateTime, Local, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::execution::TaskId;
+
+/// Engine-global monotonic sequence generator for `LogEntry.seq`.
+///
+/// Cloning shares the underlying counter (it's an `Arc<AtomicU64>`). Engine
+/// constructs one at startup; every `OutputBuffer` / `LogStore` /
+/// `LogEntryLayer` shares clones so all entries — across all sources — get
+/// strictly monotonically increasing seqs.
+#[derive(Clone, Debug)]
+pub struct SeqGen(Arc<AtomicU64>);
+
+impl SeqGen {
+    /// Create a fresh generator starting at 0 (so the first allocated seq is 1).
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Allocate the next seq. Strictly monotonic across all clones; never returns 0.
+    pub fn next(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
+impl Default for SeqGen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Which output stream a log entry originated from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -10,7 +10,7 @@
 //! provided so the eventual `Engine` (slice 4) can own a single store
 //! shared across the whole graph.
 
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use nix::sys::signal;
 use nix::unistd::Pid;
@@ -258,6 +258,20 @@ pub struct TaskExecution {
     /// `None` for the synthetic root.
     pub task_def: Option<&'static TaskDef>,
     pub task_args: Vec<String>,
+
+    // ── Reporting (Phase 1: timestamps + summary) ─────────────────
+    /// Timestamp at which the task body began running. Set exactly once
+    /// in `spawn_body` immediately before the body's tokio task is
+    /// launched. `OnceLock::get()` returns `None` until set.
+    pub started_at: Arc<OnceLock<chrono::DateTime<chrono::Local>>>,
+    /// Timestamp at which the task reached a terminal status (Done /
+    /// Failed / Cancelled / Timeout). Set exactly once at each terminal
+    /// status writer.
+    pub ended_at: Arc<OnceLock<chrono::DateTime<chrono::Local>>>,
+    /// Optional human-readable summary written by the task body via
+    /// `TaskContext::summary`. Last write wins. Shared with the running
+    /// `TaskContext` (mirrors the `task_status` sharing pattern).
+    pub summary: Arc<Mutex<Option<String>>>,
 }
 
 impl TaskExecution {
@@ -269,6 +283,7 @@ impl TaskExecution {
     pub fn with_log_store_and_engine(
         id: TaskId,
         log_store: Arc<Mutex<LogStore>>,
+        seq_gen: crate::log::SeqGen,
         engine: Weak<EngineInternals>,
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::unbounded_channel();
@@ -301,10 +316,13 @@ impl TaskExecution {
             spawn_tx,
             task_ctx: Mutex::new(None),
             log_store,
-            tracing_buffer: Arc::new(Mutex::new(OutputBuffer::new(10_000))),
+            tracing_buffer: Arc::new(Mutex::new(OutputBuffer::with_seq_gen(10_000, seq_gen))),
             registry: None,
             task_def: None,
             task_args: Vec::new(),
+            started_at: Arc::new(OnceLock::new()),
+            ended_at: Arc::new(OnceLock::new()),
+            summary: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -335,6 +353,7 @@ impl TaskExecution {
         let mut ctx = TaskContext::new(task.name);
         ctx.set_spawn_notifier(spawn_tx);
         ctx.set_task_status(self.task_status.clone());
+        ctx.set_summary(self.summary.clone());
         if let Some(ref registry) = self.registry {
             ctx.set_registry(registry.clone());
         }
@@ -367,6 +386,11 @@ impl TaskExecution {
         let task_name_owned = task.name.to_string();
         let task_id = self.id;
         let tracing_buf_for_body = tracing_buffer.clone();
+        let ended_at_for_body = self.ended_at.clone();
+
+        // Mark the start of the task body. `set` is called exactly once
+        // per `TaskExecution` because `spawn_body` itself runs once.
+        let _ = self.started_at.set(chrono::Local::now());
 
         let handle: JoinHandle<TaskResult> = tokio::spawn(async move {
             let tracing_ctx = TaskTracingCtx {
@@ -396,6 +420,7 @@ impl TaskExecution {
                         *s = TaskStatus::Failed(failure);
                     }
                 }
+                let _ = ended_at_for_body.set(chrono::Local::now());
             }
 
             if let Some(eng) = body_engine.upgrade() {

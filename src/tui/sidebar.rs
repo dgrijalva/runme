@@ -646,6 +646,9 @@ mod tests {
             children: vec![id],
             status: TaskStatus::Setup,
             processes: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            summary: None,
         };
         let task = TaskNode {
             id,
@@ -654,6 +657,9 @@ mod tests {
             children: Vec::new(),
             status,
             processes: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            summary: None,
         };
         let mut map = std::collections::HashMap::new();
         map.insert(TaskId::ROOT, root);
@@ -678,6 +684,9 @@ mod tests {
                     children: Vec::new(),
                     status: status.clone(),
                     processes: Vec::new(),
+                    started_at: None,
+                    ended_at: None,
+                    summary: None,
                 },
             );
         }
@@ -688,6 +697,9 @@ mod tests {
             children,
             status: TaskStatus::Setup,
             processes: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            summary: None,
         };
         map.insert(TaskId::ROOT, root);
         GraphSnapshot {
@@ -753,6 +765,9 @@ mod tests {
             children: Vec::new(),
             status: TaskStatus::Setup,
             processes: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            summary: None,
         };
         let mut map = std::collections::HashMap::new();
         map.insert(TaskId::ROOT, root);
@@ -926,6 +941,9 @@ mod tests {
                 status: ProcessStatus::Done,
                 ready: false,
             }],
+            started_at: None,
+            ended_at: None,
+            summary: None,
         };
         let child = TaskNode {
             id: child_id,
@@ -934,6 +952,9 @@ mod tests {
             children: Vec::new(),
             status: TaskStatus::Done,
             processes: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            summary: None,
         };
         let root = TaskNode {
             id: TaskId::ROOT,
@@ -942,6 +963,9 @@ mod tests {
             children: vec![parent_id],
             status: TaskStatus::Setup,
             processes: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            summary: None,
         };
         map.insert(TaskId::ROOT, root);
         map.insert(parent_id, parent);
@@ -1079,7 +1103,7 @@ mod tests {
 
     #[test]
     fn section_level_includes_headers_and_top_level_tasks() {
-        let entries = vec![
+        let entries = [
             make_entry(SidebarEntryKind::AllTasks, 0, TaskId::ROOT),
             make_entry(SidebarEntryKind::RunningHeader, 0, TaskId::ROOT),
             make_entry(SidebarEntryKind::Task, 0, TaskId(1)),

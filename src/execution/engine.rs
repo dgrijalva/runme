@@ -182,6 +182,15 @@ pub struct TaskNode {
     /// `ProcessInfo` is not `Clone` directly because it owns an
     /// `Arc<Mutex<OutputBuffer>>`; we copy by hand.
     pub processes: Vec<ProcessNodeInfo>,
+    /// Timestamp at which the task body began running. `None` until
+    /// `spawn_body` populates the underlying `OnceLock`.
+    pub started_at: Option<chrono::DateTime<chrono::Local>>,
+    /// Timestamp at which the task reached a terminal status. `None`
+    /// while the task is still running.
+    pub ended_at: Option<chrono::DateTime<chrono::Local>>,
+    /// Optional summary written by the task body via
+    /// `TaskContext::summary`.
+    pub summary: Option<String>,
 }
 
 /// Snapshot-friendly view of a `ProcessInfo`. The buffer Arc is included
@@ -224,6 +233,10 @@ pub struct EngineInternals {
     pub table: StdMutex<HashMap<TaskId, Arc<TaskExecution>>>,
     pub graph_tx: watch::Sender<GraphSnapshot>,
     pub log_store: Arc<Mutex<LogStore>>,
+    /// Engine-global seq generator. Cloned and shared with every
+    /// `OutputBuffer`, `LogEntryLayer`, and producer in the engine so all
+    /// log entries get a strictly-monotonic seq across all sources.
+    pub seq_gen: crate::log::SeqGen,
     pub(crate) control_tx: mpsc::UnboundedSender<Control>,
     /// Receiver slot for the synthetic root's control loop. Set during
     /// `Engine::start`; the root body takes it on first run.
@@ -264,6 +277,9 @@ impl EngineInternals {
                 .iter()
                 .map(ProcessNodeInfo::from_process)
                 .collect();
+            let started_at = exec.started_at.get().copied();
+            let ended_at = exec.ended_at.get().copied();
+            let summary = exec.summary.lock().await.clone();
             tasks.insert(
                 id,
                 TaskNode {
@@ -273,6 +289,9 @@ impl EngineInternals {
                     children: kids,
                     status,
                     processes: procs,
+                    started_at,
+                    ended_at,
+                    summary,
                 },
             );
         }
@@ -305,14 +324,19 @@ impl EngineInternals {
     ) -> Result<TaskHandle, TaskError> {
         let id = TaskId::next();
         let log_store = self.log_store.clone();
+        let seq_gen = self.seq_gen.clone();
         let engine_weak = Arc::downgrade(self);
 
         // Build the execution and wrap in Arc::new_cyclic so the body's
         // TaskContext holds a Weak<TaskExecution> back to its own node
         // (for `ctx.run` → parent.children attachment).
         let exec_arc = {
-            let mut e =
-                TaskExecution::with_log_store_and_engine(id, log_store, engine_weak.clone());
+            let mut e = TaskExecution::with_log_store_and_engine(
+                id,
+                log_store,
+                seq_gen,
+                engine_weak.clone(),
+            );
             e.parent = Some(parent_id);
             e.set_registry(self.registry.clone());
             Arc::new_cyclic(|self_weak| {
@@ -431,6 +455,7 @@ impl EngineInternals {
             if matches!(*s, TaskStatus::Setup | TaskStatus::Ready) {
                 *s = TaskStatus::Cancelled;
             }
+            let _ = exec.ended_at.set(chrono::Local::now());
         }
 
         self.publish_snapshot().await;
@@ -501,6 +526,7 @@ impl EngineInternals {
             if matches!(*s, TaskStatus::Setup | TaskStatus::Ready) {
                 *s = TaskStatus::Timeout;
             }
+            let _ = exec.ended_at.set(chrono::Local::now());
         }
         self.publish_snapshot().await;
     }
@@ -792,7 +818,10 @@ impl Engine {
 
         let (control_tx, control_rx) = mpsc::unbounded_channel::<Control>();
         let (graph_tx, graph_rx) = watch::channel(GraphSnapshot::default());
-        let log_store = Arc::new(Mutex::new(LogStore::new()));
+        // Single engine-global SeqGen: shared with the LogStore and every
+        // OutputBuffer / LogEntryLayer below it.
+        let seq_gen = crate::log::SeqGen::new();
+        let log_store = Arc::new(Mutex::new(LogStore::with_seq_gen(seq_gen.clone())));
 
         // Build the engine internals via Arc::new_cyclic so the root
         // TaskExecution can hold a Weak<EngineInternals>.
@@ -800,6 +829,7 @@ impl Engine {
             let mut root_exec_inner = TaskExecution::with_log_store_and_engine(
                 TaskId::ROOT,
                 log_store.clone(),
+                seq_gen.clone(),
                 engine_weak.clone(),
             );
             root_exec_inner.set_registry(registry.clone());
@@ -815,6 +845,7 @@ impl Engine {
                 table: StdMutex::new(HashMap::new()),
                 graph_tx,
                 log_store: log_store.clone(),
+                seq_gen: seq_gen.clone(),
                 control_tx: control_tx.clone(),
                 control_rx_slot: Mutex::new(Some(control_rx)),
                 registry: registry.clone(),
@@ -984,6 +1015,47 @@ mod tests {
         description: None,
         group: "",
         func: TaskFnKind::Static(spawner_task),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
+    fn summary_task<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.summary("hello");
+            Ok(())
+        })
+    }
+
+    static SUMMARY: TaskDef = TaskDef {
+        name: "summary",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(summary_task),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
+    fn summary_twice_task<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.summary("first");
+            // Ensure the first publish lands before the second writes.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            ctx.summary("second");
+            Ok(())
+        })
+    }
+
+    static SUMMARY_TWICE: TaskDef = TaskDef {
+        name: "summary_twice",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(summary_twice_task),
         arg_metadata: no_args,
         ui_hint: None,
     };
@@ -1379,6 +1451,9 @@ mod tests {
                 children: vec![mid],
                 status: TaskStatus::Setup,
                 processes: vec![],
+                started_at: None,
+                ended_at: None,
+                summary: None,
             },
         );
         tasks.insert(
@@ -1390,6 +1465,9 @@ mod tests {
                 children: vec![leaf],
                 status: TaskStatus::Setup,
                 processes: vec![],
+                started_at: None,
+                ended_at: None,
+                summary: None,
             },
         );
         tasks.insert(
@@ -1401,6 +1479,9 @@ mod tests {
                 children: vec![],
                 status: TaskStatus::Setup,
                 processes: vec![],
+                started_at: None,
+                ended_at: None,
+                summary: None,
             },
         );
         let snap = GraphSnapshot {
@@ -1441,5 +1522,165 @@ mod tests {
             "child should be cancelled after quit; got {:?}",
             child.status
         );
+    }
+
+    // ---- Phase 1: TaskExecution timestamps + summary ----
+
+    #[tokio::test]
+    async fn summary_writes_through_to_snapshot() {
+        let registry = build_registry(&[&SUMMARY]);
+        let (engine, handle) = Engine::start(registry);
+
+        let id = handle
+            .spawn_task(&SUMMARY, vec![])
+            .await
+            .expect("spawn_task should succeed");
+
+        let _ = wait_terminal(&handle, id).await;
+
+        // Wait for the detached publish to land. The body's spawned
+        // summary task and the terminal-status publish race; poll until
+        // the snapshot reflects the write.
+        let mut graph = handle.graph.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = graph.borrow().clone();
+            if let Some(node) = snap.tasks.get(&id)
+                && node.summary.as_deref() == Some("hello")
+            {
+                break;
+            }
+            tokio::select! {
+                _ = graph.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    let snap = handle.graph.borrow().clone();
+                    let summary = snap.tasks.get(&id).and_then(|n| n.summary.clone());
+                    panic!("summary never landed; got {summary:?}");
+                }
+            }
+        }
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn summary_last_write_wins() {
+        let registry = build_registry(&[&SUMMARY_TWICE]);
+        let (engine, handle) = Engine::start(registry);
+
+        let id = handle
+            .spawn_task(&SUMMARY_TWICE, vec![])
+            .await
+            .expect("spawn_task should succeed");
+
+        let _ = wait_terminal(&handle, id).await;
+
+        let mut graph = handle.graph.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = graph.borrow().clone();
+            if let Some(node) = snap.tasks.get(&id)
+                && node.summary.as_deref() == Some("second")
+            {
+                break;
+            }
+            tokio::select! {
+                _ = graph.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    let snap = handle.graph.borrow().clone();
+                    let summary = snap.tasks.get(&id).and_then(|n| n.summary.clone());
+                    panic!("expected last write to win; got {summary:?}");
+                }
+            }
+        }
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn started_at_populates_after_spawn_body() {
+        let registry = build_registry(&[&OK]);
+        let (engine, handle) = Engine::start(registry);
+
+        let id = handle
+            .spawn_task(&OK, vec![])
+            .await
+            .expect("spawn_task should succeed");
+
+        let _ = wait_terminal(&handle, id).await;
+        let snap = handle.graph.borrow().clone();
+        let node = snap.tasks.get(&id).expect("task in graph");
+        assert!(
+            node.started_at.is_some(),
+            "started_at must be set once spawn_body has run"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ended_at_populates_after_done() {
+        let registry = build_registry(&[&OK]);
+        let (engine, handle) = Engine::start(registry);
+
+        let id = handle
+            .spawn_task(&OK, vec![])
+            .await
+            .expect("spawn_task should succeed");
+
+        let _ = wait_terminal(&handle, id).await;
+
+        // The terminal status writer also publishes; poll briefly.
+        let mut graph = handle.graph.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = graph.borrow().clone();
+            if let Some(node) = snap.tasks.get(&id)
+                && node.ended_at.is_some()
+            {
+                break;
+            }
+            tokio::select! {
+                _ = graph.changed() => {}
+                _ = tokio::time::sleep_until(deadline) => {
+                    panic!("ended_at never populated for Done task");
+                }
+            }
+        }
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ended_at_populates_after_cancel() {
+        let registry = build_registry(&[&SLOW]);
+        let (engine, handle) = Engine::start(registry);
+
+        let id = handle
+            .spawn_task(&SLOW, vec![])
+            .await
+            .expect("spawn_task should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        handle
+            .kill_task(id, KillSignal::Term)
+            .await
+            .expect("kill_task should succeed");
+
+        let _ = wait_terminal(&handle, id).await;
+
+        let snap = handle.graph.borrow().clone();
+        let node = snap.tasks.get(&id).expect("task in graph");
+        assert!(
+            node.ended_at.is_some(),
+            "ended_at must be set after cancellation"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
     }
 }
