@@ -1,14 +1,13 @@
 mod codegen;
 mod compile;
 mod crate_name;
-mod discover;
 mod frontmatter;
 mod init;
 mod transform;
 
 use compile::compile_workspace;
-use discover::discover;
 use init::{InitOutcome, run_init};
+use rnme::discover::discover;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -39,11 +38,11 @@ fn main() {
     }
 
     // `--mcp` short-circuits compilation entirely. The supervisor runs in
-    // this outer process, owns stdio (rmcp will plug in during phase 6),
-    // and spawns child engines by re-entering `current_exe()` with
-    // `--engine`. From the child's perspective, that re-entry hits this
-    // same `main.rs`, which falls through to the normal discover+compile
-    // path with `--engine` in the pass-through args.
+    // this outer process, owns stdio for the rmcp service, and spawns
+    // child engines by re-entering `current_exe()` with `--engine`. From
+    // the child's perspective, that re-entry hits this same `main.rs`,
+    // which falls through to the normal discover+compile path with
+    // `--engine` in the pass-through args.
     //
     // We accept `--mcp` anywhere in argv (not just position 1) so it can
     // coexist with the other RnmeArgs flags the runner consumes. clap is

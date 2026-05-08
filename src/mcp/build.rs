@@ -21,11 +21,12 @@
 //!   pipeline transparently. A `cargo build` failure surfaces here as
 //!   `SpawnError::EngineExited(stderr)` and is captured into
 //!   `BuildState::LastBuildFailed`.
-//! - **Tool routing.** Phase 6 wires this module up to the rmcp tool
-//!   surface — spawn-shaped tools call [`crate::mcp::supervisor::Supervisor::check_can_spawn`]
-//!   before forwarding; existing-state tools bypass it.
+//! - **Tool routing.** The rmcp tool surface uses
+//!   [`crate::mcp::supervisor::Supervisor::check_can_spawn`] as a gate
+//!   before forwarding spawn-shaped requests; existing-state tools
+//!   bypass it.
 //!
-//! # Architectural decisions (locked in plan G0)
+//! # Generation rules
 //!
 //! - Generations that have hosted at least one task live forever for the
 //!   MCP session.

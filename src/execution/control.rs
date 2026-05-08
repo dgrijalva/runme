@@ -20,19 +20,20 @@ use super::TaskId;
 
 /// Errors produced by the engine in response to control messages.
 ///
-/// Public because it surfaces through `EngineHandle::*` methods (slice 4).
+/// Public because it surfaces through `EngineHandle::*` methods.
 ///
 /// `TaskError` does not currently implement `std::error::Error`, so the
 /// `Task` variant carries it without `#[from]`. A future cleanup pass
 /// can flip that on once `TaskError` gains the impl.
 //
-// TODO(i-engine-server): EngineError carries TaskError, which intentionally
-// does not implement Serialize/Deserialize (it conflicts with the blanket
-// `From<T: Serialize>` impl). For wire purposes we serialize the `Task`
-// variant as a string (its `Display` form) and deserialize it back into a
-// stringified TaskError. The supervisor is the only consumer right now and
-// does not need to round-trip the structured `output_json`. When that
-// changes, refactor TaskError to expose a serde-friendly snapshot type.
+// EngineError carries TaskError, which intentionally does not implement
+// Serialize/Deserialize (it conflicts with the blanket `From<T:
+// Serialize>` impl). For wire purposes we serialize the `Task` variant as
+// a string (its `Display` form) and deserialize it back into a
+// stringified TaskError — see the manual serde impls below. The
+// supervisor is the only wire consumer today and does not need to
+// round-trip the structured `output_json`. If that changes, refactor
+// TaskError to expose a serde-friendly snapshot type.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("engine is shutting down")]
@@ -65,7 +66,7 @@ impl Clone for EngineError {
 // (the Display form). On deserialize, we rebuild a `TaskError` via
 // `TaskError::from_display`. This loses the structured `output_json` and
 // `ExitHint::Code` precision, but is enough for the wire protocol's error
-// reporting use case in Phase 2.
+// reporting use case.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 enum EngineErrorWire {

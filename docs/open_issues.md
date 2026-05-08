@@ -42,6 +42,25 @@
 - _Assessment:_ Existing `src/tracing_layer.rs` already does source attribution for the log engine. The macro just needs to capture the current `tracing::Span` (or whatever context the layer keys on) and `.instrument()` the spawned future — standard tracing-tokio pattern. Likely a thin `macro_rules!` is enough; no proc macro needed unless we want to also rewrite the body. Prelude export keeps it ergonomic from RUNME.rs files
 - _Open questions:_ Does this wrap `tokio::spawn` only, or also `ctx.spawn()` (process spawn)? They're different beasts — process spawn already has source attribution via the runner; the gap is in-process `tokio::spawn` for ad-hoc async work inside a task. Probably this macro is specifically for the latter
 
+## Speed up runner build time
+
+**15:16** — Build time of the generated runner crate is the dominant contributor to launch time. Already building in debug. Application perf doesn't matter — `rnme` is a supervisor. Look at what Bevy recommends for fast iteration builds and pull what applies.
+
+- _Effort:_ Small per-knob, but the search space is wide — likely a series of experiments rather than one fix. Some options need a Linux-only path (mold/lld) so cross-platform care matters
+- _Assessment:_ Generated workspace in `src/bin/rnme/` currently does a vanilla `cargo build` with no custom `[profile.dev]` overrides (no `opt-level`, `codegen-units`, `debug`, `lto`, `incremental` set in the generated `Cargo.toml`). Lots of headroom. Concrete levers worth trying, roughly in order of expected ROI:
+    - **`debug = 0`** (or `"line-tables-only"`) in the generated dev profile — debuginfo is a huge fraction of debug-build wall time and we don't run a debugger on the runner
+    - **`codegen-units = 256`** for the runner crate — already the default in dev (256), but verify; pin it explicitly so a user-level config can't override
+    - **Cranelift backend** (`-Zcodegen-backend=cranelift` on nightly, or stable via `cargo-codegen-backend`) — Bevy's biggest single-knob win for dev builds, often 30-50% faster codegen
+    - **`rnme` as `dylib`** — Bevy's `dynamic_linking` trick. The runner depends on `rnme` (the library); link it dynamically so each rebuild only relinks the runner, not the whole `rnme` crate graph
+    - **`share-generics = true`** (`-Zshare-generics=y`) — less monomorphization duplication across the workspace's lib crates
+    - **Faster linker** — `lld` on macOS (already default-ish on recent Xcode), `mold` on Linux. `rustflags = ["-C", "link-arg=-fuse-ld=lld"]` in the generated `.cargo/config.toml`
+    - **`incremental = true`** — already default in dev, but double-check we're not accidentally disabling it via env (e.g. `CARGO_INCREMENTAL=0` from somewhere)
+    - **Strip the runner crate down** — anything we can move from per-RUNME-lib-crate compile work into `rnme` core (compiled once, cached forever) is pure win
+    - **Persistent target cache** — already cache-dir-keyed; verify nothing invalidates it on every run (e.g. timestamp-bumping a generated source file with identical content)
+    - **Pre-warmed `rnme` crate** — ship a precompiled `rnme` rlib that the runner workspace just links against, so first-time-after-version-bump pain is bounded
+- _Concern:_ Some knobs are nightly-only (`-Z share-generics`, cranelift via `-Z`). Acceptable for `rnme` since we already require nightly for edition 2024. Linker choice needs OS-specific config in the generated `.cargo/config.toml`
+- _Inspiration:_ Bevy's "fast compiles" config (https://bevy.org/learn/quick-start/getting-started/setup/), the Rust compile-time perf book
+
 ## Carriage return (`\r`) progress output corrupts log display
 
 Commands that use `\r` to update a progress line in-place (e.g., `aws s3 cp`, `curl` progress bars) produce garbled output in the TUI log viewer. The record parser splits on `\n` but `\r`-delimited progress chunks don't end with `\n`, resulting in partial line overwrites rendering as separate log entries that stomp on each other.

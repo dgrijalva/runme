@@ -412,7 +412,6 @@ mod tests {
     use super::*;
     use crate::execution::TaskId;
     use crate::execution::engine::{GraphSnapshot, ProcessNodeInfo, TaskNode};
-    use crate::execution::execution::{ProcessStatus, TaskStatus};
 
     // --- Address::parse ---
 
@@ -559,26 +558,20 @@ mod tests {
     ) -> TaskNode {
         TaskNode {
             id,
-            name: name.to_string(),
+            name: name.into(),
             parent,
             children,
-            status: TaskStatus::Setup,
             processes,
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..Default::default()
         }
     }
 
     fn make_proc(id: TaskId, label: &str) -> ProcessNodeInfo {
         ProcessNodeInfo {
             id,
-            task_name: "task".to_string(),
-            command_label: label.to_string(),
-            pid: None,
-            pgid: None,
-            status: ProcessStatus::Running,
-            ready: false,
+            task_name: "task".into(),
+            command_label: label.into(),
+            ..Default::default()
         }
     }
 

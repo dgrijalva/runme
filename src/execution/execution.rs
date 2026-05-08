@@ -259,7 +259,7 @@ pub struct TaskExecution {
     pub task_def: Option<&'static TaskDef>,
     pub task_args: Vec<String>,
 
-    // ── Reporting (Phase 1: timestamps + summary) ─────────────────
+    // ── Reporting (timestamps + summary) ──────────────────────────
     /// Timestamp at which the task body began running. Set exactly once
     /// in `spawn_body` immediately before the body's tokio task is
     /// launched. `OnceLock::get()` returns `None` until set.

@@ -607,16 +607,10 @@ mod tests {
     /// stored entries satisfy the engine-global "seq != 0" invariant.
     fn make_entry(source: TaskId, seq: u64, raw: &str) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
-            raw: raw.to_string(),
-            parsed: ParsedContent::PlainText,
+            raw: raw.into(),
             source,
             seq: seq + 1,
-            timestamp: None,
-            level: None,
-            message: None,
-            fields: HashMap::new(),
-            stream: None,
+            ..Default::default()
         }
     }
 
@@ -624,16 +618,11 @@ mod tests {
     /// [`make_entry`].
     fn make_entry_with_level(source: TaskId, seq: u64, raw: &str, level: &str) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
-            raw: raw.to_string(),
-            parsed: ParsedContent::PlainText,
+            raw: raw.into(),
             source,
             seq: seq + 1,
-            timestamp: None,
-            level: Some(level.to_string()),
-            message: None,
-            fields: HashMap::new(),
-            stream: None,
+            level: Some(level.into()),
+            ..Default::default()
         }
     }
 

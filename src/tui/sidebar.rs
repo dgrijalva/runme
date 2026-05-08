@@ -640,26 +640,16 @@ mod tests {
 
     fn snap_with_one_task(id: TaskId, name: &str, status: TaskStatus) -> GraphSnapshot {
         let root = TaskNode {
-            id: TaskId::ROOT,
-            name: "<root>".to_string(),
-            parent: None,
+            name: "<root>".into(),
             children: vec![id],
-            status: TaskStatus::Setup,
-            processes: Vec::new(),
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..Default::default()
         };
         let task = TaskNode {
             id,
-            name: name.to_string(),
+            name: name.into(),
             parent: Some(TaskId::ROOT),
-            children: Vec::new(),
             status,
-            processes: Vec::new(),
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..Default::default()
         };
         let mut map = std::collections::HashMap::new();
         map.insert(TaskId::ROOT, root);
@@ -679,27 +669,17 @@ mod tests {
                 *id,
                 TaskNode {
                     id: *id,
-                    name: (*name).to_string(),
+                    name: (*name).into(),
                     parent: Some(TaskId::ROOT),
-                    children: Vec::new(),
                     status: status.clone(),
-                    processes: Vec::new(),
-                    started_at: None,
-                    ended_at: None,
-                    summary: None,
+                    ..Default::default()
                 },
             );
         }
         let root = TaskNode {
-            id: TaskId::ROOT,
-            name: "<root>".to_string(),
-            parent: None,
+            name: "<root>".into(),
             children,
-            status: TaskStatus::Setup,
-            processes: Vec::new(),
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..Default::default()
         };
         map.insert(TaskId::ROOT, root);
         GraphSnapshot {
@@ -759,15 +739,8 @@ mod tests {
     fn build_entries_just_section_headers_when_root_has_no_children() {
         let mut sc = SourceColors::new();
         let root = TaskNode {
-            id: TaskId::ROOT,
-            name: "<root>".to_string(),
-            parent: None,
-            children: Vec::new(),
-            status: TaskStatus::Setup,
-            processes: Vec::new(),
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            name: "<root>".into(),
+            ..Default::default()
         };
         let mut map = std::collections::HashMap::new();
         map.insert(TaskId::ROOT, root);
@@ -928,44 +901,30 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         let parent = TaskNode {
             id: parent_id,
-            name: "web".to_string(),
+            name: "web".into(),
             parent: Some(TaskId::ROOT),
             children: vec![child_id],
             status: TaskStatus::Done,
             processes: vec![crate::execution::ProcessNodeInfo {
                 id: proc_id,
-                task_name: "web".to_string(),
-                command_label: "cargo run".to_string(),
-                pid: None,
-                pgid: None,
+                task_name: "web".into(),
+                command_label: "cargo run".into(),
                 status: ProcessStatus::Done,
-                ready: false,
+                ..Default::default()
             }],
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..Default::default()
         };
         let child = TaskNode {
             id: child_id,
-            name: "subtask".to_string(),
+            name: "subtask".into(),
             parent: Some(parent_id),
-            children: Vec::new(),
             status: TaskStatus::Done,
-            processes: Vec::new(),
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..Default::default()
         };
         let root = TaskNode {
-            id: TaskId::ROOT,
-            name: "<root>".to_string(),
-            parent: None,
+            name: "<root>".into(),
             children: vec![parent_id],
-            status: TaskStatus::Setup,
-            processes: Vec::new(),
-            started_at: None,
-            ended_at: None,
-            summary: None,
+            ..Default::default()
         };
         map.insert(TaskId::ROOT, root);
         map.insert(parent_id, parent);

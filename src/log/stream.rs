@@ -191,7 +191,6 @@ pub async fn export_jsonl_async(
 mod tests {
     use super::*;
     use crate::log::ParsedContent;
-    use std::collections::HashMap;
 
     /// Encode a string source name as a TaskId for tests; uses a stable hash
     /// so existing assertions on `entry.source == ...` keep working when
@@ -209,16 +208,10 @@ mod tests {
     /// stored entries satisfy the engine-global "seq != 0" invariant.
     fn make_entry(source: &str, seq: u64, raw: &str) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
-            raw: raw.to_string(),
-            parsed: ParsedContent::PlainText,
+            raw: raw.into(),
             source: tid(source),
             seq: seq + 1,
-            timestamp: None,
-            level: None,
-            message: None,
-            fields: HashMap::new(),
-            stream: None,
+            ..Default::default()
         }
     }
 
@@ -232,16 +225,12 @@ mod tests {
         message: Option<&str>,
     ) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
-            raw: raw.to_string(),
-            parsed: ParsedContent::PlainText,
+            raw: raw.into(),
             source: tid(source),
             seq: seq + 1,
-            timestamp: None,
-            level: level.map(|s| s.to_string()),
-            message: message.map(|s| s.to_string()),
-            fields: HashMap::new(),
-            stream: None,
+            level: level.map(str::to_string),
+            message: message.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -249,16 +238,13 @@ mod tests {
     /// shift as [`make_entry`].
     fn make_json_entry(source: &str, seq: u64, raw: &str, json: serde_json::Value) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
-            raw: raw.to_string(),
+            raw: raw.into(),
             parsed: ParsedContent::Json(json.clone()),
             source: tid(source),
             seq: seq + 1,
-            timestamp: None,
             level: json.get("level").and_then(|v| v.as_str()).map(String::from),
             message: json.get("msg").and_then(|v| v.as_str()).map(String::from),
-            fields: HashMap::new(),
-            stream: None,
+            ..Default::default()
         }
     }
 

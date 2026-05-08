@@ -9,8 +9,9 @@
 //! the variants below.
 //!
 //! Wire framing rule: every `WireMessage` serializes to a single line of
-//! JSON (no embedded `\n`). The transport layer (Phase 2 sibling slice)
-//! is the only place that calls `serde_json::to_string` / `from_str`.
+//! JSON (no embedded `\n`). The transport layer
+//! ([`crate::mcp::transport`]) is the only place that calls
+//! `serde_json::to_string` / `from_str`.
 
 use serde::{Deserialize, Serialize};
 
@@ -246,7 +247,6 @@ mod tests {
                 id: TaskId(1),
                 name: "build".into(),
                 parent: Some(TaskId::ROOT),
-                children: vec![],
                 status: TaskStatus::Ready,
                 processes: vec![ProcessNodeInfo {
                     id: TaskId(2),
@@ -258,8 +258,8 @@ mod tests {
                     ready: true,
                 }],
                 started_at: Some(chrono::Local::now()),
-                ended_at: None,
                 summary: Some("ok".into()),
+                ..Default::default()
             },
         );
         GraphSnapshot {

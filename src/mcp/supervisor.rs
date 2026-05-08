@@ -3,13 +3,14 @@
 //! The supervisor runs in the *outer* `rnme` process when the user invokes
 //! `rnme --mcp`. It owns one or more child engine generations
 //! (`rnme --engine` subprocesses), demuxes wire protocol traffic over each
-//! generation's TCP connection, and exposes a small async API the Phase 6
-//! tool surface will plug into.
+//! generation's TCP connection, and exposes a small async API that the
+//! rmcp tool surface in [`crate::mcp::tools`] plugs into.
 //!
 //! # Generation lifecycle
 //!
 //! - Generations are spawned by [`Supervisor::spawn_initial_generation`]
-//!   (Phase 4) or [`Supervisor::rotate_latest`] (stub for Phase 5).
+//!   at startup or [`Supervisor::rotate_latest`] when the file watcher
+//!   in [`crate::mcp::build`] fires.
 //! - The first gen always becomes the latest. New top-level spawns route
 //!   to the latest gen.
 //! - Generations whose tasks have all completed STAY ALIVE; their
@@ -19,13 +20,7 @@
 //!   (no logs of value).
 //! - Cleanup happens on supervisor drop / `shutdown` — closing the writer
 //!   channel drops the TCP write half; the engine sees EOF and cleans
-//!   itself up via the Phase 1 disconnect path.
-//!
-//! # No file watcher / build state machine here
-//!
-//! Phase 5 (`i-build-state`) will drive `rotate_latest` from a debounced
-//! file-watcher and add the `BuildState` machine. This slice ships only
-//! the supervisor primitives.
+//!   itself up via its disconnect path.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -127,7 +122,7 @@ pub async fn run() {
 }
 
 /// Install a stderr-only `tracing-subscriber`. Required because rmcp
-/// (Phase 6) owns stdout — any stdout writes corrupt JSON-RPC framing.
+/// owns stdout — any stdout writes corrupt JSON-RPC framing.
 fn install_stderr_tracing() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::{EnvFilter, Layer};
@@ -589,8 +584,8 @@ impl Supervisor {
         }
     }
 
-    /// Spawn-shaped tool guard. Phase 6's `spawn_task` / `list_tasks` /
-    /// `run_task` call this before forwarding to the latest gen.
+    /// Spawn-shaped tool guard. The MCP `spawn_task` / `list_tasks` /
+    /// `run_task` tools call this before forwarding to the latest gen.
     ///
     /// - `Idle` → `Ok(())`, proceed.
     /// - `Rebuilding` → wait on `build_state_changed`, then re-check
@@ -943,9 +938,10 @@ fn spawn_reader(
                         subscription_id,
                         entry,
                     }) => {
-                        // TODO(phase 6): forward log events to MCP clients
-                        // through whatever subscription dispatch the tool
-                        // surface ends up using.
+                        // TODO: forward Event::Log to MCP clients once the
+                        // tool surface exposes a streaming subscription.
+                        // Today the supervisor opens no SubscribeLogs of
+                        // its own, so any frame here is unsolicited.
                         let _ = (subscription_id, entry);
                     }
                     WireMessage::Request { .. } => {

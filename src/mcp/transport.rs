@@ -190,7 +190,6 @@ mod tests {
                 id: TaskId(1),
                 name: "build".into(),
                 parent: Some(TaskId::ROOT),
-                children: vec![],
                 status: TaskStatus::Ready,
                 processes: vec![ProcessNodeInfo {
                     id: TaskId(2),
@@ -202,8 +201,8 @@ mod tests {
                     ready: true,
                 }],
                 started_at: Some(chrono::Local::now()),
-                ended_at: None,
                 summary: Some("ok".into()),
+                ..Default::default()
             },
         );
         GraphSnapshot {

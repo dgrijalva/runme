@@ -123,6 +123,31 @@ pub struct LogEntry {
     pub stream: Option<Stream>,
 }
 
+impl Default for LogEntry {
+    /// Conservative defaults suitable for test fixtures: empty `raw`,
+    /// `PlainText` parsed, `TaskId::ROOT` source, seq 0, `received_at`
+    /// = now (UTC), no stream / level / message / timestamp / fields.
+    /// Use struct-update syntax to override what your test cares about:
+    ///
+    /// ```ignore
+    /// LogEntry { source: TaskId(1), seq: 1, raw: "tick".into(), ..Default::default() }
+    /// ```
+    fn default() -> Self {
+        Self {
+            raw: String::new(),
+            parsed: ParsedContent::PlainText,
+            source: TaskId::ROOT,
+            seq: 0,
+            received_at: Utc::now(),
+            timestamp: None,
+            level: None,
+            message: None,
+            fields: HashMap::new(),
+            stream: None,
+        }
+    }
+}
+
 impl LogEntry {
     /// Create a new LogEntry with `received_at` set to now.
     #[allow(clippy::too_many_arguments)]

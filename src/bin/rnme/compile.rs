@@ -7,9 +7,9 @@ use sha2::{Digest, Sha256};
 
 use crate::codegen::{CrateEntry, generate_runner_main};
 use crate::crate_name::crate_name_from_path;
-use crate::discover::DiscoveryResult;
 use crate::frontmatter::{parse_frontmatter, rewrite_path_deps};
 use crate::transform::transform_source;
+use rnme::discover::DiscoveryResult;
 
 /// Result of compiling a RUNME.rs file.
 #[derive(Debug)]

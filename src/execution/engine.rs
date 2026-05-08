@@ -218,6 +218,29 @@ pub struct TaskNode {
     pub summary: Option<String>,
 }
 
+impl Default for TaskNode {
+    /// Convenience default for test fixtures: ROOT id, empty name, no
+    /// parent / children / processes, `Setup` status, no timestamps,
+    /// no summary. Use struct-update syntax to override what you need:
+    ///
+    /// ```ignore
+    /// TaskNode { id: TaskId(42), name: "build".into(), ..Default::default() }
+    /// ```
+    fn default() -> Self {
+        Self {
+            id: TaskId::ROOT,
+            name: String::new(),
+            parent: None,
+            children: Vec::new(),
+            status: super::execution::TaskStatus::Setup,
+            processes: Vec::new(),
+            started_at: None,
+            ended_at: None,
+            summary: None,
+        }
+    }
+}
+
 /// Snapshot-friendly view of a `ProcessInfo`. The buffer Arc is included
 /// so consumers can subscribe; the rest is the displayable lifecycle
 /// state.
@@ -231,6 +254,21 @@ pub struct ProcessNodeInfo {
     pub pgid: Option<i32>,
     pub status: super::execution::ProcessStatus,
     pub ready: bool,
+}
+
+impl Default for ProcessNodeInfo {
+    /// Convenience default for test fixtures.
+    fn default() -> Self {
+        Self {
+            id: TaskId::ROOT,
+            task_name: String::new(),
+            command_label: String::new(),
+            pid: None,
+            pgid: None,
+            status: super::execution::ProcessStatus::Running,
+            ready: false,
+        }
+    }
 }
 
 impl ProcessNodeInfo {
@@ -1530,11 +1568,7 @@ mod tests {
                 name: "top".into(),
                 parent: Some(TaskId::ROOT),
                 children: vec![mid],
-                status: TaskStatus::Setup,
-                processes: vec![],
-                started_at: None,
-                ended_at: None,
-                summary: None,
+                ..Default::default()
             },
         );
         tasks.insert(
@@ -1544,11 +1578,7 @@ mod tests {
                 name: "mid".into(),
                 parent: Some(top),
                 children: vec![leaf],
-                status: TaskStatus::Setup,
-                processes: vec![],
-                started_at: None,
-                ended_at: None,
-                summary: None,
+                ..Default::default()
             },
         );
         tasks.insert(
@@ -1557,12 +1587,7 @@ mod tests {
                 id: leaf,
                 name: "leaf".into(),
                 parent: Some(mid),
-                children: vec![],
-                status: TaskStatus::Setup,
-                processes: vec![],
-                started_at: None,
-                ended_at: None,
-                summary: None,
+                ..Default::default()
             },
         );
         let snap = GraphSnapshot {
@@ -1605,7 +1630,7 @@ mod tests {
         );
     }
 
-    // ---- Phase 1: TaskExecution timestamps + summary ----
+    // ---- TaskExecution timestamps + summary ----
 
     #[tokio::test]
     async fn summary_writes_through_to_snapshot() {

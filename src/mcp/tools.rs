@@ -156,7 +156,7 @@ pub struct GrepLogsParams {
     pub scope: Option<String>,
 }
 
-/// Parameters for [`McpServer::install_skills`] (Phase 7 stub).
+/// Parameters for [`McpServer::install_skills`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InstallSkillsParams {
     /// Target directory under which a `rnme/` namespace is created.
@@ -406,7 +406,12 @@ impl McpServer {
         Ok(CallToolResult::structured(value))
     }
 
-    /// (Phase 7 stub.) Install agent-facing skill docs into a target dir.
+    /// Install agent-facing skill docs into a target dir.
+    ///
+    /// Currently unimplemented; returns an error. The skill content
+    /// lives in `docs/manual/` and the install layout is still being
+    /// designed — until then, copy the directories into your skills
+    /// path manually.
     #[tool]
     pub async fn install_skills(
         &self,
@@ -414,7 +419,7 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         Err(McpError::new(
             ErrorCode::INTERNAL_ERROR,
-            "install_skills will be implemented in Phase 7",
+            "install_skills is not yet implemented",
             None,
         ))
     }

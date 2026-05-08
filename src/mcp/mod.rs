@@ -1,9 +1,17 @@
 //! MCP frontend module.
 //!
-//! This module hosts the supervisor↔engine wire protocol and (in later
-//! phases) the supervisor agent. Phase 2 lands [`wire`] — pure types
-//! with serde derives. The transport adapter is a sibling slice; the
-//! engine server, supervisor, and agent come in later phases.
+//! - [`wire`] — pure protocol types with serde derives.
+//! - [`transport`] — JSONL-framed `Send`/`Recv` over a TCP loopback stream.
+//! - [`engine_server`] — `--engine` daemon: an embedded engine that serves
+//!   the wire protocol on a single supervisor connection.
+//! - [`supervisor`] — `--mcp` outer-driver entry: spawns engine generations,
+//!   routes RPC by dotted address, exposes the high-level API the rmcp tool
+//!   surface plugs into.
+//! - [`build`] — file-watcher and `BuildState` machine driving generation
+//!   rotation on edits.
+//! - [`routing`] — dotted-address parser and per-gen routing table.
+//! - [`report`] — human-readable task report renderer.
+//! - [`tools`] — the rmcp `ServerHandler` exposing every MCP tool.
 //!
 //! See `docs/mcp_design.md` for the full design.
 

@@ -5,10 +5,10 @@
 //! and produces the report string defined in `docs/mcp_design.md`
 //! § "Task report" → "Format".
 //!
-//! The renderer does no I/O. The caller (Phase 6's MCP tool layer) is
-//! responsible for fetching the snapshot and the relevant log entries —
-//! either directly through an `EngineHandle`, or over the supervisor↔
-//! engine wire — and handing them in.
+//! The renderer does no I/O. The caller (the MCP tool layer in
+//! [`crate::mcp::tools`]) is responsible for fetching the snapshot and
+//! the relevant log entries — either directly through an `EngineHandle`,
+//! or over the supervisor↔engine wire — and handing them in.
 
 use std::collections::HashSet;
 
@@ -230,18 +230,15 @@ mod tests {
         status: TaskStatus,
         summary: Option<String>,
     ) -> TaskNode {
-        let started = Local::now() - Duration::seconds(10);
-        let ended = Local::now();
         TaskNode {
             id,
             name: name.into(),
             parent,
-            children: vec![],
             status,
-            processes: vec![],
-            started_at: Some(started),
-            ended_at: Some(ended),
+            started_at: Some(Local::now() - Duration::seconds(10)),
+            ended_at: Some(Local::now()),
             summary,
+            ..Default::default()
         }
     }
 
@@ -256,31 +253,24 @@ mod tests {
 
     fn make_entry(source: TaskId, seq: u64, raw: &str, stream: Option<Stream>) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
-            raw: raw.to_string(),
-            parsed: ParsedContent::PlainText,
+            raw: raw.into(),
             source,
             seq,
-            timestamp: None,
-            level: None,
-            message: Some(raw.to_string()),
-            fields: HashMap::new(),
+            message: Some(raw.into()),
             stream,
+            ..Default::default()
         }
     }
 
     fn make_json_entry(source: TaskId, seq: u64, stream: Stream) -> LogEntry {
         LogEntry {
-            received_at: chrono::Utc::now(),
             raw: r#"{"k":"v"}"#.into(),
             parsed: ParsedContent::Json(serde_json::json!({"k":"v"})),
             source,
             seq,
-            timestamp: None,
-            level: None,
             message: Some("k=v".into()),
-            fields: HashMap::new(),
             stream: Some(stream),
+            ..Default::default()
         }
     }
 
