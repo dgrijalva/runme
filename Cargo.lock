@@ -1213,6 +1213,7 @@ dependencies = [
  "rmcp",
  "rnme-macros",
  "rnme-test-tasks",
+ "schemars",
  "serde",
  "serde_json",
  "sha2",

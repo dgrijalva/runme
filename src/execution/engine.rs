@@ -149,6 +149,31 @@ impl GraphSnapshot {
             .unwrap_or(false)
     }
 
+    /// Collect every source id (task + process) reachable from `root`,
+    /// including `root` itself if it is a task in the snapshot. Walks
+    /// the subtree via `TaskNode.children` and each task's `processes`.
+    ///
+    /// Used by frontends that need a flat list of `LogStore` sources to
+    /// query (e.g. the MCP task report renderer's stdout/stderr/event
+    /// counts).
+    pub fn descendant_source_ids(&self, root: TaskId) -> std::collections::HashSet<TaskId> {
+        let mut out = std::collections::HashSet::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            let Some(node) = self.tasks.get(&id) else {
+                continue;
+            };
+            out.insert(node.id);
+            for proc in &node.processes {
+                out.insert(proc.id);
+            }
+            for &child in &node.children {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
     /// Returns a map from every TaskId in the graph (tasks + processes)
     /// to its display label. For tasks, the label is the task name.
     /// For processes, the label is the command_label (falling back to

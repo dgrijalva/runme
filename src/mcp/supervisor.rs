@@ -33,12 +33,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use rmcp::ServiceExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::execution::{GraphSnapshot, KillSignal, SpawnOptions, TaskId};
+use crate::task::TaskInfo;
 use crate::mcp::build::{
     BuildState, BuildStatusInfo, FAILURE_HEAD_LINES, WatchSet, WatchSetSetup, head_of_failure,
 };
@@ -56,12 +58,9 @@ use crate::mcp::wire::{
 // ---------------------------------------------------------------------------
 
 /// Outer-driver entry. Initializes stderr-only tracing, builds the
-/// supervisor, brings up the file watcher, holds it open until stdin
-/// closes (driving any debounced rebuild signals along the way), then
-/// shuts down.
-///
-/// Phase 6 will replace the stdin-EOF wait with the rmcp service loop;
-/// the rebuild-signal arm of the select! moves into the same task.
+/// supervisor, brings up the file watcher, hands the supervisor to rmcp's
+/// stdio service loop, and concurrently drives debounced rebuild signals.
+/// Returns when the MCP peer disconnects.
 pub async fn run() {
     install_stderr_tracing();
 
@@ -81,42 +80,46 @@ pub async fn run() {
         tracing::warn!("supervisor: file watcher failed to start: {e}");
     }
 
-    // Drive: rebuild signals fire `handle_rebuild_signal`; stdin EOF
-    // breaks the loop and triggers shutdown. We `take()` the receiver
-    // so we own it locally and don't fight `&mut self`.
+    // Take the rebuild receiver out so we can drive it from a sibling
+    // task without fighting `&mut self` against the rmcp service.
     let mut rebuild_rx = supervisor.take_rebuild_rx();
-    let mut stdin_buf = Vec::new();
-    let mut stdin = tokio::io::stdin();
 
-    loop {
-        tokio::select! {
-            biased;
-            sig = async {
-                match rebuild_rx.as_mut() {
-                    Some(rx) => rx.recv().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                match sig {
-                    Some(()) => {
-                        if let Err(e) = supervisor.handle_rebuild_signal().await {
-                            tracing::error!("supervisor: rebuild driver error: {e}");
-                        }
-                    }
-                    None => {
-                        // Channel closed → watcher is gone; stop polling.
-                        rebuild_rx = None;
-                    }
-                }
-            }
-            res = stdin.read_to_end(&mut stdin_buf) => {
-                let _ = res;
-                break;
+    // Wrap the supervisor in the rmcp service object. The service holds
+    // an `Arc<Mutex<Supervisor>>` we can also use for the rebuild driver.
+    let server = crate::mcp::tools::McpServer::new(supervisor);
+    let supervisor_handle = server.supervisor();
+
+    // Sibling task: drain rebuild signals, drive `handle_rebuild_signal`.
+    let rebuild_driver = tokio::spawn(async move {
+        let Some(mut rx) = rebuild_rx.take() else {
+            return;
+        };
+        while let Some(()) = rx.recv().await {
+            let mut sup = supervisor_handle.lock().await;
+            if let Err(e) = sup.handle_rebuild_signal().await {
+                tracing::error!("supervisor: rebuild driver error: {e}");
             }
         }
+    });
+
+    // Hand the service to rmcp's stdio transport and block until peer EOF.
+    let running = match server.serve(rmcp::transport::stdio()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("rmcp serve failed: {e}");
+            rebuild_driver.abort();
+            std::process::exit(1);
+        }
+    };
+    let quit_reason = running.waiting().await;
+    if let Err(e) = quit_reason {
+        tracing::warn!("rmcp service exited with error: {e:?}");
     }
 
-    supervisor.shutdown().await;
+    rebuild_driver.abort();
+    // The rmcp `RunningService` wraps our supervisor in an Arc; once
+    // the `running` future resolves, all clones drop and the supervisor's
+    // generations close their writer channels via `Drop`.
 }
 
 /// Install a stderr-only `tracing-subscriber`. Required because rmcp
@@ -708,6 +711,47 @@ impl Supervisor {
 
         let dotted = Address::render_task(task_id.0, task_id.0);
         Ok((dotted, initial_seq))
+    }
+
+    /// List tasks registered on the latest gen. Uses `Request::ListTasks`.
+    pub async fn list_tasks(&self) -> Result<Vec<TaskInfo>, RpcError> {
+        let gen_id = self.latest_gen.ok_or_else(|| {
+            RpcError::Internal("no live generation to list against".to_string())
+        })?;
+        let resp = self.request_gen(gen_id, Request::ListTasks).await?;
+        match resp {
+            Response::ListTasks(tasks) => Ok(tasks),
+            other => Err(RpcError::Internal(format!(
+                "unexpected response to ListTasks: {other:?}"
+            ))),
+        }
+    }
+
+    /// Forward `Request::KillAll` to the latest gen.
+    pub async fn kill_all(&self) -> Result<(), RpcError> {
+        let gen_id = self.latest_gen.ok_or_else(|| {
+            RpcError::Internal("no live generation to kill_all on".to_string())
+        })?;
+        let resp = self.request_gen(gen_id, Request::KillAll).await?;
+        match resp {
+            Response::KillAll => Ok(()),
+            other => Err(RpcError::Internal(format!(
+                "unexpected response to KillAll: {other:?}"
+            ))),
+        }
+    }
+
+    /// Fetch the cached `GraphSnapshot` for the gen owning the given
+    /// dotted address. Returns `None` if the address's `<top>` is
+    /// unknown / retired, or if the owning gen has not yet pushed its
+    /// first `Event::Graph`.
+    pub async fn latest_snapshot_for(
+        &self,
+        addr: &crate::mcp::routing::Address,
+    ) -> Option<GraphSnapshot> {
+        let gen_id = self.engine_map.lookup(addr.top)?.gen_id;
+        let g = self.gens.get(&gen_id)?;
+        g.latest_snapshot.lock().await.clone()
     }
 
     /// Convenience: kill a task by dotted address.

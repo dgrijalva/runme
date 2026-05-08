@@ -9,7 +9,9 @@
 
 pub mod build;
 pub mod engine_server;
+pub mod report;
 pub mod routing;
 pub mod supervisor;
+pub mod tools;
 pub mod transport;
 pub mod wire;
