@@ -28,16 +28,20 @@
 //! the supervisor primitives.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::execution::{GraphSnapshot, KillSignal, SpawnOptions, TaskId};
+use crate::mcp::build::{
+    BuildState, BuildStatusInfo, FAILURE_HEAD_LINES, WatchSet, WatchSetSetup, head_of_failure,
+};
 use crate::mcp::routing::{
     Address, AddressError, EngineMap, GenerationId, RewrittenSnapshot, ResolveError,
     merge_snapshots, rewrite_snapshot,
@@ -52,9 +56,12 @@ use crate::mcp::wire::{
 // ---------------------------------------------------------------------------
 
 /// Outer-driver entry. Initializes stderr-only tracing, builds the
-/// supervisor, holds it open until stdin closes, then shuts down.
+/// supervisor, brings up the file watcher, holds it open until stdin
+/// closes (driving any debounced rebuild signals along the way), then
+/// shuts down.
 ///
-/// Phase 6 will replace the stdin-EOF wait with the rmcp service loop.
+/// Phase 6 will replace the stdin-EOF wait with the rmcp service loop;
+/// the rebuild-signal arm of the select! moves into the same task.
 pub async fn run() {
     install_stderr_tracing();
 
@@ -66,9 +73,48 @@ pub async fn run() {
         }
     };
 
-    // Phase 4 stub: keep alive until stdin closes. Phase 6 swaps this
-    // for the rmcp service loop on stdio.
-    let _ = tokio::io::stdin().read_to_end(&mut Vec::new()).await;
+    let cwd = std::env::current_dir().unwrap_or_else(|e| {
+        tracing::error!("supervisor: could not determine current dir: {e}");
+        std::process::exit(1);
+    });
+    if let Err(e) = supervisor.start_watcher(cwd) {
+        tracing::warn!("supervisor: file watcher failed to start: {e}");
+    }
+
+    // Drive: rebuild signals fire `handle_rebuild_signal`; stdin EOF
+    // breaks the loop and triggers shutdown. We `take()` the receiver
+    // so we own it locally and don't fight `&mut self`.
+    let mut rebuild_rx = supervisor.take_rebuild_rx();
+    let mut stdin_buf = Vec::new();
+    let mut stdin = tokio::io::stdin();
+
+    loop {
+        tokio::select! {
+            biased;
+            sig = async {
+                match rebuild_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match sig {
+                    Some(()) => {
+                        if let Err(e) = supervisor.handle_rebuild_signal().await {
+                            tracing::error!("supervisor: rebuild driver error: {e}");
+                        }
+                    }
+                    None => {
+                        // Channel closed → watcher is gone; stop polling.
+                        rebuild_rx = None;
+                    }
+                }
+            }
+            res = stdin.read_to_end(&mut stdin_buf) => {
+                let _ = res;
+                break;
+            }
+        }
+    }
 
     supervisor.shutdown().await;
 }
@@ -252,6 +298,20 @@ pub struct Supervisor {
     next_gen_id: AtomicU64,
     next_start_task_id: AtomicU64,
     spawner: Box<dyn EngineSpawner>,
+    /// Tri-state build state machine. Read by spawn-shaped tools through
+    /// [`Supervisor::check_can_spawn`] and exposed read-only via
+    /// [`Supervisor::build_status`].
+    build_state: Arc<Mutex<BuildState>>,
+    /// Signaled on every build-state transition. Spawn-shaped tools that
+    /// observed `Rebuilding` re-check after this fires.
+    build_state_changed: Arc<Notify>,
+    /// File watcher set up by [`Supervisor::start_watcher`]. `None` for
+    /// tests / contexts that don't want a live watcher.
+    watch_set: Option<WatchSet>,
+    /// Receiver feeding rebuild signals into [`Supervisor::handle_rebuild_signal`].
+    /// Owned by the supervisor between `start_watcher` and the first
+    /// driver-loop iteration; tests can take it via [`Supervisor::take_rebuild_rx`].
+    rebuild_rx: Option<mpsc::Receiver<()>>,
 }
 
 /// Each generation gets a disjoint id range so engines never collide on
@@ -267,6 +327,9 @@ impl Supervisor {
 
     /// Build a supervisor with a custom spawner. Used by tests to inject
     /// in-process engines.
+    ///
+    /// Does NOT start the file watcher — call [`Supervisor::start_watcher`]
+    /// separately. Tests that don't want a watcher skip that step.
     pub async fn new_with_spawner(
         spawner: Box<dyn EngineSpawner>,
     ) -> Result<Self, SupervisorError> {
@@ -278,9 +341,53 @@ impl Supervisor {
             next_gen_id: AtomicU64::new(0),
             next_start_task_id: AtomicU64::new(1),
             spawner,
+            build_state: Arc::new(Mutex::new(BuildState::Idle)),
+            build_state_changed: Arc::new(Notify::new()),
+            watch_set: None,
+            rebuild_rx: None,
         };
         s.spawn_initial_generation().await?;
         Ok(s)
+    }
+
+    /// Bring up the file watcher rooted at `cwd`. Discovers RUNME.rs
+    /// files, subscribes the live `notify::RecommendedWatcher` to each
+    /// parent dir non-recursively, and stages the rebuild-signal
+    /// receiver for [`Supervisor::handle_rebuild_signal`].
+    ///
+    /// Returns `Err` if `notify::RecommendedWatcher::new` itself fails
+    /// (rare — almost always an OS-level resource limit).
+    pub fn start_watcher(&mut self, cwd: PathBuf) -> notify::Result<()> {
+        let WatchSetSetup {
+            watch_set,
+            rebuild_rx,
+        } = WatchSet::build(cwd)?;
+        self.watch_set = Some(watch_set);
+        self.rebuild_rx = Some(rebuild_rx);
+        Ok(())
+    }
+
+    /// Take the rebuild receiver out of the supervisor. Used by callers
+    /// (and tests) that want to drive the receive themselves rather than
+    /// relying on [`Supervisor::handle_rebuild_signal`] in a hot loop.
+    pub fn take_rebuild_rx(&mut self) -> Option<mpsc::Receiver<()>> {
+        self.rebuild_rx.take()
+    }
+
+    /// Handle to the current build state for read-only consumers.
+    pub fn build_state_handle(&self) -> Arc<Mutex<BuildState>> {
+        Arc::clone(&self.build_state)
+    }
+
+    /// Notification handle for build-state transitions.
+    pub fn build_state_changed_handle(&self) -> Arc<Notify> {
+        Arc::clone(&self.build_state_changed)
+    }
+
+    /// Test-only: clone of the rebuild signal sender so tests can fire
+    /// rebuilds without relying on a live notify watcher.
+    pub fn rebuild_signal_tx(&self) -> Option<mpsc::Sender<()>> {
+        self.watch_set.as_ref().map(|w| w.rebuild_tx())
     }
 
     fn alloc_gen_id(&self) -> GenerationId {
@@ -303,13 +410,14 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Phase 5 will call this when a debounced file edit triggers a
-    /// successful rebuild. Spawns a new generation, makes it the latest,
-    /// and retires any prior latest generation that never had a task
-    /// spawned.
+    /// Spawn a new generation, make it the latest, and retire any prior
+    /// latest generation that never had a task spawned.
     ///
-    /// Phase 4 ships this as a stub so the supervisor's primitives are
-    /// in place before the build state machine lands.
+    /// Called by the file-watcher driver loop after a debounced edit. The
+    /// build-state transitions are managed by
+    /// [`Supervisor::handle_rebuild_signal`]; calling `rotate_latest`
+    /// directly skips them (used by some tests for the never-had-tasks
+    /// retirement check).
     pub async fn rotate_latest(&mut self) -> Result<(), SupervisorError> {
         let prior_latest = self.latest_gen;
 
@@ -328,6 +436,116 @@ impl Supervisor {
             self.retire_gen(prev).await;
         }
         Ok(())
+    }
+
+    /// Drive a single rebuild cycle: transition `BuildState` to
+    /// `Rebuilding`, call [`Supervisor::rotate_latest`], then transition
+    /// to `Idle` (success) or `LastBuildFailed` (engine spawn failed).
+    ///
+    /// Returns `Ok(())` for both successful rebuilds and recoverable
+    /// build failures — the failure is captured into `BuildState` and
+    /// surfaced to agents via [`Supervisor::check_can_spawn`] /
+    /// [`Supervisor::build_status`]. Only unrecoverable supervisor
+    /// errors (transport, IO) propagate as `Err`.
+    ///
+    /// # Refresh
+    ///
+    /// On success, the [`WatchSet`] (if any) is refreshed so newly
+    /// added / removed RUNME.rs files take effect immediately.
+    pub async fn handle_rebuild_signal(&mut self) -> Result<(), SupervisorError> {
+        // Transition → Rebuilding and notify any waiters.
+        {
+            let mut s = self.build_state.lock().await;
+            *s = BuildState::Rebuilding;
+        }
+        self.build_state_changed.notify_waiters();
+
+        let outcome = self.rotate_latest().await;
+
+        match outcome {
+            Ok(()) => {
+                {
+                    let mut s = self.build_state.lock().await;
+                    *s = BuildState::Idle;
+                }
+                self.build_state_changed.notify_waiters();
+                if let Some(ws) = self.watch_set.as_mut() {
+                    ws.refresh().await;
+                }
+                Ok(())
+            }
+            Err(SupervisorError::Spawn(SpawnError::EngineExited(stderr))) => {
+                {
+                    let mut s = self.build_state.lock().await;
+                    *s = BuildState::LastBuildFailed {
+                        last_failure_output: stderr,
+                    };
+                }
+                self.build_state_changed.notify_waiters();
+                // Build failed but the supervisor is otherwise healthy
+                // — existing live gens keep serving existing-state tools.
+                Ok(())
+            }
+            Err(other) => {
+                tracing::error!("rotate_latest failed: {}", other);
+                // Reset to Idle so spawn-shaped tools can keep trying;
+                // the underlying error has been logged.
+                {
+                    let mut s = self.build_state.lock().await;
+                    *s = BuildState::Idle;
+                }
+                self.build_state_changed.notify_waiters();
+                Err(other)
+            }
+        }
+    }
+
+    /// Spawn-shaped tool guard. Phase 6's `spawn_task` / `list_tasks` /
+    /// `run_task` call this before forwarding to the latest gen.
+    ///
+    /// - `Idle` → `Ok(())`, proceed.
+    /// - `Rebuilding` → wait on `build_state_changed`, then re-check
+    ///   (loops until the state leaves `Rebuilding`).
+    /// - `LastBuildFailed` → `Err(RpcError::BadRequest)` carrying the
+    ///   head of the captured stderr; agents fetch the full output via
+    ///   `get_build_status`.
+    ///
+    /// Existing-state tools (`kill_task`, `get_logs`, etc.) bypass this
+    /// guard — they route through `request_addr` and don't care about
+    /// the build state.
+    pub async fn check_can_spawn(&self) -> Result<(), RpcError> {
+        loop {
+            // Park a notification BEFORE reading state to avoid the
+            // missed-wake race: if the state changes between our read
+            // and our `notified().await`, the Notify will already be
+            // armed and the await returns immediately.
+            let notified = self.build_state_changed.notified();
+            tokio::pin!(notified);
+
+            let state = self.build_state.lock().await.clone();
+            match state {
+                BuildState::Idle => return Ok(()),
+                BuildState::LastBuildFailed {
+                    last_failure_output,
+                } => {
+                    let head = head_of_failure(&last_failure_output, FAILURE_HEAD_LINES);
+                    return Err(RpcError::BadRequest(format!(
+                        "build failed; call get_build_status for full output\n{head}"
+                    )));
+                }
+                BuildState::Rebuilding => {
+                    // Drop the lock before parking. The notification
+                    // we registered above remains armed.
+                    notified.await;
+                }
+            }
+        }
+    }
+
+    /// Read-only inspection for the `get_build_status` MCP tool.
+    pub async fn build_status(&self) -> BuildStatusInfo {
+        let s = self.build_state.lock().await;
+        BuildStatusInfo::from(&*s)
     }
 
     /// Build per-gen state from a freshly-spawned engine: connect TCP,
@@ -637,13 +855,54 @@ impl From<ResolveError> for RpcError {
 /// Test-only spawner that runs `engine_server::serve_on` in-process on
 /// a freshly-bound listener. Used by integration and unit tests that
 /// can't `Command::new(current_exe())` the engine.
+///
+/// Supports a fail-next queue: tests can stage one or more synthetic
+/// `SpawnError::EngineExited` errors for upcoming spawns, simulating
+/// `cargo build` failures without involving actual compilation.
 pub struct InProcessSpawner {
     pub registry: Arc<crate::task::Registry>,
+    failures: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+/// Shareable handle to the same failure queue an `InProcessSpawner`
+/// uses. Held by tests so they can stage failures after the supervisor
+/// has consumed ownership of the spawner box.
+#[derive(Clone)]
+pub struct FailureHandle {
+    queue: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl FailureHandle {
+    /// Queue a synthetic spawn failure. The next call to `spawn` will
+    /// return `SpawnError::EngineExited(message)` instead of bringing
+    /// up an in-process engine.
+    pub fn fail_next(&self, message: String) {
+        self.queue.lock().expect("poisoned").push_back(message);
+    }
 }
 
 impl InProcessSpawner {
     pub fn new(registry: Arc<crate::task::Registry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            failures: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+        }
+    }
+
+    /// Queue a synthetic spawn failure on this spawner directly. Useful
+    /// when the caller still owns the spawner. After the supervisor
+    /// consumes the box, prefer [`InProcessSpawner::failure_handle`].
+    pub fn fail_next(&self, message: String) {
+        self.failures.lock().expect("poisoned").push_back(message);
+    }
+
+    /// Cloneable handle to the failure queue. Allows tests to stage
+    /// failures *after* the supervisor has taken ownership of the
+    /// spawner.
+    pub fn failure_handle(&self) -> FailureHandle {
+        FailureHandle {
+            queue: Arc::clone(&self.failures),
+        }
     }
 }
 
@@ -653,8 +912,14 @@ impl EngineSpawner for InProcessSpawner {
         start_task_id: u64,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<SpawnedEngine, SpawnError>> + Send + 'a>>
     {
+        // Drain any queued failure synchronously so the test ordering
+        // is deterministic regardless of when the future is awaited.
+        let staged = self.failures.lock().expect("poisoned").pop_front();
         let registry = Arc::clone(&self.registry);
         Box::pin(async move {
+            if let Some(msg) = staged {
+                return Err(SpawnError::EngineExited(msg));
+            }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let port = listener.local_addr()?.port();
             let handle = tokio::spawn(async move {
