@@ -810,6 +810,30 @@ impl Engine {
     /// to set the global default; subsequent calls are no-ops thanks to
     /// `set_global_default`'s built-in once semantics.
     pub fn start(registry: Arc<Registry>) -> (Self, EngineHandle) {
+        Self::start_with_task_id_offset(registry, 1)
+    }
+
+    /// Same as [`Engine::start`] but seeds the process-global `TaskId`
+    /// allocator at `start_task_id` (must be > 0; `TaskId::ROOT` stays
+    /// at 0). Used by the MCP engine server, which is handed an offset
+    /// by its supervisor so reconnect-spawned engines don't reissue
+    /// ids the supervisor has already cached.
+    ///
+    /// Calling this more than once per process is a no-op for the
+    /// allocator unless `start_task_id` exceeds the current counter
+    /// (the underlying atomic uses `store`, not `fetch_max`). For the
+    /// engine-server lifecycle that's fine: exactly one engine per
+    /// process, called before any task is spawned.
+    pub fn start_with_task_id_offset(
+        registry: Arc<Registry>,
+        start_task_id: u64,
+    ) -> (Self, EngineHandle) {
+        // Seed the process-global TaskId allocator BEFORE Engine::start
+        // mints any ids (the synthetic root is `TaskId::ROOT` which is
+        // always 0; the first child uses the next allocated value).
+        if start_task_id > 1 {
+            TaskId::set_next_for_init(start_task_id);
+        }
         // Install the global tracing subscriber. This is the only place
         // in the codebase that does it. Returns Err if a default was
         // already set (subsequent engines, test runs sharing a process);

@@ -7,5 +7,6 @@
 //!
 //! See `docs/mcp_design.md` for the full design.
 
+pub mod engine_server;
 pub mod transport;
 pub mod wire;

@@ -20,6 +20,7 @@
 //! let received = server.recv().await?;
 //! ```
 
+use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LinesCodec, LinesCodecError};
@@ -99,6 +100,44 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WireTransport<S> {
                 let msg = serde_json::from_str(&line)?;
                 Ok(msg)
             }
+            Some(Err(e)) => Err(e.into()),
+            None => Err(TransportError::Closed),
+        }
+    }
+
+    /// Split into independent send/receive halves so a reader task and
+    /// a writer task can drive the transport concurrently without
+    /// sharing a mutex on the underlying stream.
+    pub fn into_split(self) -> (WireSink<S>, WireStream<S>) {
+        let (sink, stream) = self.framed.split();
+        (WireSink { inner: sink }, WireStream { inner: stream })
+    }
+}
+
+/// Send half of a split [`WireTransport`].
+pub struct WireSink<S> {
+    inner: SplitSink<Framed<S, LinesCodec>, String>,
+}
+
+impl<S: AsyncWrite + Unpin> WireSink<S> {
+    /// Serialize `msg` and write it as a single line.
+    pub async fn send(&mut self, msg: &WireMessage) -> Result<(), TransportError> {
+        let line = serde_json::to_string(msg)?;
+        self.inner.send(line).await?;
+        Ok(())
+    }
+}
+
+/// Receive half of a split [`WireTransport`].
+pub struct WireStream<S> {
+    inner: SplitStream<Framed<S, LinesCodec>>,
+}
+
+impl<S: AsyncRead + Unpin> WireStream<S> {
+    /// Read the next line and deserialize it as a [`WireMessage`].
+    pub async fn recv(&mut self) -> Result<WireMessage, TransportError> {
+        match self.inner.next().await {
+            Some(Ok(line)) => Ok(serde_json::from_str(&line)?),
             Some(Err(e)) => Err(e.into()),
             None => Err(TransportError::Closed),
         }

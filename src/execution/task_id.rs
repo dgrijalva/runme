@@ -27,6 +27,19 @@ impl TaskId {
     pub fn next() -> Self {
         TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
     }
+
+    /// Initialize the next-task-id allocator to `start` (must be > 0).
+    ///
+    /// Intended for the MCP engine server, which is launched by a
+    /// supervisor that hands it a TaskId offset so multiple engines
+    /// across reconnects don't reuse ids the supervisor has cached.
+    /// Should be called exactly once, at process startup, BEFORE any
+    /// `Engine::start` runs (so the synthetic root's children pick up
+    /// the new starting value).
+    pub fn set_next_for_init(start: u64) {
+        debug_assert!(start > 0, "TaskId start must be > 0; ROOT is 0");
+        NEXT_TASK_ID.store(start.max(1), Ordering::Relaxed);
+    }
 }
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);

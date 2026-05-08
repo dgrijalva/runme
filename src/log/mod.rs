@@ -35,6 +35,16 @@ impl SeqGen {
     pub fn next(&self) -> u64 {
         self.0.fetch_add(1, Ordering::Relaxed) + 1
     }
+
+    /// Read the most recently allocated seq without advancing the counter.
+    ///
+    /// Returns `0` before any allocation. Used by frontends (e.g. the MCP
+    /// engine server) that need a "seq just before this point" snapshot to
+    /// hand to a follow-up subscription's `from_seq` so no entries between
+    /// the snapshot and the subscription are missed.
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
 }
 
 impl Default for SeqGen {
