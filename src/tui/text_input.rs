@@ -155,6 +155,12 @@ impl TextInput {
     /// Move the position one step toward older history.
     /// From Blank → Virtual; from Virtual → newest saved (if any);
     /// from Saved(i) → Saved(i-1) (clamps at oldest).
+    ///
+    /// If the virtual slot equals the newest saved entry (which happens
+    /// whenever the panel reopens with the previously-committed filter
+    /// already loaded), the newest saved entry is skipped — Up lands on
+    /// the entry *before* the duplicate so the user doesn't have to press
+    /// Up twice to get visible motion.
     pub fn history_up(&mut self) {
         match self.position {
             HistoryPos::Blank => {
@@ -163,11 +169,22 @@ impl TextInput {
                 self.cursor = self.text.len();
             }
             HistoryPos::Virtual => {
-                if !self.history.is_empty() {
-                    let idx = self.history.len() - 1;
-                    self.position = HistoryPos::Saved(idx);
-                    self.text = self.history[idx].clone();
-                    self.cursor = self.text.len();
+                if let Some(last) = self.history.last() {
+                    if last == &self.virtual_text {
+                        // Newest saved == virtual. Skip past the duplicate.
+                        // If there's no entry before it, stay put.
+                        if self.history.len() >= 2 {
+                            let idx = self.history.len() - 2;
+                            self.position = HistoryPos::Saved(idx);
+                            self.text = self.history[idx].clone();
+                            self.cursor = self.text.len();
+                        }
+                    } else {
+                        let idx = self.history.len() - 1;
+                        self.position = HistoryPos::Saved(idx);
+                        self.text = self.history[idx].clone();
+                        self.cursor = self.text.len();
+                    }
                 }
             }
             HistoryPos::Saved(idx) => {
@@ -184,14 +201,26 @@ impl TextInput {
     /// Move the position one step toward blank.
     /// From Saved(i) → Saved(i+1) or → Virtual past newest;
     /// from Virtual → Blank; from Blank → Blank (clamps).
+    ///
+    /// Symmetric with `history_up`: when stepping into Saved(last) would
+    /// land on a value equal to the virtual slot, the duplicate is skipped
+    /// and the position goes straight to Virtual.
     pub fn history_down(&mut self) {
         match self.position {
             HistoryPos::Saved(idx) => {
-                if idx + 1 < self.history.len() {
-                    let new_idx = idx + 1;
-                    self.position = HistoryPos::Saved(new_idx);
-                    self.text = self.history[new_idx].clone();
-                    self.cursor = self.text.len();
+                let next_idx = idx + 1;
+                if next_idx < self.history.len() {
+                    let lands_on_duplicate = next_idx == self.history.len() - 1
+                        && self.history[next_idx] == self.virtual_text;
+                    if lands_on_duplicate {
+                        self.position = HistoryPos::Virtual;
+                        self.text = self.virtual_text.clone();
+                        self.cursor = self.text.len();
+                    } else {
+                        self.position = HistoryPos::Saved(next_idx);
+                        self.text = self.history[next_idx].clone();
+                        self.cursor = self.text.len();
+                    }
                 } else {
                     self.position = HistoryPos::Virtual;
                     self.text = self.virtual_text.clone();
@@ -448,18 +477,76 @@ mod tests {
             t.insert_char(ch);
         }
         t.commit();
-        t.save_current();
-        // Down twice past blank stays at blank
+        // After commit, virtual_text='foo' and history=['foo'].
+        // Clear the virtual slot so it differs from the saved entry,
+        // otherwise Up will skip the duplicate.
+        t.clear();
+        // Down past virtual goes to blank, then stays at blank
         t.history_down(); // virtual → blank
         t.history_down(); // stays
         assert_eq!(t.text, "");
         assert_eq!(t.position, HistoryPos::Blank);
         // Up walks back through virtual → saved[0]
-        t.history_up(); // → virtual
-        assert_eq!(t.text, "foo"); // virtual_text was 'foo'
+        t.history_up(); // → virtual (empty)
+        assert_eq!(t.text, "");
         t.history_up(); // → saved[0]='foo'
         assert_eq!(t.position, HistoryPos::Saved(0));
         t.history_up(); // clamps at oldest
         assert_eq!(t.position, HistoryPos::Saved(0));
+    }
+
+    #[test]
+    fn up_skips_duplicate_of_virtual_at_newest_saved() {
+        // Reproducer for the f→'heart'→Enter→f→Up bug: when the panel
+        // reopens with the active text equal to history.last(), the first
+        // Up should land on the entry before that duplicate.
+        let mut t = TextInput::new();
+        t.save_current();
+        for ch in "foo".chars() {
+            t.insert_char(ch);
+        }
+        t.commit();
+        t.save_current();
+        t.clear();
+        for ch in "heart".chars() {
+            t.insert_char(ch);
+        }
+        t.commit();
+        // Reopen the panel — text='heart', virtual_text='heart',
+        // history=['foo','heart'].
+        t.save_current();
+        assert_eq!(t.text, "heart");
+        assert_eq!(t.virtual_text, "heart");
+
+        // One Up should skip 'heart' and land on 'foo'.
+        t.history_up();
+        assert_eq!(t.text, "foo");
+        assert_eq!(t.position, HistoryPos::Saved(0));
+
+        // Down should mirror Up: skip the duplicate and land back on virtual.
+        t.history_down();
+        assert_eq!(t.text, "heart");
+        assert_eq!(t.position, HistoryPos::Virtual);
+
+        // Another Down goes to Blank as usual.
+        t.history_down();
+        assert!(t.text.is_empty());
+        assert_eq!(t.position, HistoryPos::Blank);
+    }
+
+    #[test]
+    fn up_stays_when_only_entry_equals_virtual() {
+        // Single-entry history that equals virtual: nowhere to go, stay put.
+        let mut t = TextInput::new();
+        t.save_current();
+        for ch in "foo".chars() {
+            t.insert_char(ch);
+        }
+        t.commit();
+        t.save_current();
+        // text='foo', virtual='foo', history=['foo']
+        t.history_up();
+        assert_eq!(t.text, "foo");
+        assert_eq!(t.position, HistoryPos::Virtual);
     }
 }
