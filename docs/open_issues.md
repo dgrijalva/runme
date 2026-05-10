@@ -64,3 +64,14 @@ Possible approaches:
 - Recognize `\r` as an in-place update and replace the previous entry from that source
 - Collapse `\r`-delimited chunks into a single entry that updates in place
 - Strip `\r` progress output entirely and only show the final line
+
+## Log grouping / context views for debugging
+
+**Feature idea:** Ways to group or contextualize log entries when debugging. These may be separate features that share a theme rather than one mechanism.
+
+- **Filter with context (`grep -C`-style):** Show each match plus N entries above and below, with a blank line separating match groups. Useful when the surrounding lines are what actually explain a match
+- **Group by data (e.g., request ID):** When a server is juggling concurrent requests, interleaved output is unreadable. Let the user pick a key (request id, trace id, session id, ...) and reassemble entries into per-key streams. Probably needs the field extractor to surface arbitrary structured fields, not just timestamp/level/message
+- **Arbitrary task-defined grouping:** Expose a hook so a task can define its own grouping/labeling logic over its output. Anywhere user code gets a concrete interface to influence tool behavior is a win — same philosophy as `ctx.summarize`. Could be a function that takes a `LogEntry` and returns a group key (or `None`)
+- _Effort:_ Variable. `grep -C` context is small (filter/render layer in `src/log/filter.rs` + `src/tui/render.rs`). Group-by-key is moderate — needs richer field extraction and a new view mode. Task-authored grouping is moderate-to-large — new `TaskContext` API + plumbing through to the log store
+- _Assessment:_ Worth treating as a family of features unified by "give the user lenses on log data." The field extraction pipeline (`src/log/extract.rs`) and store (`src/log/store.rs`) probably need extension to carry structured field maps per entry, which all three variants would build on
+- _Open questions:_ Is grouping a view-time concern (TUI re-renders the same store with a different lens) or a store-time concern (entries are tagged on ingest)? View-time is more flexible; store-time is cheaper at render. Does task-authored grouping run synchronously in the parsing pipeline, or async over the store?
