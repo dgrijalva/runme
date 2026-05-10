@@ -632,17 +632,7 @@ pub(super) fn handle_search_input_key(
                     .scan_matches(texts.iter().map(|(i, t)| (*i, t.as_str())));
 
                 // Jump to the nearest match from the current cursor position
-                let cursor_pos = match state.scroll {
-                    viewport::ScrollState::Tail => {
-                        let visible_count = state.visible_line_indices().len();
-                        if visible_count > 0 {
-                            visible_count - 1
-                        } else {
-                            0
-                        }
-                    }
-                    viewport::ScrollState::Pinned { cursor, .. } => cursor,
-                };
+                let cursor_pos = state.scroll.cursor_index(filtered_entries).unwrap_or(0);
                 if let Some(target) = state.search.jump_to_nearest(cursor_pos) {
                     navigate_to_entry(
                         state,
@@ -879,24 +869,18 @@ pub(super) fn copy_entry_to_clipboard(state: &AppState) {
     use std::io::Write;
 
     let visible_indices = state.visible_line_indices();
-    let cursor_idx = match state.scroll {
-        viewport::ScrollState::Tail => {
-            if visible_indices.is_empty() {
-                return;
-            }
-            *visible_indices.last().unwrap()
-        }
-        viewport::ScrollState::Pinned { cursor, .. } => {
-            if cursor >= visible_indices.len() {
-                if visible_indices.is_empty() {
-                    return;
-                }
-                *visible_indices.last().unwrap()
-            } else {
-                visible_indices[cursor]
-            }
-        }
-    };
+    if visible_indices.is_empty() {
+        return;
+    }
+    let visible_entries: Vec<LogEntry> = visible_indices
+        .iter()
+        .filter_map(|&i| state.log_lines.get(i).cloned())
+        .collect();
+    let cursor_visible_idx = state
+        .scroll
+        .cursor_index(&visible_entries)
+        .unwrap_or(visible_indices.len() - 1);
+    let cursor_idx = visible_indices[cursor_visible_idx];
 
     if let Some(entry) = state.log_lines.get(cursor_idx) {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&entry.raw);
@@ -954,7 +938,9 @@ pub(super) fn navigate_to_entry(
     viewport_height: u16,
     _viewport_width: u16,
 ) {
-    let total = state.visible_line_indices().len();
+    let visible_entries: Vec<LogEntry> =
+        state.visible_log_lines().into_iter().cloned().collect();
+    let total = visible_entries.len();
     if total == 0 {
         return;
     }
@@ -964,30 +950,10 @@ pub(super) fn navigate_to_entry(
     if target >= total.saturating_sub(1) {
         state.scroll = viewport::ScrollState::Tail;
     } else {
-        // Set cursor to target, compute appropriate top
-        let current_top = match state.scroll {
-            viewport::ScrollState::Pinned { top, .. } => top,
-            viewport::ScrollState::Tail => 0,
-        };
-        state.scroll = viewport::ScrollState::Pinned {
-            cursor: target,
-            top: current_top,
-        };
-        // Let the viewport adjust top for the new cursor position
-        // We need the filtered entries for this — recalculate from visible
-        let visible_entries: Vec<LogEntry> =
-            state.visible_log_lines().into_iter().cloned().collect();
-        if !visible_entries.is_empty() {
-            // Use scroll_down/scroll_up logic to adjust — just set and let render fix it
-            // For a clean approach, manually recompute. A simple heuristic:
-            // Put the target entry in the middle of the viewport.
-            let half = (viewport_height / 2) as usize;
-            let new_top = target.saturating_sub(half);
-            state.scroll = viewport::ScrollState::Pinned {
-                cursor: target,
-                top: new_top,
-            };
-        }
+        // Place the target entry near the middle of the viewport.
+        let half = (viewport_height / 2) as usize;
+        let new_top = target.saturating_sub(half);
+        state.scroll = viewport::ScrollState::pinned(&visible_entries, target, new_top);
     }
 }
 
@@ -1186,17 +1152,25 @@ fn copy_viewport_to_clipboard(state: &mut AppState) {
     if visible_indices.is_empty() {
         return;
     }
+    let visible_entries: Vec<LogEntry> = visible_indices
+        .iter()
+        .filter_map(|&i| state.log_lines.get(i).cloned())
+        .collect();
 
     // Determine the viewport range from scroll state
+    let height = state.last_viewport_height.unwrap_or(40) as usize;
     let (start, end) = match state.scroll {
         viewport::ScrollState::Tail => {
             let end = visible_indices.len();
-            let height = state.last_viewport_height.unwrap_or(40) as usize;
             let start = end.saturating_sub(height);
             (start, end)
         }
-        viewport::ScrollState::Pinned { top, .. } => {
-            let height = state.last_viewport_height.unwrap_or(40) as usize;
+        viewport::ScrollState::Pinned { .. } => {
+            let top = state
+                .scroll
+                .resolve(&visible_entries)
+                .map(|r| r.top)
+                .unwrap_or(0);
             let end = (top + height).min(visible_indices.len());
             (top, end)
         }
@@ -1226,16 +1200,15 @@ fn copy_stream_to_clipboard(state: &mut AppState) {
     }
 
     // Determine the source of the currently selected entry
-    let cursor_idx = match state.scroll {
-        viewport::ScrollState::Tail => *visible_indices.last().unwrap(),
-        viewport::ScrollState::Pinned { cursor, .. } => {
-            if cursor >= visible_indices.len() {
-                *visible_indices.last().unwrap()
-            } else {
-                visible_indices[cursor]
-            }
-        }
-    };
+    let visible_entries: Vec<LogEntry> = visible_indices
+        .iter()
+        .filter_map(|&i| state.log_lines.get(i).cloned())
+        .collect();
+    let cursor_visible_idx = state
+        .scroll
+        .cursor_index(&visible_entries)
+        .unwrap_or(visible_indices.len() - 1);
+    let cursor_idx = visible_indices[cursor_visible_idx];
 
     let source = match state.log_lines.get(cursor_idx) {
         Some(entry) => entry.source,
@@ -1313,13 +1286,15 @@ mod tests {
     fn make_log_entry(raw: &str, source: TaskId) -> LogEntry {
         use crate::log::ParsedContent;
         use std::collections::HashMap;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
+        static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source,
-            seq: 0,
+            seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
             timestamp: None,
             level: Some("info".to_string()),
             message: Some(raw.to_string()),
@@ -1449,7 +1424,7 @@ mod tests {
         let mut state = AppState::new();
         state.log_lines.push(make_log_entry("hello", TaskId(1)));
         // Pin to entry 0 so there's a cursor
-        state.scroll = ScrollState::Pinned { cursor: 0, top: 0 };
+        state.scroll = ScrollState::pinned(&state.log_lines, 0, 0);
 
         let entries = state.log_lines.clone();
         assert_eq!(state.mode, AppMode::Normal);
@@ -1578,7 +1553,7 @@ mod tests {
                 .log_lines
                 .push(make_log_entry(&format!("entry {}", i), TaskId(1)));
         }
-        state.scroll = ScrollState::Pinned { cursor: 2, top: 0 };
+        state.scroll = ScrollState::pinned(&state.log_lines, 2, 0);
         state.mode = AppMode::EntryDetail;
 
         let entries = state.log_lines.clone();
@@ -1592,10 +1567,9 @@ mod tests {
             &labels,
         );
         assert_eq!(state.mode, AppMode::Normal);
-        // Should have moved cursor down (from 2 to 3)
-        match state.scroll {
-            ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 3),
-            ScrollState::Tail => {} // also acceptable at end of list
+        // Should have moved cursor down (from 2 to 3); Tail (None) is also OK at end of list
+        if let Some(idx) = state.scroll.cursor_index(&state.log_lines) {
+            assert_eq!(idx, 3);
         }
     }
 
@@ -1607,7 +1581,7 @@ mod tests {
                 .log_lines
                 .push(make_log_entry(&format!("entry {}", i), TaskId(1)));
         }
-        state.scroll = ScrollState::Pinned { cursor: 2, top: 0 };
+        state.scroll = ScrollState::pinned(&state.log_lines, 2, 0);
         state.mode = AppMode::EntryDetail;
 
         let entries = state.log_lines.clone();
@@ -1622,10 +1596,11 @@ mod tests {
         );
         assert_eq!(state.mode, AppMode::Normal);
         // Should have moved cursor up (from 2 to 1)
-        match state.scroll {
-            ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 1),
-            _ => panic!("expected Pinned"),
-        }
+        let idx = state
+            .scroll
+            .cursor_index(&state.log_lines)
+            .expect("expected Pinned");
+        assert_eq!(idx, 1);
     }
 
     // -- Process control tests --

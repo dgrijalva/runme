@@ -275,7 +275,8 @@ pub fn render_frame(
             spans.extend(search_status_spans(&state.search));
 
             // Scroll position / entry count — use visible count
-            let visible_count = state.visible_line_indices().len();
+            let visible_entries = state.visible_log_lines();
+            let visible_count = visible_entries.len();
             if visible_count > 0 {
                 spans.push(Span::raw(" "));
                 match state.scroll {
@@ -285,8 +286,14 @@ pub fn render_frame(
                             Style::default().fg(THEME.dim),
                         ));
                     }
-                    ScrollState::Pinned { cursor, .. } => {
-                        let new_count = new_entries_since_pin(&state.scroll, visible_count);
+                    ScrollState::Pinned { .. } => {
+                        let visible_owned: Vec<LogEntry> =
+                            visible_entries.iter().map(|e| (*e).clone()).collect();
+                        let cursor = state
+                            .scroll
+                            .cursor_index(&visible_owned)
+                            .unwrap_or(visible_count - 1);
+                        let new_count = new_entries_since_pin(&state.scroll, &visible_owned);
                         let pos_text = if new_count > 0 {
                             format!(" {} / {} (+{} new) ", cursor + 1, visible_count, new_count)
                         } else {
@@ -699,24 +706,18 @@ fn render_entry_detail(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, 
 
     // Find the focused entry from the cursor position
     let visible_indices = state.visible_line_indices();
-    let cursor_idx = match state.scroll {
-        ScrollState::Tail => {
-            if visible_indices.is_empty() {
-                return;
-            }
-            *visible_indices.last().unwrap()
-        }
-        ScrollState::Pinned { cursor, .. } => {
-            if cursor >= visible_indices.len() {
-                if visible_indices.is_empty() {
-                    return;
-                }
-                *visible_indices.last().unwrap()
-            } else {
-                visible_indices[cursor]
-            }
-        }
-    };
+    if visible_indices.is_empty() {
+        return;
+    }
+    let visible_entries: Vec<LogEntry> = visible_indices
+        .iter()
+        .filter_map(|&i| state.log_lines.get(i).cloned())
+        .collect();
+    let cursor_visible_idx = state
+        .scroll
+        .cursor_index(&visible_entries)
+        .unwrap_or(visible_indices.len() - 1);
+    let cursor_idx = visible_indices[cursor_visible_idx];
 
     let entry = match state.log_lines.get(cursor_idx) {
         Some(e) => e,

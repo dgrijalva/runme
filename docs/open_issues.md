@@ -18,14 +18,6 @@
 - _Assessment:_ Fits naturally next to existing per-session state (`TaskStatus`, `processes`). The task is the right place to author this since only the task knows what's interesting in its own output. Summary is just a `String` (or maybe `Option<String>` + timestamp); no need for streaming/structure in v1
 - _Open questions:_ Single summary or append-only stream? Overwrite semantics on re-run? Should summaries persist with completed tasks (probably yes, since logs do)? Does the TUI surface them anywhere, or are they purely for programmatic consumers?
 
-## Filter occasionally collapses to a single result
-
-**14:17** — Applying a filter expression in the TUI sometimes shows only one matching line even when multiple entries clearly match. Repro conditions unknown.
-
-- _Effort:_ Needs dedicated exploration — repro is the hard part
-- _Assessment:_ Filter pipeline is `App::visible_line_indices()` / `visible_log_lines()` (src/tui/app.rs:301, src/tui/app.rs:323), which composes focus filter + manual hides + `log_filter::matches(expr, entry)`. Worth checking: (a) is `effective_visible_sources()` returning a stale/over-narrow set when sources arrive after the filter is applied? (b) does the viewport's visible-index list get out of sync with `log_lines` after a re-filter, so it renders one line rather than scrolling? (c) is search vs filter being conflated — `n`/`N` jumps to next match and could leave the viewport on a single-line slice
-- _Concern:_ Hard to fix without a repro. Next time it happens, capture: filter expr, source set in sidebar, whether focus filter is active, whether search was used recently
-
 ## Soft vs hard restart
 
 **14:17** — Two restart modes. `r` = soft restart: a cooperative signal the task can opt into. `R` = hard restart: current behavior (kill + respawn). Mechanism: `TaskContext` exposes a restart channel/signal that the task can `take()`. If taken, soft restart sends through that channel and the task decides what to do (e.g., reload config, re-exec a child, drain). If not taken, soft and hard behave identically. CLI mode could map `SIGHUP` to soft restart on the same principle.

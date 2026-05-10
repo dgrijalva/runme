@@ -16,17 +16,88 @@ use super::render::{DisplayMode, SourceColors, render_entry, render_entry_opts};
 const SCROLL_MARGIN: u16 = 2;
 
 /// Scroll state: either following the tail or pinned at a position.
+///
+/// `Pinned` stores entry seq numbers, not visible-list indices. This makes
+/// the cursor stable across visible-set changes (filter applied, source
+/// toggled, focus changed): if the pinned entry survives, the cursor stays
+/// on it; if not, [`resolve_seq`] picks the nearest surviving entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScrollState {
     /// Following the end of the log. Cursor is always the last entry.
     Tail,
-    /// Pinned: cursor and viewport are independent of new entries.
+    /// Pinned by entry identity. `cursor_seq` is the seq of the focused entry;
+    /// `top_seq` is the seq of the entry at the top of the viewport.
     Pinned {
-        /// Which entry is focused (index into visible entries)
-        cursor: usize,
-        /// Which entry is at the top of the viewport
-        top: usize,
+        cursor_seq: u64,
+        top_seq: u64,
     },
+}
+
+/// Resolved pinned position as visible-list indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Resolved {
+    pub cursor: usize,
+    pub top: usize,
+}
+
+impl ScrollState {
+    /// Resolve to visible-list indices against the current `entries` slice
+    /// (must be sorted by `seq` ascending). Returns `None` if `entries` is
+    /// empty. For `Tail`, both `cursor` and `top` point at the last entry;
+    /// `layout` recomputes `top` from `cursor` for the Tail case anyway.
+    pub fn resolve(&self, entries: &[LogEntry]) -> Option<Resolved> {
+        if entries.is_empty() {
+            return None;
+        }
+        match *self {
+            ScrollState::Tail => {
+                let last = entries.len() - 1;
+                Some(Resolved {
+                    cursor: last,
+                    top: last,
+                })
+            }
+            ScrollState::Pinned {
+                cursor_seq,
+                top_seq,
+            } => Some(Resolved {
+                cursor: resolve_seq(entries, cursor_seq),
+                top: resolve_seq(entries, top_seq),
+            }),
+        }
+    }
+
+    /// Convenience: resolve and return the cursor index, or `None` if empty.
+    pub fn cursor_index(&self, entries: &[LogEntry]) -> Option<usize> {
+        self.resolve(entries).map(|r| r.cursor)
+    }
+
+    /// Construct a `Pinned` state from visible-list indices, snapshotting the
+    /// seqs of the entries at those positions. Returns `Tail` if `entries` is
+    /// empty.
+    pub fn pinned(entries: &[LogEntry], cursor: usize, top: usize) -> Self {
+        if entries.is_empty() {
+            return ScrollState::Tail;
+        }
+        let last = entries.len() - 1;
+        let cursor = cursor.min(last);
+        let top = top.min(last);
+        ScrollState::Pinned {
+            cursor_seq: entries[cursor].seq,
+            top_seq: entries[top].seq,
+        }
+    }
+}
+
+/// Resolve a `seq` to an index in `entries`. Returns the index of the entry
+/// with matching seq, or — if not present — the nearest surviving entry
+/// (preferring the next-larger seq, falling back to the last entry).
+///
+/// Caller must ensure `entries` is non-empty and sorted by `seq` ascending.
+pub fn resolve_seq(entries: &[LogEntry], seq: u64) -> usize {
+    debug_assert!(!entries.is_empty());
+    let pos = entries.partition_point(|e| e.seq < seq);
+    pos.min(entries.len() - 1)
 }
 
 /// Compute the viewport layout: which entries are visible and where.
@@ -89,10 +160,24 @@ pub fn layout(
             );
             (cursor, top)
         }
-        ScrollState::Pinned { cursor, top } => {
-            let cursor = cursor.min(entries.len() - 1);
-            let top = top.min(entries.len() - 1);
-            (cursor, top)
+        ScrollState::Pinned { .. } => {
+            let r = scroll.resolve(entries).expect("entries non-empty");
+            // After visible-set changes, the resolved `top` may no longer
+            // keep the cursor in view (e.g. `top` resolved to the same entry
+            // as `cursor` because the originals were filtered out). Always
+            // adjust to keep the cursor visible with margin.
+            let top = adjust_top_for_cursor(
+                r.cursor,
+                r.top,
+                entries,
+                viewport_height,
+                width,
+                mode,
+                wrap,
+                source_colors,
+                source_labels,
+            );
+            (r.cursor, top)
         }
     };
 
@@ -180,14 +265,15 @@ pub fn scroll_down(
 
     match *scroll {
         ScrollState::Tail => ScrollState::Tail,
-        ScrollState::Pinned { cursor, top } => {
-            if cursor + 1 >= entries.len() {
+        ScrollState::Pinned { .. } => {
+            let r = scroll.resolve(entries).expect("entries non-empty");
+            if r.cursor + 1 >= entries.len() {
                 return ScrollState::Tail;
             }
-            let new_cursor = cursor + 1;
+            let new_cursor = r.cursor + 1;
             let new_top = adjust_top_for_cursor(
                 new_cursor,
-                top,
+                r.top,
                 entries,
                 viewport_height,
                 width,
@@ -196,10 +282,7 @@ pub fn scroll_down(
                 source_colors,
                 source_labels,
             );
-            ScrollState::Pinned {
-                cursor: new_cursor,
-                top: new_top,
-            }
+            ScrollState::pinned(entries, new_cursor, new_top)
         }
     }
 }
@@ -223,7 +306,7 @@ pub fn scroll_up(
     match *scroll {
         ScrollState::Tail => {
             if entries.len() <= 1 {
-                return ScrollState::Pinned { cursor: 0, top: 0 };
+                return ScrollState::pinned(entries, 0, 0);
             }
             let cursor = entries.len() - 2;
             let top = compute_top_for_bottom(
@@ -247,16 +330,17 @@ pub fn scroll_up(
                 source_colors,
                 source_labels,
             );
-            ScrollState::Pinned { cursor, top }
+            ScrollState::pinned(entries, cursor, top)
         }
-        ScrollState::Pinned { cursor, top } => {
-            if cursor == 0 {
-                return ScrollState::Pinned { cursor: 0, top: 0 };
+        ScrollState::Pinned { .. } => {
+            let r = scroll.resolve(entries).expect("entries non-empty");
+            if r.cursor == 0 {
+                return ScrollState::pinned(entries, 0, 0);
             }
-            let new_cursor = cursor - 1;
+            let new_cursor = r.cursor - 1;
             let new_top = adjust_top_for_cursor(
                 new_cursor,
-                top,
+                r.top,
                 entries,
                 viewport_height,
                 width,
@@ -265,10 +349,7 @@ pub fn scroll_up(
                 source_colors,
                 source_labels,
             );
-            ScrollState::Pinned {
-                cursor: new_cursor,
-                top: new_top,
-            }
+            ScrollState::pinned(entries, new_cursor, new_top)
         }
     }
 }
@@ -289,25 +370,21 @@ pub fn scroll_down_half_page(
         return ScrollState::Tail;
     }
 
-    let cursor = match *scroll {
+    let r = match *scroll {
         ScrollState::Tail => return ScrollState::Tail,
-        ScrollState::Pinned { cursor, .. } => cursor,
+        ScrollState::Pinned { .. } => scroll.resolve(entries).expect("entries non-empty"),
     };
 
     let half = (viewport_height / 2).max(1) as usize;
-    let new_cursor = (cursor + half).min(entries.len() - 1);
+    let new_cursor = (r.cursor + half).min(entries.len() - 1);
 
     if new_cursor >= entries.len() - 1 {
         return ScrollState::Tail;
     }
 
-    let top = match *scroll {
-        ScrollState::Pinned { top, .. } => top,
-        _ => 0,
-    };
     let new_top = adjust_top_for_cursor(
         new_cursor,
-        top,
+        r.top,
         entries,
         viewport_height,
         width,
@@ -317,10 +394,7 @@ pub fn scroll_down_half_page(
         source_labels,
     );
 
-    ScrollState::Pinned {
-        cursor: new_cursor,
-        top: new_top,
-    }
+    ScrollState::pinned(entries, new_cursor, new_top)
 }
 
 /// Jump backward by half a viewport.
@@ -339,27 +413,29 @@ pub fn scroll_up_half_page(
         return ScrollState::Tail;
     }
 
-    let cursor = match *scroll {
-        ScrollState::Tail => entries.len() - 1,
-        ScrollState::Pinned { cursor, .. } => cursor,
+    let (cursor, top) = match *scroll {
+        ScrollState::Tail => (
+            entries.len() - 1,
+            compute_top_for_bottom(
+                entries.len() - 1,
+                entries,
+                viewport_height,
+                width,
+                mode,
+                wrap,
+                source_colors,
+                source_labels,
+            ),
+        ),
+        ScrollState::Pinned { .. } => {
+            let r = scroll.resolve(entries).expect("entries non-empty");
+            (r.cursor, r.top)
+        }
     };
 
     let half = (viewport_height / 2).max(1) as usize;
     let new_cursor = cursor.saturating_sub(half);
 
-    let top = match *scroll {
-        ScrollState::Pinned { top, .. } => top,
-        ScrollState::Tail => compute_top_for_bottom(
-            entries.len() - 1,
-            entries,
-            viewport_height,
-            width,
-            mode,
-            wrap,
-            source_colors,
-            source_labels,
-        ),
-    };
     let new_top = adjust_top_for_cursor(
         new_cursor,
         top,
@@ -372,10 +448,7 @@ pub fn scroll_up_half_page(
         source_labels,
     );
 
-    ScrollState::Pinned {
-        cursor: new_cursor,
-        top: new_top,
-    }
+    ScrollState::pinned(entries, new_cursor, new_top)
 }
 
 /// Jump to first entry.
@@ -383,7 +456,7 @@ pub fn scroll_to_top(_scroll: &ScrollState, entries: &[LogEntry]) -> ScrollState
     if entries.is_empty() {
         return ScrollState::Tail;
     }
-    ScrollState::Pinned { cursor: 0, top: 0 }
+    ScrollState::pinned(entries, 0, 0)
 }
 
 /// Jump to last entry (tail mode).
@@ -394,11 +467,17 @@ pub fn scroll_to_bottom(_scroll: &ScrollState, entries: &[LogEntry]) -> ScrollSt
     ScrollState::Tail
 }
 
-/// Compute the number of new entries since pinning.
-pub fn new_entries_since_pin(scroll: &ScrollState, total: usize) -> usize {
+/// Number of entries with seq strictly greater than the pinned cursor's seq.
+/// Returns 0 for `Tail` (always tracking the latest). Counts entries that
+/// arrived/became visible after the pin, regardless of whether the pinned
+/// entry itself is still in `entries`.
+pub fn new_entries_since_pin(scroll: &ScrollState, entries: &[LogEntry]) -> usize {
     match *scroll {
         ScrollState::Tail => 0,
-        ScrollState::Pinned { cursor, .. } => total.saturating_sub(cursor + 1),
+        ScrollState::Pinned { cursor_seq, .. } => {
+            let pos = entries.partition_point(|e| e.seq <= cursor_seq);
+            entries.len() - pos
+        }
     }
 }
 
@@ -514,13 +593,13 @@ mod tests {
         crate::execution::TaskId(h.finish())
     }
 
-    fn make_entry(raw: &str, source: &str) -> LogEntry {
+    fn make_entry(raw: &str, source: &str, seq: u64) -> LogEntry {
         LogEntry {
             received_at: chrono::Utc::now(),
             raw: raw.to_string(),
             parsed: ParsedContent::PlainText,
             source: tid(source),
-            seq: 0,
+            seq,
             timestamp: None,
             level: Some("info".to_string()),
             message: Some(raw.to_string()),
@@ -531,7 +610,7 @@ mod tests {
 
     fn make_entries(n: usize) -> Vec<LogEntry> {
         (0..n)
-            .map(|i| make_entry(&format!("entry {}", i), "test"))
+            .map(|i| make_entry(&format!("entry {}", i), "test", (i as u64) + 1))
             .collect()
     }
 
@@ -605,7 +684,7 @@ mod tests {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let state = ScrollState::Pinned { cursor: 5, top: 0 };
+        let state = ScrollState::pinned(&entries, 5, 0);
         let next = scroll_down(
             &state,
             &entries,
@@ -616,10 +695,7 @@ mod tests {
             &mut sc,
             &labels,
         );
-        match next {
-            ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 6),
-            _ => panic!("expected Pinned"),
-        }
+        assert_eq!(next.cursor_index(&entries), Some(6));
     }
 
     #[test]
@@ -627,7 +703,7 @@ mod tests {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let state = ScrollState::Pinned { cursor: 9, top: 0 };
+        let state = ScrollState::pinned(&entries, 9, 0);
         let next = scroll_down(
             &state,
             &entries,
@@ -646,7 +722,7 @@ mod tests {
         let entries = make_entries(20);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let state = ScrollState::Pinned { cursor: 10, top: 5 };
+        let state = ScrollState::pinned(&entries, 10, 5);
         let next = scroll_up(
             &state,
             &entries,
@@ -657,10 +733,7 @@ mod tests {
             &mut sc,
             &labels,
         );
-        match next {
-            ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 9),
-            _ => panic!("expected Pinned"),
-        }
+        assert_eq!(next.cursor_index(&entries), Some(9));
     }
 
     #[test]
@@ -678,10 +751,7 @@ mod tests {
             &mut sc,
             &labels,
         );
-        match next {
-            ScrollState::Pinned { cursor, .. } => assert_eq!(cursor, 18),
-            _ => panic!("expected Pinned"),
-        }
+        assert_eq!(next.cursor_index(&entries), Some(18));
     }
 
     #[test]
@@ -689,7 +759,7 @@ mod tests {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let state = ScrollState::Pinned { cursor: 0, top: 0 };
+        let state = ScrollState::pinned(&entries, 0, 0);
         let next = scroll_up(
             &state,
             &entries,
@@ -700,26 +770,20 @@ mod tests {
             &mut sc,
             &labels,
         );
-        assert_eq!(next, ScrollState::Pinned { cursor: 0, top: 0 });
+        assert_eq!(next, ScrollState::pinned(&entries, 0, 0));
     }
 
     #[test]
     fn scroll_to_top_works() {
         let entries = make_entries(20);
-        let next = scroll_to_top(
-            &ScrollState::Pinned {
-                cursor: 15,
-                top: 10,
-            },
-            &entries,
-        );
-        assert_eq!(next, ScrollState::Pinned { cursor: 0, top: 0 });
+        let next = scroll_to_top(&ScrollState::pinned(&entries, 15, 10), &entries);
+        assert_eq!(next, ScrollState::pinned(&entries, 0, 0));
     }
 
     #[test]
     fn scroll_to_bottom_works() {
         let entries = make_entries(20);
-        let next = scroll_to_bottom(&ScrollState::Pinned { cursor: 5, top: 0 }, &entries);
+        let next = scroll_to_bottom(&ScrollState::pinned(&entries, 5, 0), &entries);
         assert_eq!(next, ScrollState::Tail);
     }
 
@@ -728,7 +792,7 @@ mod tests {
         let entries = make_entries(10);
         let mut sc = SourceColors::new();
         let labels = HashMap::new();
-        let state = ScrollState::Pinned { cursor: 3, top: 0 };
+        let state = ScrollState::pinned(&entries, 3, 0);
         let result = layout(
             &state,
             &entries,
@@ -750,6 +814,94 @@ mod tests {
                 assert!(!e.is_cursor);
             }
         }
+    }
+
+    #[test]
+    fn pinned_survives_filter_shrink() {
+        // Regression test for the "filter collapses to one result" bug.
+        // User scrolls deep into a long log, then applies a filter that
+        // narrows the visible set to fewer entries than the cursor's index.
+        // The viewport must still render multiple entries, with the cursor
+        // landing on the nearest surviving entry.
+        let full = make_entries(50);
+        let pinned_at_50 = ScrollState::Pinned {
+            cursor_seq: 50,
+            top_seq: 45,
+        };
+
+        // Filter narrows to first 8 entries (seqs 1..=8) — cursor's seq 50
+        // is filtered out.
+        let filtered: Vec<LogEntry> = full.iter().take(8).cloned().collect();
+
+        let mut sc = SourceColors::new();
+        let labels = HashMap::new();
+        let result = layout(
+            &pinned_at_50,
+            &filtered,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+            None,
+            true,
+            &labels,
+        );
+
+        // Must render multiple entries, not just the last one.
+        assert!(
+            result.entries.len() > 1,
+            "expected viewport to render multiple entries after filter shrink, got {}",
+            result.entries.len()
+        );
+        // Cursor falls back to the last surviving entry (seq 8 → index 7).
+        let cursor_entry = result
+            .entries
+            .iter()
+            .find(|e| e.is_cursor)
+            .expect("a cursor entry");
+        assert_eq!(cursor_entry.entry_index, 7);
+    }
+
+    #[test]
+    fn pinned_preserves_focus_when_entry_survives() {
+        // If the pinned entry survives the filter, the cursor stays on it
+        // even though its visible-list index has shifted.
+        let full = make_entries(50);
+        // Pin to entry with seq 10 (index 9 in `full`).
+        let pinned = ScrollState::Pinned {
+            cursor_seq: 10,
+            top_seq: 8,
+        };
+
+        // Filter to even-seq entries: [seq 2, 4, 6, 8, 10, 12, ...]. Pinned
+        // entry (seq 10) is at visible-index 4, not 9.
+        let filtered: Vec<LogEntry> = full.iter().filter(|e| e.seq % 2 == 0).cloned().collect();
+
+        let mut sc = SourceColors::new();
+        let labels = HashMap::new();
+        let result = layout(
+            &pinned,
+            &filtered,
+            24,
+            80,
+            DisplayMode::Preview,
+            false,
+            &mut sc,
+            None,
+            true,
+            &labels,
+        );
+
+        let cursor_entry = result
+            .entries
+            .iter()
+            .find(|e| e.is_cursor)
+            .expect("a cursor entry");
+        // entry_index is the index into `filtered`; the pinned entry is at
+        // visible-index 4 there.
+        assert_eq!(cursor_entry.entry_index, 4);
+        assert_eq!(filtered[cursor_entry.entry_index].seq, 10);
     }
 
     #[test]
@@ -777,15 +929,31 @@ mod tests {
 
     #[test]
     fn new_entries_since_pin_tail() {
-        assert_eq!(new_entries_since_pin(&ScrollState::Tail, 100), 0);
+        let entries = make_entries(100);
+        assert_eq!(new_entries_since_pin(&ScrollState::Tail, &entries), 0);
     }
 
     #[test]
     fn new_entries_since_pin_pinned() {
+        let entries = make_entries(100);
+        // Pin at index 50 (seq 51); 49 entries follow it.
+        let state = ScrollState::pinned(&entries, 50, 40);
+        assert_eq!(new_entries_since_pin(&state, &entries), 49);
+    }
+
+    #[test]
+    fn new_entries_since_pin_when_pinned_entry_filtered_out() {
+        // If the pinned entry's seq is no longer in `entries`, count the
+        // entries with strictly greater seq — not "everything after the
+        // resolved nearest match", which would be wrong.
+        let mut entries = make_entries(10);
+        // Remove the entry with seq 5.
+        entries.retain(|e| e.seq != 5);
         let state = ScrollState::Pinned {
-            cursor: 50,
-            top: 40,
+            cursor_seq: 5,
+            top_seq: 5,
         };
-        assert_eq!(new_entries_since_pin(&state, 100), 49);
+        // Entries with seq > 5: 6, 7, 8, 9, 10 → 5
+        assert_eq!(new_entries_since_pin(&state, &entries), 5);
     }
 }

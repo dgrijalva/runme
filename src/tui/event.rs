@@ -204,13 +204,7 @@ pub async fn run_event_loop(
 
 /// Source TaskId of the log entry under the log viewer's cursor.
 fn log_cursor_source(entries: &[LogEntry], scroll: &viewport::ScrollState) -> Option<TaskId> {
-    if entries.is_empty() {
-        return None;
-    }
-    let idx = match *scroll {
-        viewport::ScrollState::Tail => entries.len() - 1,
-        viewport::ScrollState::Pinned { cursor, .. } => cursor.min(entries.len() - 1),
-    };
+    let idx = scroll.cursor_index(entries)?;
     entries.get(idx).map(|e| e.source)
 }
 
@@ -641,17 +635,19 @@ fn handle_mouse(
                         let entry_start = ve.y as usize;
                         let entry_end = entry_start + ve.lines.len();
                         if log_y >= entry_start && log_y < entry_end {
-                            state.scroll = viewport::ScrollState::Pinned {
-                                cursor: ve.entry_index,
-                                top: match state.scroll {
-                                    viewport::ScrollState::Pinned { top, .. } => top,
-                                    viewport::ScrollState::Tail => vp_layout
-                                        .entries
-                                        .first()
-                                        .map(|e| e.entry_index)
-                                        .unwrap_or(0),
-                                },
+                            let top_idx = match state.scroll.resolve(&filtered_entries) {
+                                Some(r) => r.top,
+                                None => vp_layout
+                                    .entries
+                                    .first()
+                                    .map(|e| e.entry_index)
+                                    .unwrap_or(0),
                             };
+                            state.scroll = viewport::ScrollState::pinned(
+                                &filtered_entries,
+                                ve.entry_index,
+                                top_idx,
+                            );
                             state.sidebar.focused = false;
                             state.dirty = true;
                             break;
