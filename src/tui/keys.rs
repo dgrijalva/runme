@@ -537,18 +537,12 @@ pub(super) fn handle_filter_input_key(key: KeyEvent, state: &mut AppState) {
         KeyCode::Up => {
             if !state.filter_history.is_empty() {
                 let idx = match state.filter_history_index {
-                    Some(i) => {
-                        if i > 0 {
-                            i - 1
-                        } else {
-                            0
-                        }
-                    }
+                    Some(i) => i.saturating_sub(1),
                     None => state.filter_history.len() - 1,
                 };
                 state.filter_history_index = Some(idx);
-                state.filter_input.text = state.filter_history[idx].clone();
-                state.filter_input.cursor = state.filter_input.text.len();
+                let text = state.filter_history[idx].clone();
+                state.filter_input.set_text(text);
             }
         }
 
@@ -558,13 +552,12 @@ pub(super) fn handle_filter_input_key(key: KeyEvent, state: &mut AppState) {
                 if idx + 1 < state.filter_history.len() {
                     let new_idx = idx + 1;
                     state.filter_history_index = Some(new_idx);
-                    state.filter_input.text = state.filter_history[new_idx].clone();
-                    state.filter_input.cursor = state.filter_input.text.len();
+                    let text = state.filter_history[new_idx].clone();
+                    state.filter_input.set_text(text);
                 } else {
                     // Past the end of history — clear to empty
                     state.filter_history_index = None;
-                    state.filter_input.text.clear();
-                    state.filter_input.cursor = 0;
+                    state.filter_input.clear();
                 }
             }
         }
@@ -1985,6 +1978,38 @@ mod tests {
         );
         assert!(state.filter_input.text.is_empty());
         assert!(state.filter_history_index.is_none());
+    }
+
+    #[test]
+    fn filter_history_nav_updates_active_filter() {
+        // Regression: arrow navigation through filter history must update
+        // `last_valid_expr` so that pressing Enter applies the selected
+        // filter. Previously, arrow handlers set `text` but never reparsed,
+        // so Enter no-op'd against whatever filter was active on entry.
+        let mut state = AppState::new();
+        state.filter_history = vec!["level:warn".to_string()];
+        state.mode = AppMode::FilterInput;
+        state.filter_input.save_current();
+        assert!(state.filter_input.active_expr().is_none());
+
+        // Up arrow selects history entry — must take effect immediately.
+        handle_filter_input_key(make_key_event(KeyCode::Up, KeyModifiers::NONE), &mut state);
+        assert_eq!(state.filter_input.text, "level:warn");
+        assert!(
+            state.filter_input.active_expr().is_some(),
+            "history nav must reparse so the active filter matches the displayed text"
+        );
+
+        // Down past end clears to empty and clears the active filter.
+        handle_filter_input_key(
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(state.filter_input.text.is_empty());
+        assert!(
+            state.filter_input.active_expr().is_none(),
+            "clearing input must clear the active filter"
+        );
     }
 
     #[test]

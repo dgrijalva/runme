@@ -123,6 +123,16 @@ impl FilterInputState {
         }
     }
 
+    /// Replace the input text wholesale (e.g. when navigating filter history),
+    /// place the cursor at the end, and re-derive `last_valid_expr` from it.
+    /// Without re-parsing here, history navigation would leave `last_valid_expr`
+    /// pointing at the previously-applied filter — so Enter would no-op.
+    pub fn set_text(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.text.len();
+        self.reparse();
+    }
+
     /// Clear the input (Ctrl-u).
     pub fn clear(&mut self) {
         self.text.clear();
