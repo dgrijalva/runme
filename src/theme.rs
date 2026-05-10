@@ -62,6 +62,12 @@ pub struct Theme {
     pub search_match_bg: Color,
     pub search_match_fg: Color,
 
+    // Filter highlighting (positive value matches from a filter expression).
+    // Distinct from search so the two can be visually told apart when both
+    // are active simultaneously.
+    pub filter_match_bg: Color,
+    pub filter_match_fg: Color,
+
     // Source palette (cycled for multi-source logs)
     pub source_palette: &'static [Color],
 }
@@ -88,6 +94,9 @@ impl Default for Theme {
 
             search_match_bg: Color::Yellow,
             search_match_fg: Color::Black,
+
+            filter_match_bg: Color::Cyan,
+            filter_match_fg: Color::Black,
 
             source_palette: &[
                 Color::Cyan,

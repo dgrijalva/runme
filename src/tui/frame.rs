@@ -29,12 +29,14 @@ pub fn render_frame(
     terminal.draw(|frame| {
         let area = frame.area();
 
-        // Vertical layout: main content + optional input bar + status bar
+        // Vertical layout: main content + optional input bar + status bar.
+        // The input bar is a 3-row bordered chrome (top border, input row,
+        // bottom border) when in filter/search mode.
         let has_input_bar = matches!(state.mode, AppMode::FilterInput | AppMode::SearchInput);
         let vert_chunks = if has_input_bar {
             Layout::vertical([
                 Constraint::Min(0),    // main content area
-                Constraint::Length(1), // input bar
+                Constraint::Length(3), // input bar (bordered)
                 Constraint::Length(1), // status bar
             ])
             .split(area)
@@ -153,6 +155,14 @@ pub fn render_frame(
             };
             let current_search_entry = state.search.current_match_index();
 
+            // Collect positive value-match literals from the active filter
+            // expression so they highlight in the visible log too.
+            let filter_literals: Vec<String> = state
+                .filter_input
+                .active_expr()
+                .map(|expr| crate::log::filter::collect_positive_literals(expr))
+                .unwrap_or_default();
+
             // Place rendered entries into the buffer at their Y positions
             let cursor_bg = if state.sidebar.focused {
                 THEME.selection_bg_dim
@@ -167,12 +177,21 @@ pub fn render_frame(
                 for (line_offset, line) in ve.lines.iter().enumerate() {
                     let y = ve.y as usize + line_offset;
                     if y < log_height as usize {
-                        // Apply search highlighting if search is active
-                        let display_line = if let Some(ref pattern) = search_pattern {
-                            apply_search_highlight(line, pattern, is_current_search_match)
+                        // Apply filter highlighting first (lower priority).
+                        let mut display_line = if !filter_literals.is_empty() {
+                            apply_filter_highlight(line, &filter_literals)
                         } else {
                             line.clone()
                         };
+                        // Then overlay search highlighting (higher priority,
+                        // so the bg wins for substrings matching both).
+                        if let Some(ref pattern) = search_pattern {
+                            display_line = apply_search_highlight(
+                                &display_line,
+                                pattern,
+                                is_current_search_match,
+                            );
+                        }
 
                         if ve.is_cursor {
                             // Highlight the focused row
@@ -1001,6 +1020,62 @@ fn render_notifications(
     ]);
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, notif_area);
+}
+
+/// Apply filter-positive-literal highlighting to a rendered line.
+///
+/// For each literal collected from the active filter expression, walks the
+/// line's spans and styles substring matches with the filter highlight color.
+/// Empty `literals` is a no-op; callers should avoid the call in that case.
+fn apply_filter_highlight(line: &Line<'static>, literals: &[String]) -> Line<'static> {
+    use super::search::find_match_ranges;
+
+    let hl_style = Style::default()
+        .bg(THEME.filter_match_bg)
+        .fg(THEME.filter_match_fg);
+
+    let mut new_spans: Vec<Span<'static>> = Vec::new();
+    for span in &line.spans {
+        let text: &str = &span.content;
+
+        // Collect all match ranges across all literals, then merge overlaps.
+        let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+        for lit in literals {
+            ranges.extend(find_match_ranges(text, lit));
+        }
+        if ranges.is_empty() {
+            new_spans.push(span.clone());
+            continue;
+        }
+        ranges.sort_by_key(|r| r.start);
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+        for r in ranges {
+            if let Some(last) = merged.last_mut() {
+                if r.start <= last.end {
+                    if r.end > last.end {
+                        last.end = r.end;
+                    }
+                    continue;
+                }
+            }
+            merged.push(r);
+        }
+
+        let mut pos = 0;
+        for range in &merged {
+            if range.start > pos {
+                new_spans.push(Span::styled(text[pos..range.start].to_string(), span.style));
+            }
+            let style = span.style.patch(hl_style);
+            new_spans.push(Span::styled(text[range.start..range.end].to_string(), style));
+            pos = range.end;
+        }
+        if pos < text.len() {
+            new_spans.push(Span::styled(text[pos..].to_string(), span.style));
+        }
+    }
+
+    Line::from(new_spans)
 }
 
 /// Apply search highlighting to a rendered line.

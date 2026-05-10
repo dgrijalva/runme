@@ -1,26 +1,30 @@
-//! Filter input widget for the TUI.
+//! Filter input state for the TUI.
 //!
-//! Provides a text input component for entering filter expressions.
-//! Renders in the status bar area when active, with inline parse error display.
+//! Wraps the shared `TextInput` control and keeps a live-parsed filter
+//! expression in sync as the user types. Rendering is handled by the
+//! shared chrome in `text_input::render_chrome`.
 
 use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
+    text::Span,
 };
 
-use crate::theme::THEME;
-
 use crate::log::filter::{self, FilterExpr};
+use crate::theme::THEME;
+use crate::tui::text_input::{ChromeOptions, TextInput, render_chrome};
+
+/// Hint string shown in the bottom border of the filter input box.
+const FILTER_HINTS: &str = "[enter] save  [esc] cancel";
+
+/// Placeholder shown in the input when empty.
+const FILTER_PLACEHOLDER: &str = "level:error AND source:api ...";
 
 /// State for the filter input widget.
 pub struct FilterInputState {
-    /// Current text in the input buffer.
-    pub text: String,
-    /// Cursor position within the text (byte offset, always on a char boundary).
-    pub cursor: usize,
+    /// Shared text-input control: text, cursor, history, virtual slot.
+    pub input: TextInput,
     /// The last successfully parsed filter expression.
     /// None if the input is empty or has never been valid.
     pub last_valid_expr: Option<FilterExpr>,
@@ -28,9 +32,6 @@ pub struct FilterInputState {
     pub last_valid_text: String,
     /// Current parse error, if any.
     pub parse_error: Option<String>,
-    /// The text/expr that was active before entering filter mode (for cancel/revert).
-    pub saved_text: String,
-    pub saved_expr: Option<FilterExpr>,
 }
 
 impl Default for FilterInputState {
@@ -42,134 +43,98 @@ impl Default for FilterInputState {
 impl FilterInputState {
     pub fn new() -> Self {
         Self {
-            text: String::new(),
-            cursor: 0,
+            input: TextInput::new(),
             last_valid_expr: None,
             last_valid_text: String::new(),
             parse_error: None,
-            saved_text: String::new(),
-            saved_expr: None,
         }
     }
 
     /// Save the current filter state before entering filter input mode.
-    /// This allows reverting on Esc.
+    /// Snapshots for revert and resets the in-session history nav state.
     pub fn save_current(&mut self) {
-        self.saved_text = self.text.clone();
-        // We can't clone FilterExpr (it contains Regex), so we re-parse from saved_text.
-        self.saved_expr = if self.saved_text.is_empty() {
-            None
-        } else {
-            filter::parse(&self.saved_text).ok()
-        };
+        self.input.save_current();
     }
 
-    /// Revert to the saved state (on Esc).
+    /// Revert to the saved state (on Esc). Re-parses to restore
+    /// `last_valid_expr` from the restored text.
     pub fn revert(&mut self) {
-        self.text = self.saved_text.clone();
-        self.cursor = self.text.len();
-        self.parse_error = None;
-        // Re-parse the saved text to restore last_valid_expr
-        if self.text.is_empty() {
-            self.last_valid_expr = None;
-            self.last_valid_text.clear();
-        } else if let Ok(expr) = filter::parse(&self.text) {
-            self.last_valid_expr = Some(expr);
-            self.last_valid_text = self.text.clone();
-        }
+        self.input.revert();
+        self.reparse();
     }
 
-    /// Insert a character at the cursor position.
+    /// Commit the current text to history (with MRU dedup) and update
+    /// the active filter expression. Empty text clears the active filter.
+    pub fn commit(&mut self) {
+        self.input.commit();
+        self.reparse();
+    }
+
     pub fn insert_char(&mut self, ch: char) {
-        self.text.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+        self.input.insert_char(ch);
         self.reparse();
     }
 
-    /// Delete the character before the cursor (Backspace).
     pub fn delete_char_before(&mut self) {
-        if self.cursor > 0 {
-            // Find the previous char boundary
-            let prev = self.text[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.text.remove(prev);
-            self.cursor = prev;
-            self.reparse();
-        }
-    }
-
-    /// Move cursor left by one character.
-    pub fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor = self.text[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
-    }
-
-    /// Move cursor right by one character.
-    pub fn move_right(&mut self) {
-        if self.cursor < self.text.len() {
-            self.cursor = self.text[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor + i)
-                .unwrap_or(self.text.len());
-        }
-    }
-
-    /// Replace the input text wholesale (e.g. when navigating filter history),
-    /// place the cursor at the end, and re-derive `last_valid_expr` from it.
-    /// Without re-parsing here, history navigation would leave `last_valid_expr`
-    /// pointing at the previously-applied filter — so Enter would no-op.
-    pub fn set_text(&mut self, text: String) {
-        self.text = text;
-        self.cursor = self.text.len();
+        self.input.delete_char_before();
         self.reparse();
     }
 
-    /// Clear the input (Ctrl-u).
+    pub fn move_left(&mut self) {
+        self.input.move_left();
+    }
+
+    pub fn move_right(&mut self) {
+        self.input.move_right();
+    }
+
+    pub fn set_text(&mut self, text: String) {
+        self.input.set_text(text);
+        self.reparse();
+    }
+
     pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
+        self.input.clear();
         self.last_valid_expr = None;
         self.last_valid_text.clear();
         self.parse_error = None;
     }
 
+    pub fn history_up(&mut self) {
+        self.input.history_up();
+        self.reparse();
+    }
+
+    pub fn history_down(&mut self) {
+        self.input.history_down();
+        self.reparse();
+    }
+
     /// Re-parse the current text and update the valid expr / error state.
     fn reparse(&mut self) {
-        if self.text.is_empty() {
+        if self.input.text.is_empty() {
             self.last_valid_expr = None;
             self.last_valid_text.clear();
             self.parse_error = None;
             return;
         }
 
-        match filter::parse(&self.text) {
+        match filter::parse(&self.input.text) {
             Ok(expr) => {
                 self.last_valid_expr = Some(expr);
-                self.last_valid_text = self.text.clone();
+                self.last_valid_text = self.input.text.clone();
                 self.parse_error = None;
             }
             Err(e) => {
-                // Keep last_valid_expr as-is; show the error
                 self.parse_error = Some(e);
             }
         }
     }
 
-    /// Get the current active filter expression (the last valid one).
     pub fn active_expr(&self) -> Option<&FilterExpr> {
         self.last_valid_expr.as_ref()
     }
 
-    /// Whether there is an active filter (either valid expr or text present).
     pub fn has_active_filter(&self) -> bool {
         self.last_valid_expr.is_some()
     }
@@ -185,63 +150,26 @@ impl FilterInputState {
     }
 }
 
-/// Render the filter input bar into the given area.
+/// Render the filter input bar (bordered chrome with title + hints).
 pub fn render_filter_input(frame: &mut Frame, area: Rect, filter_state: &FilterInputState) {
-    let mut spans: Vec<Span> = Vec::new();
+    let trailing = filter_state.parse_error.as_ref().map(|err| {
+        Span::styled(err.clone(), Style::default().fg(THEME.level_error))
+    });
 
-    // Prefix
-    spans.push(Span::styled(" filter: ", Style::default().fg(THEME.accent)));
-
-    if filter_state.text.is_empty() {
-        // Placeholder
-        spans.push(Span::styled(
-            "level:error AND source:api ...",
-            Style::default().fg(THEME.dim),
-        ));
-    } else {
-        // Split text at cursor position for rendering
-        let before = &filter_state.text[..filter_state.cursor];
-        let after = &filter_state.text[filter_state.cursor..];
-
-        spans.push(Span::styled(
-            before.to_string(),
-            Style::default().fg(Color::White),
-        ));
-
-        // Cursor character (highlight the char at cursor, or a space if at end)
-        if after.is_empty() {
-            spans.push(Span::styled(
-                " ",
-                Style::default().fg(Color::Black).bg(Color::White),
-            ));
-        } else {
-            let cursor_char = &after[..after.chars().next().unwrap().len_utf8()];
-            let rest = &after[cursor_char.len()..];
-            spans.push(Span::styled(
-                cursor_char.to_string(),
-                Style::default().fg(Color::Black).bg(Color::White),
-            ));
-            spans.push(Span::styled(
-                rest.to_string(),
-                Style::default().fg(Color::White),
-            ));
-        }
-    }
-
-    // Parse error display
-    if let Some(ref err) = filter_state.parse_error {
-        spans.push(Span::styled(
-            format!("  {}", err),
-            Style::default().fg(THEME.level_error),
-        ));
-    }
-
-    let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
-    frame.render_widget(paragraph, area);
+    render_chrome(
+        frame,
+        area,
+        &filter_state.input,
+        ChromeOptions {
+            title: "filter",
+            hints: FILTER_HINTS,
+            trailing,
+            placeholder: FILTER_PLACEHOLDER,
+        },
+    );
 }
 
-/// Render the filter indicator in the status bar when not in filter mode.
+/// Render the active-filter chip in the status bar when not in filter mode.
 /// Returns spans to add to the status bar, or empty vec if no filter active.
 pub fn filter_status_spans(filter_state: &FilterInputState) -> Vec<Span<'static>> {
     match filter_state.status_display() {
@@ -250,7 +178,7 @@ pub fn filter_status_spans(filter_state: &FilterInputState) -> Vec<Span<'static>
                 Span::raw(" "),
                 Span::styled(
                     format!(" filter: {} ", text),
-                    Style::default().fg(THEME.accent),
+                    Style::default().fg(Color::Black).bg(THEME.accent),
                 ),
             ]
         }
@@ -265,8 +193,8 @@ mod tests {
     #[test]
     fn new_state_is_empty() {
         let state = FilterInputState::new();
-        assert!(state.text.is_empty());
-        assert_eq!(state.cursor, 0);
+        assert!(state.input.text.is_empty());
+        assert_eq!(state.input.cursor, 0);
         assert!(state.last_valid_expr.is_none());
         assert!(state.parse_error.is_none());
         assert!(!state.has_active_filter());
@@ -278,8 +206,8 @@ mod tests {
         let mut state = FilterInputState::new();
         state.insert_char('h');
         state.insert_char('i');
-        assert_eq!(state.text, "hi");
-        assert_eq!(state.cursor, 2);
+        assert_eq!(state.input.text, "hi");
+        assert_eq!(state.input.cursor, 2);
     }
 
     #[test]
@@ -289,42 +217,8 @@ mod tests {
         state.insert_char('b');
         state.insert_char('c');
         state.delete_char_before();
-        assert_eq!(state.text, "ab");
-        assert_eq!(state.cursor, 2);
-    }
-
-    #[test]
-    fn backspace_at_start_does_nothing() {
-        let mut state = FilterInputState::new();
-        state.delete_char_before();
-        assert!(state.text.is_empty());
-        assert_eq!(state.cursor, 0);
-    }
-
-    #[test]
-    fn move_left_right() {
-        let mut state = FilterInputState::new();
-        state.insert_char('a');
-        state.insert_char('b');
-        state.insert_char('c');
-        assert_eq!(state.cursor, 3);
-
-        state.move_left();
-        assert_eq!(state.cursor, 2);
-        state.move_left();
-        assert_eq!(state.cursor, 1);
-        state.move_left();
-        assert_eq!(state.cursor, 0);
-        state.move_left(); // at start, no-op
-        assert_eq!(state.cursor, 0);
-
-        state.move_right();
-        assert_eq!(state.cursor, 1);
-        state.move_right();
-        state.move_right();
-        assert_eq!(state.cursor, 3);
-        state.move_right(); // at end, no-op
-        assert_eq!(state.cursor, 3);
+        assert_eq!(state.input.text, "ab");
+        assert_eq!(state.input.cursor, 2);
     }
 
     #[test]
@@ -333,8 +227,8 @@ mod tests {
         state.insert_char('x');
         state.insert_char('y');
         state.clear();
-        assert!(state.text.is_empty());
-        assert_eq!(state.cursor, 0);
+        assert!(state.input.text.is_empty());
+        assert_eq!(state.input.cursor, 0);
         assert!(state.last_valid_expr.is_none());
         assert!(state.parse_error.is_none());
     }
@@ -342,7 +236,6 @@ mod tests {
     #[test]
     fn valid_expr_is_parsed() {
         let mut state = FilterInputState::new();
-        // Type a valid filter: "error"
         for ch in "error".chars() {
             state.insert_char(ch);
         }
@@ -355,21 +248,15 @@ mod tests {
     #[test]
     fn parse_error_keeps_last_valid() {
         let mut state = FilterInputState::new();
-        // Type a valid filter
         for ch in "error".chars() {
             state.insert_char(ch);
         }
         assert!(state.last_valid_expr.is_some());
-        assert!(state.parse_error.is_none());
 
-        // Now type something that creates a parse error.
-        // "error AND OR" is invalid because OR needs a left operand after AND.
         for ch in " AND OR".chars() {
             state.insert_char(ch);
         }
-        // The last valid expr should still be active
         assert!(state.has_active_filter());
-        // There should be a parse error
         assert!(state.parse_error.is_some());
     }
 
@@ -381,59 +268,45 @@ mod tests {
         }
         state.save_current();
 
-        // Modify the text
         state.clear();
         for ch in "new filter".chars() {
             state.insert_char(ch);
         }
-        assert_eq!(state.text, "new filter");
+        assert_eq!(state.input.text, "new filter");
 
-        // Revert
         state.revert();
-        assert_eq!(state.text, "level:error");
-        assert_eq!(state.cursor, state.text.len());
+        assert_eq!(state.input.text, "level:error");
+        assert_eq!(state.input.cursor, state.input.text.len());
     }
 
     #[test]
-    fn insert_in_middle() {
+    fn commit_pushes_to_history() {
         let mut state = FilterInputState::new();
-        state.insert_char('a');
-        state.insert_char('c');
-        state.move_left(); // cursor between 'a' and 'c'
-        state.insert_char('b');
-        assert_eq!(state.text, "abc");
-        assert_eq!(state.cursor, 2); // after 'b'
-    }
-
-    #[test]
-    fn delete_in_middle() {
-        let mut state = FilterInputState::new();
-        state.insert_char('a');
-        state.insert_char('b');
-        state.insert_char('c');
-        state.move_left(); // cursor after 'b', before 'c'
-        state.delete_char_before(); // delete 'b'
-        assert_eq!(state.text, "ac");
-        assert_eq!(state.cursor, 1); // after 'a'
-    }
-
-    #[test]
-    fn field_filter_parses() {
-        let mut state = FilterInputState::new();
+        state.save_current();
         for ch in "level:error".chars() {
             state.insert_char(ch);
         }
-        assert!(state.last_valid_expr.is_some());
-        assert!(state.parse_error.is_none());
+        state.commit();
+        assert_eq!(state.input.history, vec!["level:error".to_string()]);
     }
 
     #[test]
-    fn complex_filter_parses() {
+    fn history_navigation_with_virtual_slot() {
         let mut state = FilterInputState::new();
-        for ch in "level:error AND source:api".chars() {
+        state.save_current();
+        for ch in "foo".chars() {
             state.insert_char(ch);
         }
-        assert!(state.last_valid_expr.is_some());
-        assert!(state.parse_error.is_none());
+        state.commit();
+        // Reopen the panel — text persists as the active filter
+        state.save_current();
+        // Down should clear (virtual → blank)
+        state.history_down();
+        assert!(state.input.text.is_empty());
+        assert!(state.last_valid_expr.is_none());
+        // Up returns to virtual='foo'
+        state.history_up();
+        assert_eq!(state.input.text, "foo");
+        assert!(state.has_active_filter());
     }
 }

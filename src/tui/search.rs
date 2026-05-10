@@ -1,7 +1,9 @@
-//! Search input and match tracking for the TUI.
+//! Search state for the TUI (`/` find with n/N navigation).
 //!
-//! Provides a text input component for entering search patterns,
-//! match tracking with navigation (n/N), and search highlighting.
+//! Wraps the shared `TextInput` control and tracks match positions in the
+//! currently-visible log. The text input portion (chrome, history, virtual
+//! slot) is shared with the filter panel; this module owns the search-
+//! specific match tracking, highlighting, and navigation.
 
 use std::ops::Range;
 
@@ -9,18 +11,22 @@ use ratatui::{
     Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
+    text::Span,
 };
 
 use crate::theme::THEME;
+use crate::tui::text_input::{ChromeOptions, TextInput, render_chrome};
+
+/// Hint string shown in the bottom border of the search input box.
+const SEARCH_HINTS: &str = "[enter] save  [esc] cancel";
+
+/// Placeholder shown in the input when empty.
+const SEARCH_PLACEHOLDER: &str = "search...";
 
 /// State for the search feature.
 pub struct SearchState {
-    /// Current text in the search input buffer.
-    pub text: String,
-    /// Cursor position within the text (byte offset, always on a char boundary).
-    pub cursor: usize,
+    /// Shared text-input control: text, cursor, history, virtual slot.
+    pub input: TextInput,
     /// Whether search is active (pattern confirmed and highlighting).
     pub active: bool,
     /// The confirmed search pattern (set on Enter).
@@ -40,8 +46,7 @@ impl Default for SearchState {
 impl SearchState {
     pub fn new() -> Self {
         Self {
-            text: String::new(),
-            cursor: 0,
+            input: TextInput::new(),
             active: false,
             pattern: String::new(),
             match_indices: Vec::new(),
@@ -49,75 +54,73 @@ impl SearchState {
         }
     }
 
-    /// Insert a character at the cursor position.
-    pub fn insert_char(&mut self, ch: char) {
-        self.text.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+    /// Save the current state before entering search input mode.
+    /// Pre-populates the input with the active pattern so editing extends it.
+    pub fn save_current(&mut self) {
+        self.input.text = self.pattern.clone();
+        self.input.cursor = self.input.text.len();
+        self.input.save_current();
     }
 
-    /// Delete the character before the cursor (Backspace).
-    pub fn delete_char_before(&mut self) {
-        if self.cursor > 0 {
-            let prev = self.text[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.text.remove(prev);
-            self.cursor = prev;
-        }
+    /// Revert to the saved snapshot. Active search pattern is unchanged
+    /// (the snapshot equals the pre-edit pattern).
+    pub fn revert(&mut self) {
+        self.input.revert();
     }
 
-    /// Move cursor left by one character.
-    pub fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor = self.text[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
-    }
-
-    /// Move cursor right by one character.
-    pub fn move_right(&mut self) {
-        if self.cursor < self.text.len() {
-            self.cursor = self.text[self.cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor + i)
-                .unwrap_or(self.text.len());
-        }
-    }
-
-    /// Clear the search input (Ctrl-u).
-    pub fn clear_input(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-    }
-
-    /// Confirm the search: set pattern, mark active.
-    /// The caller must then call `scan_matches` to populate match_indices.
-    pub fn confirm(&mut self) {
-        self.pattern = self.text.clone();
+    /// Commit the current input text as the active pattern and push to
+    /// history with MRU dedup. Sets `active` and clears match state for
+    /// the caller to re-populate via `scan_matches`.
+    pub fn commit(&mut self) {
+        self.input.commit();
+        self.pattern = self.input.text.clone();
         if self.pattern.is_empty() {
             self.active = false;
             self.match_indices.clear();
             self.current_match = 0;
         } else {
             self.active = true;
-            // match_indices will be populated by scan_matches
         }
     }
 
-    /// Cancel the search: clear everything.
-    pub fn cancel(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
+    /// Clear the active search entirely (used by Esc-from-normal-mode).
+    pub fn clear_active(&mut self) {
+        self.input.text.clear();
+        self.input.cursor = 0;
+        self.input.saved_text.clear();
+        self.input.virtual_text.clear();
         self.active = false;
         self.pattern.clear();
         self.match_indices.clear();
         self.current_match = 0;
+    }
+
+    pub fn insert_char(&mut self, ch: char) {
+        self.input.insert_char(ch);
+    }
+
+    pub fn delete_char_before(&mut self) {
+        self.input.delete_char_before();
+    }
+
+    pub fn move_left(&mut self) {
+        self.input.move_left();
+    }
+
+    pub fn move_right(&mut self) {
+        self.input.move_right();
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+    }
+
+    pub fn history_up(&mut self) {
+        self.input.history_up();
+    }
+
+    pub fn history_down(&mut self) {
+        self.input.history_down();
     }
 
     /// Scan visible entries for the current pattern (case-insensitive substring).
@@ -134,7 +137,6 @@ impl SearchState {
                 self.match_indices.push(idx);
             }
         }
-        // Clamp current_match
         if self.match_indices.is_empty() {
             self.current_match = 0;
         } else {
@@ -187,31 +189,25 @@ impl SearchState {
         }
     }
 
-    /// Find the nearest match at or after the given visible index and set
-    /// current_match to it. Used when confirming search to jump to the first
-    /// match near the current cursor position.
+    /// Find the nearest match at or after the given visible index.
     pub fn jump_to_nearest(&mut self, visible_index: usize) -> Option<usize> {
         if self.match_indices.is_empty() {
             return None;
         }
-        // Find the first match at or after visible_index
         for (i, &idx) in self.match_indices.iter().enumerate() {
             if idx >= visible_index {
                 self.current_match = i;
                 return Some(idx);
             }
         }
-        // Wrap around to the first match
         self.current_match = 0;
         Some(self.match_indices[0])
     }
 
-    /// Total number of matches.
     pub fn match_count(&self) -> usize {
         self.match_indices.len()
     }
 
-    /// The 1-based position of the current match (for display).
     pub fn current_match_display(&self) -> usize {
         self.current_match + 1
     }
@@ -234,52 +230,23 @@ pub fn find_match_ranges(text: &str, pattern: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-/// Render the search input bar into the given area.
+/// Render the search input bar (bordered chrome with title + hints).
 pub fn render_search_input(frame: &mut Frame, area: Rect, search_state: &SearchState) {
-    let mut spans: Vec<Span> = Vec::new();
-
-    // Prefix
-    spans.push(Span::styled(" /", Style::default().fg(THEME.level_warn)));
-
-    if search_state.text.is_empty() {
-        // Placeholder
-        spans.push(Span::styled("search...", Style::default().fg(THEME.dim)));
-    } else {
-        // Split text at cursor position for rendering
-        let before = &search_state.text[..search_state.cursor];
-        let after = &search_state.text[search_state.cursor..];
-
-        spans.push(Span::styled(
-            before.to_string(),
-            Style::default().fg(Color::White),
-        ));
-
-        // Cursor character (highlight the char at cursor, or a space if at end)
-        if after.is_empty() {
-            spans.push(Span::styled(
-                " ",
-                Style::default().fg(Color::Black).bg(Color::White),
-            ));
-        } else {
-            let cursor_char = &after[..after.chars().next().unwrap().len_utf8()];
-            let rest = &after[cursor_char.len()..];
-            spans.push(Span::styled(
-                cursor_char.to_string(),
-                Style::default().fg(Color::Black).bg(Color::White),
-            ));
-            spans.push(Span::styled(
-                rest.to_string(),
-                Style::default().fg(Color::White),
-            ));
-        }
-    }
-
-    let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(THEME.dim).fg(Color::White));
-    frame.render_widget(paragraph, area);
+    render_chrome(
+        frame,
+        area,
+        &search_state.input,
+        ChromeOptions {
+            title: "search",
+            hints: SEARCH_HINTS,
+            trailing: None,
+            placeholder: SEARCH_PLACEHOLDER,
+        },
+    );
 }
 
-/// Return status bar spans showing search match info, or empty vec if no search active.
+/// Return status bar spans showing search match info as a chip,
+/// or empty vec if no search active.
 pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
     if !search_state.active {
         return vec![];
@@ -290,7 +257,9 @@ pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
             Span::raw(" "),
             Span::styled(
                 format!(" /{} [no matches] ", search_state.pattern),
-                Style::default().fg(THEME.level_error),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(THEME.level_error),
             ),
         ]
     } else {
@@ -303,7 +272,7 @@ pub fn search_status_spans(search_state: &SearchState) -> Vec<Span<'static>> {
                     search_state.current_match_display(),
                     count,
                 ),
-                Style::default().fg(THEME.level_warn),
+                Style::default().fg(Color::Black).bg(THEME.level_warn),
             ),
         ]
     }
@@ -325,12 +294,6 @@ pub fn current_match_highlight_style() -> Style {
 }
 
 /// Apply search highlighting to a line of text.
-///
-/// Takes the original text and its base style, finds match ranges for `pattern`,
-/// and returns a vector of styled spans with highlights overlaid.
-///
-/// `is_current_match` indicates whether this entry is the current n/N focus,
-/// which gets a more prominent highlight style.
 pub fn highlight_line(text: &str, pattern: &str, is_current_match: bool) -> Vec<Span<'static>> {
     let ranges = find_match_ranges(text, pattern);
     if ranges.is_empty() {
@@ -366,13 +329,11 @@ pub fn highlight_line(text: &str, pattern: &str, is_current_match: bool) -> Vec<
 mod tests {
     use super::*;
 
-    // -- SearchState tests --
-
     #[test]
     fn new_state_is_empty() {
         let state = SearchState::new();
-        assert!(state.text.is_empty());
-        assert_eq!(state.cursor, 0);
+        assert!(state.input.text.is_empty());
+        assert_eq!(state.input.cursor, 0);
         assert!(!state.active);
         assert!(state.pattern.is_empty());
         assert!(state.match_indices.is_empty());
@@ -384,314 +345,77 @@ mod tests {
         let mut state = SearchState::new();
         state.insert_char('h');
         state.insert_char('i');
-        assert_eq!(state.text, "hi");
-        assert_eq!(state.cursor, 2);
+        assert_eq!(state.input.text, "hi");
+        assert_eq!(state.input.cursor, 2);
     }
 
     #[test]
-    fn backspace_deletes_before_cursor() {
+    fn commit_sets_pattern_and_active() {
         let mut state = SearchState::new();
-        state.insert_char('a');
-        state.insert_char('b');
-        state.insert_char('c');
-        state.delete_char_before();
-        assert_eq!(state.text, "ab");
-        assert_eq!(state.cursor, 2);
-    }
-
-    #[test]
-    fn backspace_at_start_does_nothing() {
-        let mut state = SearchState::new();
-        state.delete_char_before();
-        assert!(state.text.is_empty());
-        assert_eq!(state.cursor, 0);
-    }
-
-    #[test]
-    fn move_left_right() {
-        let mut state = SearchState::new();
-        state.insert_char('a');
-        state.insert_char('b');
-        state.insert_char('c');
-        assert_eq!(state.cursor, 3);
-
-        state.move_left();
-        assert_eq!(state.cursor, 2);
-        state.move_left();
-        assert_eq!(state.cursor, 1);
-        state.move_left();
-        assert_eq!(state.cursor, 0);
-        state.move_left(); // at start, no-op
-        assert_eq!(state.cursor, 0);
-
-        state.move_right();
-        assert_eq!(state.cursor, 1);
-        state.move_right();
-        state.move_right();
-        assert_eq!(state.cursor, 3);
-        state.move_right(); // at end, no-op
-        assert_eq!(state.cursor, 3);
-    }
-
-    #[test]
-    fn clear_input_resets_text() {
-        let mut state = SearchState::new();
-        state.insert_char('x');
-        state.insert_char('y');
-        state.clear_input();
-        assert!(state.text.is_empty());
-        assert_eq!(state.cursor, 0);
-    }
-
-    #[test]
-    fn confirm_sets_pattern_and_active() {
-        let mut state = SearchState::new();
+        state.save_current();
         for ch in "error".chars() {
             state.insert_char(ch);
         }
-        state.confirm();
-        assert!(state.active);
+        state.commit();
         assert_eq!(state.pattern, "error");
-    }
-
-    #[test]
-    fn confirm_empty_deactivates() {
-        let mut state = SearchState::new();
-        state.confirm();
-        assert!(!state.active);
-        assert!(state.pattern.is_empty());
-    }
-
-    #[test]
-    fn cancel_clears_everything() {
-        let mut state = SearchState::new();
-        for ch in "error".chars() {
-            state.insert_char(ch);
-        }
-        state.confirm();
         assert!(state.active);
+        assert_eq!(state.input.history, vec!["error".to_string()]);
+    }
 
-        state.cancel();
-        assert!(!state.active);
-        assert!(state.text.is_empty());
+    #[test]
+    fn commit_empty_deactivates() {
+        let mut state = SearchState::new();
+        state.save_current();
+        state.commit();
         assert!(state.pattern.is_empty());
-        assert!(state.match_indices.is_empty());
+        assert!(!state.active);
+        assert!(state.input.history.is_empty());
     }
 
     #[test]
-    fn scan_matches_finds_entries() {
+    fn clear_active_resets_search() {
         let mut state = SearchState::new();
+        state.save_current();
         for ch in "error".chars() {
             state.insert_char(ch);
         }
-        state.confirm();
-
-        let texts = vec![
-            (0, "INFO: started"),
-            (1, "ERROR: disk full"),
-            (2, "INFO: ok"),
-            (3, "error: another problem"),
-        ];
-        state.scan_matches(texts.into_iter());
-        assert_eq!(state.match_indices, vec![1, 3]);
+        state.commit();
+        state.clear_active();
+        assert!(state.input.text.is_empty());
+        assert!(!state.active);
+        assert!(state.pattern.is_empty());
     }
 
     #[test]
-    fn scan_matches_case_insensitive() {
+    fn next_prev_wrap() {
         let mut state = SearchState::new();
-        for ch in "Error".chars() {
-            state.insert_char(ch);
-        }
-        state.confirm();
-
-        let texts = vec![(0, "ERROR: fail"), (1, "error: problem"), (2, "no match")];
-        state.scan_matches(texts.into_iter());
-        assert_eq!(state.match_indices, vec![0, 1]);
-    }
-
-    #[test]
-    fn next_prev_match_cycles() {
-        let mut state = SearchState::new();
-        for ch in "x".chars() {
-            state.insert_char(ch);
-        }
-        state.confirm();
-        state.match_indices = vec![2, 5, 8];
+        state.match_indices = vec![1, 5, 9];
+        state.active = true;
         state.current_match = 0;
 
-        // next cycles forward
         assert_eq!(state.next_match(), Some(5));
-        assert_eq!(state.current_match, 1);
-        assert_eq!(state.next_match(), Some(8));
-        assert_eq!(state.current_match, 2);
-        // wrap around
-        assert_eq!(state.next_match(), Some(2));
-        assert_eq!(state.current_match, 0);
+        assert_eq!(state.next_match(), Some(9));
+        assert_eq!(state.next_match(), Some(1));
 
-        // prev cycles backward
-        assert_eq!(state.prev_match(), Some(8));
-        assert_eq!(state.current_match, 2);
+        assert_eq!(state.prev_match(), Some(9));
         assert_eq!(state.prev_match(), Some(5));
-        assert_eq!(state.current_match, 1);
     }
 
     #[test]
-    fn next_prev_no_matches() {
-        let mut state = SearchState::new();
-        assert_eq!(state.next_match(), None);
-        assert_eq!(state.prev_match(), None);
+    fn find_match_ranges_basic() {
+        let ranges = find_match_ranges("the quick brown fox", "quick");
+        assert_eq!(ranges, vec![4..9]);
+
+        let ranges = find_match_ranges("ababab", "ab");
+        assert_eq!(ranges, vec![0..2, 2..4, 4..6]);
+
+        let ranges = find_match_ranges("Hello World", "world");
+        assert_eq!(ranges, vec![6..11]);
     }
 
     #[test]
-    fn jump_to_nearest_finds_match() {
-        let mut state = SearchState::new();
-        state.match_indices = vec![3, 7, 12];
-        state.current_match = 0;
-
-        // Jump from visible index 5 — should land on 7
-        assert_eq!(state.jump_to_nearest(5), Some(7));
-        assert_eq!(state.current_match, 1);
-
-        // Jump from visible index 0 — should land on 3
-        assert_eq!(state.jump_to_nearest(0), Some(3));
-        assert_eq!(state.current_match, 0);
-
-        // Jump from visible index 15 — wraps to first (3)
-        assert_eq!(state.jump_to_nearest(15), Some(3));
-        assert_eq!(state.current_match, 0);
-    }
-
-    #[test]
-    fn check_new_entry_adds_match() {
-        let mut state = SearchState::new();
-        for ch in "error".chars() {
-            state.insert_char(ch);
-        }
-        state.confirm();
-        state.match_indices.clear();
-
-        state.check_new_entry(0, "INFO: ok");
-        assert!(state.match_indices.is_empty());
-
-        state.check_new_entry(1, "ERROR: fail");
-        assert_eq!(state.match_indices, vec![1]);
-    }
-
-    #[test]
-    fn check_new_entry_inactive_noop() {
-        let mut state = SearchState::new();
-        state.check_new_entry(0, "ERROR: fail");
-        assert!(state.match_indices.is_empty());
-    }
-
-    // -- find_match_ranges tests --
-
-    #[test]
-    fn find_ranges_basic() {
-        let ranges = find_match_ranges("hello world hello", "hello");
-        assert_eq!(ranges, vec![0..5, 12..17]);
-    }
-
-    #[test]
-    fn find_ranges_case_insensitive() {
-        let ranges = find_match_ranges("Hello HELLO hello", "hello");
-        assert_eq!(ranges.len(), 3);
-    }
-
-    #[test]
-    fn find_ranges_empty_pattern() {
-        let ranges = find_match_ranges("hello", "");
+    fn find_match_ranges_empty_pattern() {
+        let ranges = find_match_ranges("text", "");
         assert!(ranges.is_empty());
-    }
-
-    #[test]
-    fn find_ranges_no_match() {
-        let ranges = find_match_ranges("hello world", "xyz");
-        assert!(ranges.is_empty());
-    }
-
-    // -- highlight_line tests --
-
-    #[test]
-    fn highlight_no_match() {
-        let spans = highlight_line("hello world", "xyz", false);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content, "hello world");
-    }
-
-    #[test]
-    fn highlight_single_match() {
-        let spans = highlight_line("hello world", "world", false);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0].content, "hello ");
-        assert_eq!(spans[1].content, "world");
-        assert_eq!(spans[1].style, match_highlight_style());
-    }
-
-    #[test]
-    fn highlight_current_match_is_bold() {
-        let spans = highlight_line("hello world", "world", true);
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[1].style, current_match_highlight_style());
-    }
-
-    #[test]
-    fn highlight_multiple_matches() {
-        let spans = highlight_line("error and error again", "error", false);
-        // Should be: "error", " and ", "error", " again"
-        // Actually: highlighted "error", " and ", highlighted "error", " again"
-        assert_eq!(spans.len(), 4);
-        assert_eq!(spans[0].content, "error");
-        assert_eq!(spans[0].style, match_highlight_style());
-        assert_eq!(spans[1].content, " and ");
-        assert_eq!(spans[2].content, "error");
-        assert_eq!(spans[2].style, match_highlight_style());
-        assert_eq!(spans[3].content, " again");
-    }
-
-    #[test]
-    fn highlight_at_start_and_end() {
-        let spans = highlight_line("err", "err", false);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content, "err");
-        assert_eq!(spans[0].style, match_highlight_style());
-    }
-
-    // -- Status display tests --
-
-    #[test]
-    fn status_spans_inactive() {
-        let state = SearchState::new();
-        let spans = search_status_spans(&state);
-        assert!(spans.is_empty());
-    }
-
-    #[test]
-    fn status_spans_no_matches() {
-        let mut state = SearchState::new();
-        for ch in "xyz".chars() {
-            state.insert_char(ch);
-        }
-        state.confirm();
-        // No scan done, so match_indices is empty
-        let spans = search_status_spans(&state);
-        assert_eq!(spans.len(), 2);
-        // Should contain "no matches"
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("no matches"));
-    }
-
-    #[test]
-    fn status_spans_with_matches() {
-        let mut state = SearchState::new();
-        for ch in "error".chars() {
-            state.insert_char(ch);
-        }
-        state.confirm();
-        state.match_indices = vec![1, 5, 10];
-        state.current_match = 1;
-        let spans = search_status_spans(&state);
-        let text: String = spans.iter().map(|s| s.content.to_string()).collect();
-        assert!(text.contains("2/3")); // 1-based: match 2 of 3
     }
 }

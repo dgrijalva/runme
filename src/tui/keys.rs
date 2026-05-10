@@ -271,12 +271,17 @@ pub(super) fn handle_log_viewer_key(
             state.mode = AppMode::FilterInput;
         }
 
-        // /: enter search input mode
+        // /: enter search input mode. Pre-populates with the active pattern.
         KeyCode::Char('/') => {
-            // Pre-populate with the previous search pattern if any
-            state.search.text = state.search.pattern.clone();
-            state.search.cursor = state.search.text.len();
+            state.search.save_current();
             state.mode = AppMode::SearchInput;
+        }
+
+        // Esc: clear active filter + search (back to default view).
+        // Source hides and focus filter are untouched (out of scope).
+        KeyCode::Esc => {
+            state.filter_input.clear();
+            state.search.clear_active();
         }
 
         // n: jump to next search match
@@ -512,54 +517,24 @@ fn handle_picker_args_input_key(key: KeyEvent, state: &mut AppState) {
 /// Handle keys when in filter input mode.
 pub(super) fn handle_filter_input_key(key: KeyEvent, state: &mut AppState) {
     match key.code {
-        // Enter: confirm filter and return to Normal mode
+        // Enter: commit current text to history (MRU dedup) and close panel.
         KeyCode::Enter => {
-            // Save to filter history if non-empty
-            let text = state.filter_input.text.clone();
-            if !text.is_empty() {
-                // Don't duplicate the last entry
-                if state.filter_history.last().map(|s| s.as_str()) != Some(&text) {
-                    state.filter_history.push(text);
-                }
-            }
-            state.filter_history_index = None;
+            state.filter_input.commit();
             state.mode = AppMode::Normal;
         }
 
-        // Esc: cancel (revert) and return to Normal mode
+        // Esc: revert to snapshot and close panel.
         KeyCode::Esc => {
             state.filter_input.revert();
-            state.filter_history_index = None;
             state.mode = AppMode::Normal;
         }
 
-        // Up arrow: cycle to previous filter history entry
+        // Up / Down: navigate the [saved..., virtual, blank] sequence.
         KeyCode::Up => {
-            if !state.filter_history.is_empty() {
-                let idx = match state.filter_history_index {
-                    Some(i) => i.saturating_sub(1),
-                    None => state.filter_history.len() - 1,
-                };
-                state.filter_history_index = Some(idx);
-                let text = state.filter_history[idx].clone();
-                state.filter_input.set_text(text);
-            }
+            state.filter_input.history_up();
         }
-
-        // Down arrow: cycle to next filter history entry
         KeyCode::Down => {
-            if let Some(idx) = state.filter_history_index {
-                if idx + 1 < state.filter_history.len() {
-                    let new_idx = idx + 1;
-                    state.filter_history_index = Some(new_idx);
-                    let text = state.filter_history[new_idx].clone();
-                    state.filter_input.set_text(text);
-                } else {
-                    // Past the end of history — clear to empty
-                    state.filter_history_index = None;
-                    state.filter_input.clear();
-                }
-            }
+            state.filter_input.history_down();
         }
 
         // Ctrl-u: clear the input
@@ -567,28 +542,21 @@ pub(super) fn handle_filter_input_key(key: KeyEvent, state: &mut AppState) {
             state.filter_input.clear();
         }
 
-        // Ctrl-c: cancel and return to Normal mode
+        // Ctrl-c: cancel (revert) and return to Normal mode
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.filter_input.revert();
             state.mode = AppMode::Normal;
         }
 
-        // Left arrow: move cursor left
         KeyCode::Left => {
             state.filter_input.move_left();
         }
-
-        // Right arrow: move cursor right
         KeyCode::Right => {
             state.filter_input.move_right();
         }
-
-        // Backspace: delete character before cursor
         KeyCode::Backspace => {
             state.filter_input.delete_char_before();
         }
-
-        // Any other character: insert into the filter text
         KeyCode::Char(ch) => {
             state.filter_input.insert_char(ch);
         }
@@ -606,11 +574,10 @@ pub(super) fn handle_search_input_key(
     viewport_width: u16,
 ) {
     match key.code {
-        // Enter: confirm search, scan matches, jump to nearest
+        // Enter: commit current text as the search pattern, scan, jump.
         KeyCode::Enter => {
-            state.search.confirm();
+            state.search.commit();
             if state.search.active {
-                // Scan all visible entries for the pattern
                 let visible = state.visible_log_lines();
                 let texts: Vec<(usize, String)> = visible
                     .iter()
@@ -624,7 +591,6 @@ pub(super) fn handle_search_input_key(
                     .search
                     .scan_matches(texts.iter().map(|(i, t)| (*i, t.as_str())));
 
-                // Jump to the nearest match from the current cursor position
                 let cursor_pos = state.scroll.cursor_index(filtered_entries).unwrap_or(0);
                 if let Some(target) = state.search.jump_to_nearest(cursor_pos) {
                     navigate_to_entry(
@@ -639,39 +605,38 @@ pub(super) fn handle_search_input_key(
             state.mode = AppMode::Normal;
         }
 
-        // Esc: cancel search and return to Normal mode
+        // Esc: revert to snapshot (active pattern unchanged) and close.
         KeyCode::Esc => {
-            state.search.cancel();
+            state.search.revert();
             state.mode = AppMode::Normal;
         }
 
-        // Ctrl-u: clear the search input
+        // Up / Down: navigate history with virtual slot.
+        KeyCode::Up => {
+            state.search.history_up();
+        }
+        KeyCode::Down => {
+            state.search.history_down();
+        }
+
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             state.search.clear_input();
         }
 
-        // Ctrl-c: cancel and return to Normal mode
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.search.cancel();
+            state.search.revert();
             state.mode = AppMode::Normal;
         }
 
-        // Left arrow: move cursor left
         KeyCode::Left => {
             state.search.move_left();
         }
-
-        // Right arrow: move cursor right
         KeyCode::Right => {
             state.search.move_right();
         }
-
-        // Backspace: delete character before cursor
         KeyCode::Backspace => {
             state.search.delete_char_before();
         }
-
-        // Any other character: insert into the search text
         KeyCode::Char(ch) => {
             state.search.insert_char(ch);
         }
@@ -1932,100 +1897,189 @@ mod tests {
         let mut state = AppState::new();
         state.mode = AppMode::FilterInput;
 
-        // Type something
         for ch in "error".chars() {
             state.filter_input.insert_char(ch);
         }
 
-        // Confirm with Enter
         handle_filter_input_key(
             make_key_event(KeyCode::Enter, KeyModifiers::NONE),
             &mut state,
         );
 
-        assert_eq!(state.filter_history.len(), 1);
-        assert_eq!(state.filter_history[0], "error");
+        assert_eq!(state.filter_input.input.history, vec!["error".to_string()]);
     }
 
     #[test]
     fn filter_history_up_down_cycles() {
         let mut state = AppState::new();
-        state.filter_history = vec!["error".to_string(), "level:warn".to_string()];
+        state.filter_input.input.history = vec!["error".to_string(), "level:warn".to_string()];
         state.mode = AppMode::FilterInput;
+        state.filter_input.save_current();
 
-        // Up should go to the last entry
+        // Up should go to the newest saved entry
         handle_filter_input_key(make_key_event(KeyCode::Up, KeyModifiers::NONE), &mut state);
-        assert_eq!(state.filter_input.text, "level:warn");
-        assert_eq!(state.filter_history_index, Some(1));
+        assert_eq!(state.filter_input.input.text, "level:warn");
 
-        // Up again should go to first entry
+        // Up again should go to the older saved entry
         handle_filter_input_key(make_key_event(KeyCode::Up, KeyModifiers::NONE), &mut state);
-        assert_eq!(state.filter_input.text, "error");
-        assert_eq!(state.filter_history_index, Some(0));
+        assert_eq!(state.filter_input.input.text, "error");
 
-        // Down should go back to second entry
+        // Down should go back forward through history
         handle_filter_input_key(
             make_key_event(KeyCode::Down, KeyModifiers::NONE),
             &mut state,
         );
-        assert_eq!(state.filter_input.text, "level:warn");
-        assert_eq!(state.filter_history_index, Some(1));
+        assert_eq!(state.filter_input.input.text, "level:warn");
 
-        // Down past end should clear
+        // Down again drops back to the virtual slot (empty in this session)
         handle_filter_input_key(
             make_key_event(KeyCode::Down, KeyModifiers::NONE),
             &mut state,
         );
-        assert!(state.filter_input.text.is_empty());
-        assert!(state.filter_history_index.is_none());
+        assert!(state.filter_input.input.text.is_empty());
     }
 
     #[test]
     fn filter_history_nav_updates_active_filter() {
-        // Regression: arrow navigation through filter history must update
-        // `last_valid_expr` so that pressing Enter applies the selected
-        // filter. Previously, arrow handlers set `text` but never reparsed,
-        // so Enter no-op'd against whatever filter was active on entry.
+        // Regression: arrow navigation through history must update
+        // `last_valid_expr` so that pressing Enter applies the selected filter.
         let mut state = AppState::new();
-        state.filter_history = vec!["level:warn".to_string()];
+        state.filter_input.input.history = vec!["level:warn".to_string()];
         state.mode = AppMode::FilterInput;
         state.filter_input.save_current();
         assert!(state.filter_input.active_expr().is_none());
 
-        // Up arrow selects history entry — must take effect immediately.
         handle_filter_input_key(make_key_event(KeyCode::Up, KeyModifiers::NONE), &mut state);
-        assert_eq!(state.filter_input.text, "level:warn");
+        assert_eq!(state.filter_input.input.text, "level:warn");
         assert!(
             state.filter_input.active_expr().is_some(),
             "history nav must reparse so the active filter matches the displayed text"
         );
 
-        // Down past end clears to empty and clears the active filter.
+        // Down drops to virtual (empty); active filter clears.
         handle_filter_input_key(
             make_key_event(KeyCode::Down, KeyModifiers::NONE),
             &mut state,
         );
-        assert!(state.filter_input.text.is_empty());
-        assert!(
-            state.filter_input.active_expr().is_none(),
-            "clearing input must clear the active filter"
+        assert!(state.filter_input.input.text.is_empty());
+        assert!(state.filter_input.active_expr().is_none());
+    }
+
+    #[test]
+    fn filter_history_down_from_active_clears_immediately() {
+        // Bug fix: f → Down should clear an active filter in one keystroke
+        // (no need for f → Up → Down → Down detour). With the virtual-slot
+        // model, save_current seeds position=Virtual and Down → Blank.
+        let mut state = AppState::new();
+        state.filter_input.input.history = vec!["error".to_string()];
+        // Pretend a filter is already active.
+        for ch in "error".chars() {
+            state.filter_input.insert_char(ch);
+        }
+        state.mode = AppMode::FilterInput;
+        state.filter_input.save_current();
+        assert_eq!(state.filter_input.input.text, "error");
+
+        handle_filter_input_key(
+            make_key_event(KeyCode::Down, KeyModifiers::NONE),
+            &mut state,
+        );
+        assert!(state.filter_input.input.text.is_empty());
+        assert!(state.filter_input.active_expr().is_none());
+    }
+
+    #[test]
+    fn filter_esc_reverts_to_snapshot() {
+        let mut state = AppState::new();
+        for ch in "error".chars() {
+            state.filter_input.insert_char(ch);
+        }
+        state.mode = AppMode::FilterInput;
+        state.filter_input.save_current();
+
+        // Mutate the input
+        state.filter_input.clear();
+        for ch in "warn".chars() {
+            state.filter_input.insert_char(ch);
+        }
+        assert_eq!(state.filter_input.input.text, "warn");
+
+        // Esc reverts to snapshot
+        handle_filter_input_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
+        assert_eq!(state.filter_input.input.text, "error");
+        assert_eq!(state.mode, AppMode::Normal);
+    }
+
+    #[test]
+    fn filter_history_mru_dedup_on_recommit() {
+        // Re-applying a saved filter should move it to newest, not duplicate.
+        let mut state = AppState::new();
+        state.mode = AppMode::FilterInput;
+
+        // Commit "foo"
+        for ch in "foo".chars() {
+            state.filter_input.insert_char(ch);
+        }
+        handle_filter_input_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+
+        // Open again, commit "bar"
+        state.mode = AppMode::FilterInput;
+        state.filter_input.save_current();
+        state.filter_input.clear();
+        for ch in "bar".chars() {
+            state.filter_input.insert_char(ch);
+        }
+        handle_filter_input_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+
+        // Open again, re-commit "foo"
+        state.mode = AppMode::FilterInput;
+        state.filter_input.save_current();
+        state.filter_input.clear();
+        for ch in "foo".chars() {
+            state.filter_input.insert_char(ch);
+        }
+        handle_filter_input_key(
+            make_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            &mut state,
+        );
+
+        assert_eq!(
+            state.filter_input.input.history,
+            vec!["bar".to_string(), "foo".to_string()]
         );
     }
 
     #[test]
-    fn filter_history_esc_resets_index() {
+    fn esc_from_normal_clears_filter_and_search() {
         let mut state = AppState::new();
-        state.filter_history = vec!["error".to_string()];
-        state.mode = AppMode::FilterInput;
-        state.filter_input.save_current();
+        // Active filter
+        for ch in "error".chars() {
+            state.filter_input.insert_char(ch);
+        }
+        assert!(state.filter_input.has_active_filter());
+        // Active search
+        state.search.pattern = "needle".to_string();
+        state.search.active = true;
 
-        // Browse history
-        handle_filter_input_key(make_key_event(KeyCode::Up, KeyModifiers::NONE), &mut state);
-        assert_eq!(state.filter_history_index, Some(0));
+        handle_log_viewer_key(
+            make_key_event(KeyCode::Esc, KeyModifiers::NONE),
+            &mut state,
+            &[],
+            24,
+            80,
+            &HashMap::new(),
+        );
 
-        // Esc should reset the history index
-        handle_filter_input_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
-        assert!(state.filter_history_index.is_none());
+        assert!(!state.filter_input.has_active_filter());
+        assert!(state.filter_input.input.text.is_empty());
+        assert!(!state.search.active);
+        assert!(state.search.pattern.is_empty());
     }
 
     // -- Picker overlay tests --

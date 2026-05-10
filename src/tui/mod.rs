@@ -8,6 +8,7 @@ pub mod render;
 pub mod runner;
 pub mod search;
 pub mod sidebar;
+pub mod text_input;
 pub mod viewport;
 
 pub use app::{App, AppMode, AppState};

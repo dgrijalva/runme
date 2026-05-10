@@ -170,10 +170,6 @@ pub struct AppState {
     pub sidebar_visible: bool,
     /// Notification messages (text, timestamp for auto-dismiss).
     pub notifications: Vec<(String, std::time::Instant)>,
-    /// Filter expression history (session-scoped).
-    pub filter_history: Vec<String>,
-    /// Current position in filter history (for Up/Down cycling). None = not browsing history.
-    pub filter_history_index: Option<usize>,
     /// The most recently launched task definition. Used by the status
     /// bar to display the active task's name.
     pub current_task: Option<&'static TaskDef>,
@@ -233,8 +229,6 @@ impl AppState {
             process_detail_sockets: None,
             sidebar_visible: true,
             notifications: Vec::new(),
-            filter_history: Vec::new(),
-            filter_history_index: None,
             current_task: None,
             pending_restart: None,
             follow_source: None,
@@ -611,8 +605,7 @@ mod tests {
         assert!(state.current_task_id.is_none());
         assert!(state.sidebar_visible);
         assert!(state.notifications.is_empty());
-        assert!(state.filter_history.is_empty());
-        assert!(state.filter_history_index.is_none());
+        assert!(state.filter_input.input.history.is_empty());
         assert!(state.process_detail_index.is_none());
         assert_eq!(state.process_detail_scroll, 0);
         assert!(state.process_detail_sockets.is_none());

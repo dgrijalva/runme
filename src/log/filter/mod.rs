@@ -5,10 +5,12 @@
 //! matchers (substring, exact, regex, comparison, wildcard).
 
 mod eval;
+mod highlight;
 mod parse;
 mod types;
 
 pub use eval::matches;
+pub use highlight::collect_positive_literals;
 pub use parse::parse;
 pub use types::*;
 
