@@ -12,20 +12,19 @@ use tracing::Subscriber;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::execution::TaskId;
 use crate::log::buffer::OutputBuffer;
 use crate::log::{LogEntry, ParsedContent, SeqGen};
 
-tokio::task_local! {
-    /// Per-task context populated by the engine before invoking a task's
-    /// async function. The global `LogEntryLayer` reads this to route
-    /// tracing events (`info!`/`error!`/etc.) into the right task's
-    /// output buffer with the right source `TaskId`.
-    pub static TASK_TRACING_CTX: TaskTracingCtx;
-}
-
-/// Per-task context plumbed to the global tracing layer.
+/// Per-task context attached to the per-task carrier span by the engine
+/// (see `TaskExecution::spawn_body`). The global `LogEntryLayer` finds
+/// this in the event's span scope and routes the event into the right
+/// task's output buffer with the right source `TaskId`. Carried via
+/// `tracing::Span::extensions()` so it propagates across `tokio::spawn`
+/// boundaries whenever the spawned future is `.instrument(span)`'d
+/// (use the `rnme::spawn!` macro for the common case).
 #[derive(Clone)]
 pub struct TaskTracingCtx {
     pub buffer: Arc<Mutex<OutputBuffer>>,
@@ -34,14 +33,14 @@ pub struct TaskTracingCtx {
 }
 
 /// A `tracing::Layer` that converts events into `LogEntry`s and pushes them
-/// into the per-task `OutputBuffer` selected by `TASK_TRACING_CTX`. When
-/// no task-local context is set (events emitted outside any task body),
-/// the event is silently dropped.
+/// into the `OutputBuffer` selected by the nearest enclosing span carrying
+/// a `TaskTracingCtx` in its extensions. When no such span is in scope
+/// (events emitted outside any task body), the event is silently dropped.
 ///
-/// The layer pulls its `SeqGen` from the per-task `TASK_TRACING_CTX` so
-/// seqs share the engine-global counter regardless of which engine
-/// generation owns the task. The layer itself holds a fallback `SeqGen`
-/// used only when a context exposes no generator (degenerate test path).
+/// The layer pulls its `SeqGen` from the `TaskTracingCtx`'s buffer so seqs
+/// share the engine-global counter regardless of which engine generation
+/// owns the task. The layer itself holds a fallback `SeqGen` used only
+/// when the buffer is contended at event time.
 pub struct LogEntryLayer {
     fallback_seq_gen: SeqGen,
 }
@@ -49,7 +48,8 @@ pub struct LogEntryLayer {
 impl LogEntryLayer {
     /// Create a layer with a fresh fallback `SeqGen`. Used by the globally-
     /// installed subscriber: at event time, the layer pulls the actual
-    /// engine-global `SeqGen` from the per-task `TASK_TRACING_CTX`'s buffer.
+    /// engine-global `SeqGen` from the per-task buffer reached via the
+    /// `TaskTracingCtx` attached to the enclosing carrier span.
     pub fn new() -> Self {
         Self::with_seq_gen(SeqGen::new())
     }
@@ -67,6 +67,32 @@ impl Default for LogEntryLayer {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Build the per-task carrier span and attach `ctx` to its extensions so
+/// the global `LogEntryLayer` can find it when events fire inside the
+/// span's scope. Returns the span — the caller is responsible for
+/// running the task body inside it via `Instrument::instrument`.
+///
+/// The span is created at INFO level with target `"rnme_task"`. The
+/// engine adds a `rnme_task=info` directive to the env filter in
+/// `install_global_tracing_subscriber` so this span is always enabled
+/// regardless of the user's `RUST_LOG`.
+///
+/// If no `tracing_subscriber::Registry` is installed under the current
+/// dispatch (e.g. a test with a custom subscriber that doesn't include
+/// the registry), the attach is a silent no-op and events fired inside
+/// the returned span will be dropped by `LogEntryLayer`.
+pub fn attach_task_tracing_ctx(ctx: TaskTracingCtx) -> tracing::Span {
+    let span = tracing::info_span!(target: "rnme_task", "task");
+    span.with_subscriber(|(id, dispatch)| {
+        if let Some(registry) = dispatch.downcast_ref::<tracing_subscriber::Registry>() {
+            if let Some(span_ref) = registry.span(id) {
+                span_ref.extensions_mut().insert(ctx);
+            }
+        }
+    });
+    span
 }
 
 /// Visitor that collects the formatted message and structured fields from a
@@ -145,15 +171,25 @@ impl Visit for FieldCollector {
     }
 }
 
-impl<S: Subscriber> Layer<S> for LogEntryLayer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        // Resolve the per-task tracing context. If unset (event outside
-        // any task body), drop silently — this is the correct behavior
-        // for engine bootstrap traces and tests using `tracing` without
-        // an `Engine` wrapper.
-        let task_ctx = match TASK_TRACING_CTX.try_with(|c| c.clone()) {
-            Ok(c) => c,
-            Err(_) => return,
+impl<S> Layer<S> for LogEntryLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+        // Walk the event's span scope (innermost first) and find a span
+        // whose extensions carry a `TaskTracingCtx`. The engine attaches
+        // this in `spawn_body` to a per-task carrier span and runs the
+        // body inside that span via `Instrument`; the `rnme::spawn!`
+        // macro re-enters the same span in spawned children. If no span
+        // in scope carries one, drop silently — this is the correct
+        // behavior for engine bootstrap traces and tests using `tracing`
+        // without an `Engine` wrapper.
+        let Some(task_ctx) = ctx.event_scope(event).and_then(|scope| {
+            scope.into_iter().find_map(|span| {
+                span.extensions().get::<TaskTracingCtx>().cloned()
+            })
+        }) else {
+            return;
         };
 
         let metadata = event.metadata();
@@ -229,6 +265,7 @@ impl<S: Subscriber> Layer<S> for LogEntryLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing::Instrument;
     use tracing_subscriber::layer::SubscriberExt;
 
     fn ctx(buf: Arc<Mutex<OutputBuffer>>, label: &str, id: TaskId) -> TaskTracingCtx {
@@ -245,12 +282,13 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        TASK_TRACING_CTX
-            .scope(ctx(buffer.clone(), "task", TaskId(99)), async {
-                tracing::info!(key = "val", "hello");
-                tokio::task::yield_now().await;
-            })
-            .await;
+        let span = attach_task_tracing_ctx(ctx(buffer.clone(), "task", TaskId(99)));
+        async {
+            tracing::info!(key = "val", "hello");
+            tokio::task::yield_now().await;
+        }
+        .instrument(span)
+        .await;
 
         let buf = buffer.lock().await;
         assert_eq!(buf.len(), 1);
@@ -277,15 +315,16 @@ mod tests {
             tracing_subscriber::registry().with(LogEntryLayer::with_seq_gen(seq_gen));
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        TASK_TRACING_CTX
-            .scope(ctx(buffer.clone(), "test_source", TaskId(100)), async {
-                tracing::error!("err msg");
-                tracing::warn!("warn msg");
-                tracing::debug!("debug msg");
-                tracing::trace!("trace msg");
-                tokio::task::yield_now().await;
-            })
-            .await;
+        let span = attach_task_tracing_ctx(ctx(buffer.clone(), "test_source", TaskId(100)));
+        async {
+            tracing::error!("err msg");
+            tracing::warn!("warn msg");
+            tracing::debug!("debug msg");
+            tracing::trace!("trace msg");
+            tokio::task::yield_now().await;
+        }
+        .instrument(span)
+        .await;
 
         let buf = buffer.lock().await;
         assert_eq!(buf.len(), 4);
@@ -307,12 +346,13 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        TASK_TRACING_CTX
-            .scope(ctx(buffer.clone(), "task", TaskId(99)), async {
-                tracing::info!(count = 42_i64, ratio = 2.72_f64, active = true, "metrics");
-                tokio::task::yield_now().await;
-            })
-            .await;
+        let span = attach_task_tracing_ctx(ctx(buffer.clone(), "task", TaskId(99)));
+        async {
+            tracing::info!(count = 42_i64, ratio = 2.72_f64, active = true, "metrics");
+            tokio::task::yield_now().await;
+        }
+        .instrument(span)
+        .await;
 
         let buf = buffer.lock().await;
         assert_eq!(buf.len(), 1);
@@ -328,17 +368,79 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        TASK_TRACING_CTX
-            .scope(ctx(buffer.clone(), "task", TaskId(99)), async {
-                tracing::info!("simple message");
-                tokio::task::yield_now().await;
-            })
-            .await;
+        let span = attach_task_tracing_ctx(ctx(buffer.clone(), "task", TaskId(99)));
+        async {
+            tracing::info!("simple message");
+            tokio::task::yield_now().await;
+        }
+        .instrument(span)
+        .await;
 
         let buf = buffer.lock().await;
         let entry = &buf.lines()[0];
         assert!(entry.raw.contains("INFO"));
         assert!(entry.raw.contains("task"));
         assert!(entry.raw.contains("simple message"));
+    }
+
+    /// Events emitted from a `tokio::spawn`'d future inside a task body
+    /// are attributed to the right `TaskId` when the spawned future is
+    /// instrumented with the current span. This is the bug `rnme::spawn!`
+    /// exists to prevent — without re-entering the span in the child
+    /// task, the layer finds no `TaskTracingCtx` in scope and drops.
+    #[tokio::test]
+    async fn test_tracing_layer_propagates_to_spawned_future() {
+        let buffer = Arc::new(Mutex::new(OutputBuffer::new(100)));
+        let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = attach_task_tracing_ctx(ctx(buffer.clone(), "task", TaskId(7)));
+        async {
+            tracing::info!("from body");
+            let handle = tokio::spawn(
+                async {
+                    tracing::info!("from child");
+                }
+                .instrument(tracing::Span::current()),
+            );
+            handle.await.unwrap();
+        }
+        .instrument(span)
+        .await;
+
+        let buf = buffer.lock().await;
+        assert_eq!(buf.len(), 2, "body and child events both captured");
+        assert!(
+            buf.lines().iter().all(|e| e.source == TaskId(7)),
+            "all events attributed to TaskId(7)",
+        );
+        let msgs: Vec<_> = buf.lines().iter().filter_map(|e| e.message.as_deref()).collect();
+        assert!(msgs.contains(&"from body"));
+        assert!(msgs.contains(&"from child"));
+    }
+
+    /// Counter-test: a plain `tokio::spawn` without `.instrument()` drops
+    /// the span context, so the child's event is not routed to the task
+    /// buffer. This documents the gap the `rnme::spawn!` macro closes.
+    #[tokio::test]
+    async fn test_tracing_layer_plain_spawn_drops_context() {
+        let buffer = Arc::new(Mutex::new(OutputBuffer::new(100)));
+        let subscriber = tracing_subscriber::registry().with(LogEntryLayer::new());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let span = attach_task_tracing_ctx(ctx(buffer.clone(), "task", TaskId(8)));
+        async {
+            tracing::info!("from body");
+            let handle = tokio::spawn(async {
+                tracing::info!("from orphan child");
+            });
+            handle.await.unwrap();
+        }
+        .instrument(span)
+        .await;
+
+        let buf = buffer.lock().await;
+        assert_eq!(buf.len(), 1, "only the body event is captured");
+        assert_eq!(buf.lines()[0].message.as_deref(), Some("from body"));
     }
 }

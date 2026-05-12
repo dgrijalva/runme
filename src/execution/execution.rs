@@ -23,7 +23,7 @@ use crate::log::LogEntry;
 use crate::log::buffer::OutputBuffer;
 use crate::log::store::LogStore;
 use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef};
-use crate::tracing_layer::{TASK_TRACING_CTX, TaskTracingCtx};
+use crate::tracing_layer::{TaskTracingCtx, attach_task_tracing_ctx};
 
 use super::engine::EngineInternals;
 use super::task_id::TaskId;
@@ -244,8 +244,8 @@ pub struct TaskExecution {
     log_store: Arc<Mutex<LogStore>>,
     /// The task's tracing output buffer (info!/error!/etc from the task
     /// function). The global `LogEntryLayer` (installed once in
-    /// `Engine::start`) writes here when the body runs inside the
-    /// task's `TASK_TRACING_CTX` scope.
+    /// `Engine::start`) writes here when an event fires inside the
+    /// per-task carrier span attached by `spawn_body`.
     tracing_buffer: Arc<Mutex<OutputBuffer>>,
 
     // ── Registry ───────────────────────────────────────────────────
@@ -341,9 +341,12 @@ impl TaskExecution {
     }
 
     /// Engine-aware launch core. Builds the `TaskContext`, wires the
-    /// engine weak into it, and spawns the body inside the task's
-    /// `TASK_TRACING_CTX` scope so the global tracing layer routes
-    /// events from inside the body to this task's buffer.
+    /// engine weak into it, and runs the body instrumented by a per-task
+    /// carrier span carrying the `TaskTracingCtx` in its extensions, so
+    /// the global tracing layer routes events from inside the body to
+    /// this task's buffer. Spans propagate across `tokio::spawn` when
+    /// child futures are `.instrument(Span::current())`'d — the
+    /// `rnme::spawn!` macro does this for the common case.
     pub fn spawn_body(
         &mut self,
         self_weak: Weak<TaskExecution>,
@@ -428,15 +431,16 @@ impl TaskExecution {
         let _ = self.started_at.set(chrono::Local::now());
 
         let handle: JoinHandle<TaskResult> = tokio::spawn(async move {
+            use tracing::Instrument;
+
             let tracing_ctx = TaskTracingCtx {
                 buffer: tracing_buf_for_body,
                 source_label: task_name_owned,
                 source_id: task_id,
             };
-            let result = TASK_TRACING_CTX
-                .scope(tracing_ctx, async move {
-                    task.func.call(&body_ctx, &task_args).await
-                })
+            let span = attach_task_tracing_ctx(tracing_ctx);
+            let result = async move { task.func.call(&body_ctx, &task_args).await }
+                .instrument(span)
                 .await;
 
             {

@@ -33,10 +33,17 @@ use super::root::ROOT_TASK;
 pub(crate) const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Install the global `tracing` subscriber. Exactly one install site in
-/// the codebase. The subscriber is a single `LogEntryLayer` that reads
-/// `TASK_TRACING_CTX` (set by `spawn_body` for each task) to route events
-/// to the right buffer with the right `TaskId`. Idempotent across
-/// multiple `Engine::start` calls (a `Once` gates the install).
+/// the codebase. The subscriber is a single `LogEntryLayer` that walks
+/// each event's span scope to find a per-task carrier span (created by
+/// `spawn_body` with target `rnme_task`) carrying a `TaskTracingCtx` in
+/// its extensions, and routes the event to that task's buffer.
+///
+/// The env filter pins `rnme_task=info` so the carrier span is always
+/// enabled regardless of the user's `RUST_LOG` — without this, a user
+/// setting `RUST_LOG=warn` would silently disable per-task routing.
+///
+/// Idempotent across multiple `Engine::start` calls (a `Once` gates the
+/// install).
 fn install_global_tracing_subscriber() {
     use std::sync::Once;
     use tracing_subscriber::EnvFilter;
@@ -47,7 +54,9 @@ fn install_global_tracing_subscriber() {
 
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"))
+            .add_directive("rnme_task=info".parse().expect("static directive parses"));
         let subscriber = Registry::default()
             .with(filter)
             .with(LogEntryLayer::new());

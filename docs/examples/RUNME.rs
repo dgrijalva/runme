@@ -122,17 +122,25 @@ async fn watch_restart(ctx: &TaskContext) -> TaskResult {
     }
 }
 
-/// Custom watch channel: poll an external condition
+/// Custom watch channel: poll an external condition.
+///
+/// The background poller uses `spawn!` (tracing-aware) and observes
+/// `ctx.cancellation()` so it shuts down with the task instead of
+/// leaking past task kill.
 #[rnme::task]
 async fn watch_channel_demo(ctx: &TaskContext) -> TaskResult {
     let (tx, w) = ctx.watch_channel::<String>();
     let mut w = w.label("health check");
 
-    // Background poller
-    tokio::spawn(async move {
+    let cancel = ctx.cancellation();
+    spawn!(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let _ = tx.send("checked".to_string());
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    let _ = tx.send("checked".to_string());
+                }
+            }
         }
     });
 
@@ -183,6 +191,53 @@ async fn concurrent(ctx: &TaskContext) -> TaskResult {
     a?;
     b?;
     info!("concurrent setup complete");
+    Ok(())
+}
+
+/// Spawn in-process background workers that participate in the task's
+/// logging and cancellation.
+///
+/// Two things to notice:
+///   1. `spawn!` (not bare `tokio::spawn`) re-enters the task's tracing
+///      span inside the spawned future, so `info!` calls from each
+///      worker are attributed to this task in the log viewer. A plain
+///      `tokio::spawn` would drop the span and the events would
+///      disappear.
+///   2. Spawned futures are independent tokio tasks — they don't inherit
+///      the body's cancellation. Clone `ctx.cancellation()` into each
+///      worker and `select!` on `.cancelled()` so killing the task
+///      shuts the workers down cleanly. Without this, workers leak past
+///      task kill.
+#[rnme::task]
+async fn background_workers(ctx: &TaskContext) -> TaskResult {
+    use std::time::Duration;
+
+    info!("starting 3 background workers");
+    let mut handles = Vec::new();
+    for id in 0..3 {
+        let cancel = ctx.cancellation();
+        handles.push(spawn!(async move {
+            let mut tick = 0u32;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("worker {id} stopping after {tick} ticks");
+                        return;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                        tick += 1;
+                        info!("worker {id}: tick {tick}");
+                    }
+                }
+            }
+        }));
+    }
+
+    ctx.cancellation_signal().await;
+    for h in handles {
+        let _ = h.await;
+    }
+    info!("all workers shut down");
     Ok(())
 }
 

@@ -71,11 +71,45 @@ pub use rnme_macros::init;
 /// argument forms (zero-arg, simple flags, clap parser struct).
 pub use rnme_macros::task;
 
+/// Spawn a future on the tokio runtime with the current `tracing` span
+/// re-entered inside it. Use this from inside a task body whenever you'd
+/// reach for `tokio::spawn(...)` — events emitted from the spawned future
+/// will be attributed to the originating task. Plain `tokio::spawn` drops
+/// the span context, so its events are routed nowhere and disappear from
+/// the log viewer.
+///
+/// ```rust,ignore
+/// use rnme::prelude::*;
+///
+/// #[rnme::task]
+/// async fn worker(_ctx: &TaskContext) -> TaskResult {
+///     let handle = rnme::spawn!(async move {
+///         info!("from a spawned future");
+///     });
+///     handle.await.ok();
+///     Ok(())
+/// }
+/// ```
+#[macro_export]
+macro_rules! spawn {
+    ($future:expr) => {
+        $crate::tokio::spawn($crate::tracing::Instrument::instrument(
+            $future,
+            $crate::tracing::Span::current(),
+        ))
+    };
+}
+
 // Re-export inventory so generated code can reference it
 pub use inventory;
 
 // Re-export tokio so macro-generated code (#[tokio::main]) can reference it
 pub use tokio;
+
+// Re-export tracing so the `spawn!` macro can resolve `Instrument` / `Span`
+// through `$crate::tracing` — the generated runner crate doesn't depend
+// on `tracing` directly.
+pub use tracing;
 
 // Re-export serde_json so macro-generated code can reference it
 pub use serde_json;

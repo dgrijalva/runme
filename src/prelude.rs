@@ -42,6 +42,7 @@ pub use crate::task::{
     TaskFnKind, TaskGuard, TaskInfo, TaskQuery, UiHint,
 };
 pub use crate::watch::{Watch, WatchInfo, WatchKind, glob_filter};
+pub use crate::spawn;
 pub use rnme_macros::cmd;
 pub use rnme_macros::init;
 pub use rnme_macros::task;

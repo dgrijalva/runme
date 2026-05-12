@@ -21,14 +21,6 @@
 - _Assessment:_ Fits the existing `TaskContext` shape (it already owns process lifecycle plumbing). Restart channel is probably a `oneshot`-per-restart or a `tokio::sync::Notify` the task can `take()` once. "Take" semantics matter: only one consumer, and the runner needs to know whether it was taken so it can decide soft-vs-hard fallback. CLI mode parallel is clean since `SIGHUP` is the conventional cooperative-reload signal anyway
 - _Open questions:_ What does "the task" mean for soft restart — the top-level task fn, or any spawned child it owns? Is the signal one-shot per restart, or a stream the task subscribes to for the lifetime of the run? Does soft restart wait for the task to finish handling, or fire-and-forget? What happens if the task takes the signal but never responds — timeout into hard restart?
 
-## Bare `spawn!` macro with auto-traced context
-
-**14:17** — Add a `spawn!` macro to the prelude that wraps `tokio::spawn` (or equivalent) and automatically threads tracing context through, so logs emitted from the spawned future are correctly attributed to the originating task/source.
-
-- _Effort:_ Small-to-moderate — proc macro or `macro_rules!` in `rnme-macros` or the prelude, plus integration with the existing `tracing_layer.rs`
-- _Assessment:_ Existing `src/tracing_layer.rs` already does source attribution for the log engine. The macro just needs to capture the current `tracing::Span` (or whatever context the layer keys on) and `.instrument()` the spawned future — standard tracing-tokio pattern. Likely a thin `macro_rules!` is enough; no proc macro needed unless we want to also rewrite the body. Prelude export keeps it ergonomic from RUNME.rs files
-- _Open questions:_ Does this wrap `tokio::spawn` only, or also `ctx.spawn()` (process spawn)? They're different beasts — process spawn already has source attribution via the runner; the gap is in-process `tokio::spawn` for ad-hoc async work inside a task. Probably this macro is specifically for the latter
-
 ## Speed up runner build time
 
 **15:16** — Build time of the generated runner crate is the dominant contributor to launch time. Already building in debug. Application perf doesn't matter — `rnme` is a supervisor. Look at what Bevy recommends for fast iteration builds and pull what applies.
