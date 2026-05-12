@@ -9,14 +9,9 @@
 - _Concern:_ Affects muscle memory — once a scheme is published, churn is annoying. Pre-release status (per CLAUDE.md) means now is the right window. Also: a redesign should probably be paired with a discoverability mechanism (footer hints / `?` overlay), otherwise users won't find the new bindings
 - _Inspiration sources to look at:_ LazyGit (panes + which-key menus + footer hints), LazyDocker (similar TUI shape, log-heavy), k9s (resource navigation), Vim/Helix (motion + text-object grammar). Helix may be more relevant than Vim proper since its keybinding philosophy is closer to a curated app than a programmable editor
 
-## Task-authored output summaries (`ctx.summarize`)
+## Surface task summaries in the TUI
 
-**Feature idea:** Let a task post-process its own output and publish a summary string via something like `ctx.summarize(s)`. When agent/MCP mode lands, an agent that runs a task could request the summary instead of pulling raw logs — far cheaper context-wise.
-
-- _Example:_ A `cargo build` task post-processes the build output (errors, warnings counts, failing crate) into a useful summary to hand back to Claude
-- _Effort:_ Moderate — needs a per-session summary slot on `TaskSession`/status, an API surface on `TaskContext`, and (eventually) an MCP tool that prefers summary over logs when present
-- _Assessment:_ Fits naturally next to existing per-session state (`TaskStatus`, `processes`). The task is the right place to author this since only the task knows what's interesting in its own output. Summary is just a `String` (or maybe `Option<String>` + timestamp); no need for streaming/structure in v1
-- _Open questions:_ Single summary or append-only stream? Overwrite semantics on re-run? Should summaries persist with completed tasks (probably yes, since logs do)? Does the TUI surface them anywhere, or are they purely for programmatic consumers?
+`ctx.summary` lands in the MCP report path but the TUI doesn't read it — decide if/where to show it.
 
 ## Soft vs hard restart
 
@@ -75,3 +70,13 @@ Possible approaches:
 - _Effort:_ Variable. `grep -C` context is small (filter/render layer in `src/log/filter.rs` + `src/tui/render.rs`). Group-by-key is moderate — needs richer field extraction and a new view mode. Task-authored grouping is moderate-to-large — new `TaskContext` API + plumbing through to the log store
 - _Assessment:_ Worth treating as a family of features unified by "give the user lenses on log data." The field extraction pipeline (`src/log/extract.rs`) and store (`src/log/store.rs`) probably need extension to carry structured field maps per entry, which all three variants would build on
 - _Open questions:_ Is grouping a view-time concern (TUI re-renders the same store with a different lens) or a store-time concern (entries are tagged on ingest)? View-time is more flexible; store-time is cheaper at render. Does task-authored grouping run synchronously in the parsing pipeline, or async over the store?
+
+## Built-in cargo task helpers
+
+**Feature idea:** Library-side support for the common cargo workflows (check / build / test, maybe clippy / fmt / doc). Users register them during `#[rnme::init]` with a single fn call and get smart summaries + optional watch behavior for free.
+
+- _Example:_ `cargo_tasks::register(ctx).check().build().test().watch();` (shape tbd) — produces ready-to-run tasks with sensible names, descriptions, and post-processed summaries (errors/warnings counts, failing tests, slow tests, etc.)
+- _Effort:_ Moderate — a new module/feature in `rnme` core that builds on `Cmd` + the dynamic task registration path (`InitContext::register_task()`). Cargo output parsing for summaries is the biggest chunk; `--message-format=json` makes it tractable
+- _Assessment:_ Natural pairing with the planned `ctx.summarize` API — these tasks would be the canonical first consumers. Cargo is universal enough across Rust projects that built-in support pays off vs. copy-pasting boilerplate. Watch mode could lean on `cargo-watch` initially, or implement file-watching natively via `notify`. Dynamic registration already supports this shape (closures + leaked `&'static str` names), so no new plumbing required
+- _Concern:_ Scope creep — once we ship "built-in cargo," people will want npm, pnpm, go, make, etc. Worth deciding up front whether this is "blessed first-party helpers" or "first example of a pluggable helper ecosystem"
+- _Open questions:_ Where does it live — `rnme::cargo` module, separate `rnme-cargo` crate, or feature-gated? What's the registration API shape (builder, free functions, struct config)? Are watch tasks separate task entries or a flag on the base task? Does this also surface `cargo run`-style long-lived processes, or stay focused on the check/build/test triad?
