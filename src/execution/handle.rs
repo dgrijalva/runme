@@ -68,6 +68,54 @@ impl TaskHandle {
     pub fn cancellation(&self) -> CancellationToken {
         self.exec.cancellation.clone()
     }
+
+    /// Wait for the task to transition to [`TaskStatus::Ready`].
+    ///
+    /// Resolves `Ok(())` when the task body calls `ctx.mark_ready()` or
+    /// `ctx.bind_ready(&proc)` flips the status to `Ready`.
+    ///
+    /// If the task reaches a terminal status without ever becoming
+    /// ready, returns an error reflecting that terminal state — `Done`
+    /// surfaces as "task completed before reaching ready state" so a
+    /// parent waiting on a long-running child doesn't silently block
+    /// forever when the child exits early.
+    ///
+    /// Observation is via the engine's graph snapshot watch, so the
+    /// future is wake-driven, not polling.
+    pub async fn wait_ready(&self) -> TaskResult {
+        let id = self.exec.id;
+        let Some(engine) = self.engine.upgrade() else {
+            return Err(TaskError::from_display("engine unavailable"));
+        };
+        let mut rx = engine.graph_tx.subscribe();
+        let settled = rx
+            .wait_for(|snap| match snap.tasks.get(&id).map(|n| &n.status) {
+                Some(TaskStatus::Ready)
+                | Some(TaskStatus::Done)
+                | Some(TaskStatus::Failed(_))
+                | Some(TaskStatus::Cancelled)
+                | Some(TaskStatus::Timeout) => true,
+                Some(TaskStatus::Setup) | None => false,
+            })
+            .await;
+        match settled {
+            Ok(snap_ref) => match snap_ref.tasks.get(&id).map(|n| n.status.clone()) {
+                Some(TaskStatus::Ready) => Ok(()),
+                Some(TaskStatus::Done) => Err(TaskError::from_display(
+                    "task completed before reaching ready state",
+                )),
+                Some(TaskStatus::Failed(failure)) => {
+                    Err(TaskError::from_display(failure.message).with_code(failure.exit_code))
+                }
+                Some(TaskStatus::Cancelled) => Err(TaskError::cancelled()),
+                Some(TaskStatus::Timeout) => Err(TaskError::timeout()),
+                Some(TaskStatus::Setup) | None => {
+                    Err(TaskError::from_display("wait_for predicate violated"))
+                }
+            },
+            Err(_) => Err(TaskError::from_display("engine dropped graph channel")),
+        }
+    }
 }
 
 impl IntoFuture for TaskHandle {
@@ -176,6 +224,26 @@ mod tests {
         })
     }
 
+    fn ready_then_block_task<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move {
+            ctx.mark_ready();
+            tokio::select! {
+                _ = ctx.cancellation_signal() => Err(TaskError::cancelled()),
+                _ = tokio::time::sleep(Duration::from_secs(30)) => Ok(()),
+            }
+        })
+    }
+
+    fn fail_task<'a>(
+        _ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move { Err(TaskError::from_display("boom").with_code(7)) })
+    }
+
     fn parent_task<'a>(
         ctx: &'a TaskContext,
         _args: &[String],
@@ -213,6 +281,24 @@ mod tests {
         description: None,
         group: "",
         func: TaskFnKind::Static(parent_task),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
+    static READY_THEN_BLOCK: TaskDef = TaskDef {
+        name: "ready_then_block",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(ready_then_block_task),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
+    static FAIL: TaskDef = TaskDef {
+        name: "fail",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(fail_task),
         arg_metadata: no_args,
         ui_hint: None,
     };
@@ -333,5 +419,69 @@ mod tests {
         let result = ctx.run("ok", &[]).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "no engine context");
+    }
+
+    #[tokio::test]
+    async fn wait_ready_resolves_when_task_marks_ready() {
+        let registry = build_registry(&[&READY_THEN_BLOCK]);
+        let (engine, handle) = Engine::start(registry);
+        let id = handle
+            .spawn_task(&READY_THEN_BLOCK, vec![])
+            .await
+            .expect("spawn ready_then_block");
+        let exec = handle.lookup(id).expect("exec in table");
+        let internals_weak = std::sync::Arc::downgrade(&handle.internals);
+        let h = super::TaskHandle::new(exec, internals_weak);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), h.wait_ready())
+            .await
+            .expect("wait_ready should resolve before deadline");
+        assert!(outcome.is_ok(), "wait_ready returned err: {outcome:?}");
+
+        // Dropping the handle cancels the still-blocking child.
+        drop(h);
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wait_ready_errors_when_task_completes_without_ready() {
+        let registry = build_registry(&[&OK]);
+        let (engine, handle) = Engine::start(registry);
+        let id = handle.spawn_task(&OK, vec![]).await.expect("spawn ok");
+        let exec = handle.lookup(id).expect("exec in table");
+        let internals_weak = std::sync::Arc::downgrade(&handle.internals);
+        let h = super::TaskHandle::new(exec, internals_weak);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), h.wait_ready())
+            .await
+            .expect("wait_ready should resolve before deadline");
+        let err = outcome.expect_err("ok task never marks ready");
+        assert!(
+            err.to_string().contains("completed before reaching ready"),
+            "unexpected error message: {err}"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn wait_ready_propagates_task_failure() {
+        let registry = build_registry(&[&FAIL]);
+        let (engine, handle) = Engine::start(registry);
+        let id = handle.spawn_task(&FAIL, vec![]).await.expect("spawn fail");
+        let exec = handle.lookup(id).expect("exec in table");
+        let internals_weak = std::sync::Arc::downgrade(&handle.internals);
+        let h = super::TaskHandle::new(exec, internals_weak);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), h.wait_ready())
+            .await
+            .expect("wait_ready should resolve before deadline");
+        let err = outcome.expect_err("fail task surfaces error");
+        assert!(err.to_string().contains("boom"), "unexpected error: {err}");
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
     }
 }
