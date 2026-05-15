@@ -29,6 +29,15 @@
 //! let url = "http://example.com";
 //! ctx.exec(cmd!(curl -X POST {&url} -H "Content-Type: application/json")).await?;
 //! ```
+//!
+//! The `{expr...}` splat interpolates an `IntoIterator` as zero or more args.
+//! Naturally handles `Option<T>`, `Vec<T>`, and slices:
+//!
+//! ```rust,ignore
+//! let verbose = debug.then_some("--verbose");        // Option<&str>
+//! let tests   = vec!["test_a", "test_b"];            // Vec<&str>
+//! ctx.exec(cmd!(cargo test {verbose...} {tests...})).await?;
+//! ```
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -451,5 +460,40 @@ mod tests {
         let name = String::from("world");
         let cmd = rnme::cmd!(echo {&name});
         assert_eq!(cmd.to_string(), "echo world");
+    }
+
+    #[test]
+    fn test_cmd_macro_splat_option_some() {
+        let foo = true.then_some("--foo");
+        let cmd = rnme::cmd!(do {foo...} thing);
+        assert_eq!(cmd.to_string(), "do --foo thing");
+    }
+
+    #[test]
+    fn test_cmd_macro_splat_option_none() {
+        let foo: Option<&str> = None;
+        let cmd = rnme::cmd!(do {foo...} thing);
+        assert_eq!(cmd.to_string(), "do thing");
+    }
+
+    #[test]
+    fn test_cmd_macro_splat_vec() {
+        let names = vec!["a", "b", "c"];
+        let cmd = rnme::cmd!(echo {names...});
+        assert_eq!(cmd.to_string(), "echo a b c");
+    }
+
+    #[test]
+    fn test_cmd_macro_splat_empty_vec() {
+        let names: Vec<&str> = vec![];
+        let cmd = rnme::cmd!(echo prefix {names...} suffix);
+        assert_eq!(cmd.to_string(), "echo prefix suffix");
+    }
+
+    #[test]
+    fn test_cmd_macro_splat_with_method() {
+        let names = vec![String::from("x"), String::from("y")];
+        let cmd = rnme::cmd!(echo {names.iter()...});
+        assert_eq!(cmd.to_string(), "echo x y");
     }
 }

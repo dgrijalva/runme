@@ -8,6 +8,10 @@ enum CmdArg {
     Literal(String, Span),
     /// An interpolated expression from `{expr}`.
     Expr(TokenStream, Span),
+    /// A splatted expression from `{expr...}` — expands to zero or more args.
+    /// The expression must be `IntoIterator<Item: Into<OsString>>`. Naturally
+    /// handles `Option<T>` (0 or 1 args), `Vec<T>`, slices, etc.
+    Splat(TokenStream, Span),
 }
 
 /// Parse cmd! input and generate a `Cmd` expression.
@@ -15,10 +19,11 @@ enum CmdArg {
 /// Tokenization rules:
 /// - Whitespace separates arguments (detected via span positions)
 /// - `{expr}` braces create an interpolation argument
+/// - `{expr...}` splats an iterable into zero or more args
 /// - `"quoted strings"` are single literal arguments (unquoted content)
 /// - Adjacent tokens (no whitespace) concatenate into one argument
 /// - First argument becomes the program: `Cmd::new(...)`
-/// - Remaining arguments become `.arg(...)` calls
+/// - Remaining arguments become `.arg(...)` or `.args(...)` calls
 pub(crate) fn expand_cmd(input: TokenStream) -> Result<TokenStream, syn::Error> {
     let args = parse_args(input)?;
 
@@ -32,12 +37,19 @@ pub(crate) fn expand_cmd(input: TokenStream) -> Result<TokenStream, syn::Error> 
     let mut chain = match &args[0] {
         CmdArg::Literal(s, _) => quote! { ::rnme::cmd::Cmd::new(#s) },
         CmdArg::Expr(expr, _) => quote! { ::rnme::cmd::Cmd::new(#expr) },
+        CmdArg::Splat(_, span) => {
+            return Err(syn::Error::new(
+                *span,
+                "cmd! program (first argument) cannot be a splat — it must be a single value",
+            ));
+        }
     };
 
     for arg in &args[1..] {
         chain = match arg {
             CmdArg::Literal(s, _) => quote! { #chain.arg(#s) },
             CmdArg::Expr(expr, _) => quote! { #chain.arg(#expr) },
+            CmdArg::Splat(expr, _) => quote! { #chain.args(#expr) },
         };
     }
 
@@ -55,7 +67,31 @@ fn parse_args(input: TokenStream) -> Result<Vec<CmdArg>, syn::Error> {
             TokenTree::Group(g) if g.delimiter() == Delimiter::Brace => {
                 flush_word(&mut args, &mut current_word, &mut word_span);
                 last_end = Some(g.span().end());
-                args.push(CmdArg::Expr(g.stream(), g.span()));
+                let inner: Vec<TokenTree> = g.stream().into_iter().collect();
+                let trailing_dots = inner
+                    .iter()
+                    .rev()
+                    .take_while(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == '.'))
+                    .count();
+                if trailing_dots > 3 {
+                    return Err(syn::Error::new(
+                        g.span(),
+                        "splat uses exactly three dots: `{expr...}`",
+                    ));
+                } else if trailing_dots == 3 {
+                    let expr_len = inner.len() - 3;
+                    if expr_len == 0 {
+                        return Err(syn::Error::new(
+                            g.span(),
+                            "empty splat: `{...}` needs an expression before `...`",
+                        ));
+                    }
+                    let expr_stream: TokenStream =
+                        inner.into_iter().take(expr_len).collect();
+                    args.push(CmdArg::Splat(expr_stream, g.span()));
+                } else {
+                    args.push(CmdArg::Expr(g.stream(), g.span()));
+                }
             }
             TokenTree::Group(g) => {
                 return Err(syn::Error::new(
@@ -143,6 +179,7 @@ mod tests {
             .map(|a| match a {
                 CmdArg::Literal(s, _) => format!("lit:{s}"),
                 CmdArg::Expr(ts, _) => format!("expr:{ts}"),
+                CmdArg::Splat(ts, _) => format!("splat:{ts}"),
             })
             .collect()
     }
@@ -218,5 +255,46 @@ mod tests {
             parse_arg_strings("ls src/main.rs"),
             vec!["lit:ls", "lit:src/main.rs"]
         );
+    }
+
+    #[test]
+    fn splat_basic() {
+        let result = parse_arg_strings("do {foo...} thing");
+        assert_eq!(result[0], "lit:do");
+        assert!(result[1].starts_with("splat:"));
+        assert_eq!(result[2], "lit:thing");
+    }
+
+    #[test]
+    fn splat_with_method_call() {
+        let result = parse_arg_strings("cargo test {names.iter()...}");
+        assert!(result[2].starts_with("splat:"));
+        assert!(result[2].contains("names"));
+        assert!(result[2].contains("iter"));
+    }
+
+    #[test]
+    fn splat_with_range_in_expr() {
+        // Range with `..` inside, but no trailing `...` — should be Expr not Splat.
+        let result = parse_arg_strings("echo {0..10}");
+        assert!(result[1].starts_with("expr:"));
+    }
+
+    #[test]
+    fn empty_splat_is_error() {
+        let ts: TokenStream = "echo {...}".parse().unwrap();
+        assert!(parse_args(ts).is_err());
+    }
+
+    #[test]
+    fn too_many_dots_is_error() {
+        let ts: TokenStream = "echo {foo....}".parse().unwrap();
+        assert!(parse_args(ts).is_err());
+    }
+
+    #[test]
+    fn splat_as_program_is_error() {
+        let ts: TokenStream = "{progs...}".parse().unwrap();
+        assert!(expand_cmd(ts).is_err());
     }
 }

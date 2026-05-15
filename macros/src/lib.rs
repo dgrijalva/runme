@@ -718,13 +718,19 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Build a structured `Cmd` from shell-like syntax.
 ///
 /// Whitespace separates arguments. `{expr}` interpolates a Rust expression
-/// as a single argument. Quoted strings (`"..."`) are single arguments.
-/// Adjacent tokens (no whitespace) merge into one argument.
+/// as a single argument. `{expr...}` splats an `IntoIterator` as zero or
+/// more arguments — useful for `Option<T>` (0/1 args), `Vec<T>`, slices, etc.
+/// Quoted strings (`"..."`) are single arguments. Adjacent tokens (no
+/// whitespace) merge into one argument.
 ///
 /// ```ignore
 /// // These are equivalent:
 /// cmd!(curl -X POST {&url} -H "Content-Type: application/json")
 /// Cmd::new("curl").arg("-X").arg("POST").arg(&url).arg("-H").arg("Content-Type: application/json")
+///
+/// // Splat for optional flags and lists:
+/// let verbose = debug.then_some("--verbose");
+/// cmd!(cargo test {verbose...} {test_names...})
 /// ```
 #[proc_macro]
 pub fn cmd(input: TokenStream) -> TokenStream {
