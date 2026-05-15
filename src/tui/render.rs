@@ -121,8 +121,9 @@ fn render_preview(
         Style::default().fg(source_color),
     );
 
-    // Message: use extracted message, fall back to raw
-    let message = entry.message.as_deref().unwrap_or(&entry.raw).to_string();
+    // Message: use extracted message, fall back to raw. Strip control
+    // sequences that would corrupt the terminal display.
+    let message = sanitize_for_display(entry.message.as_deref().unwrap_or(&entry.raw));
 
     // Calculate prefix width (columns before message)
     let prefix_width =
@@ -261,14 +262,15 @@ fn render_preview(
 /// Render in raw mode: show the original text as-is.
 fn render_raw(entry: &LogEntry, width: u16, wrap: bool) -> (Vec<Line<'static>>, usize) {
     let width = width as usize;
+    let raw = sanitize_for_display(&entry.raw);
 
     if !wrap {
         // Truncated: single line
-        let text = truncate_str(&entry.raw, width);
+        let text = truncate_str(&raw, width);
         (vec![Line::from(text)], 1)
     } else {
         // Wrapped
-        let lines = wrap_text(&entry.raw, width);
+        let lines = wrap_text(&raw, width);
         let result: Vec<Line<'static>> = if lines.is_empty() {
             vec![Line::from(String::new())]
         } else {
@@ -277,6 +279,61 @@ fn render_raw(entry: &LogEntry, width: u16, wrap: bool) -> (Vec<Line<'static>>, 
         let h = result.len();
         (result, h)
     }
+}
+
+/// Strip control characters and ANSI escape sequences from a string before
+/// handing it to ratatui. Without this, characters like `\r`, `\x08`, and CSI
+/// sequences (`\x1b[...`) are passed through to the host terminal and corrupt
+/// the rendered TUI layout (cursor jumps, missing characters, broken columns).
+///
+/// Preserves `\n` (wrap-mode rendering splits on it) and `\t`. Strips all other
+/// C0 controls, DEL, C1 controls, and ANSI CSI / OSC sequences.
+fn sanitize_for_display(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                // ANSI escape — consume the sequence so it doesn't reach the terminal.
+                match chars.next() {
+                    Some('[') => {
+                        // CSI: parameter / intermediate bytes followed by a final
+                        // byte in 0x40..=0x7E.
+                        for c in chars.by_ref() {
+                            if matches!(c, '\x40'..='\x7e') {
+                                break;
+                            }
+                        }
+                    }
+                    Some(']') => {
+                        // OSC: terminated by BEL (\x07) or ST (ESC '\\').
+                        let mut prev = '\0';
+                        for c in chars.by_ref() {
+                            if c == '\x07' || (prev == '\x1b' && c == '\\') {
+                                break;
+                            }
+                            prev = c;
+                        }
+                    }
+                    _ => {
+                        // Single-char escape (or stray trailing ESC) — drop it.
+                    }
+                }
+            }
+            '\n' | '\t' => out.push(c),
+            c if (c as u32) < 0x20 => {
+                // Strip C0 controls: \r, \x08 backspace, \x07 bell, \x0c form feed, etc.
+            }
+            '\x7f' => {
+                // Strip DEL.
+            }
+            c if (0x80..=0x9f).contains(&(c as u32)) => {
+                // Strip C1 controls.
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Format a level string and return (display text, color).
@@ -725,5 +782,69 @@ mod tests {
             ("DEBUG".to_string(), Color::DarkGray)
         );
         assert_eq!(format_level(&None), ("---".to_string(), Color::DarkGray));
+    }
+
+    #[test]
+    fn sanitize_strips_carriage_return() {
+        assert_eq!(sanitize_for_display("foo\rbar"), "foobar");
+        assert_eq!(sanitize_for_display("Progress 50%\r"), "Progress 50%");
+    }
+
+    #[test]
+    fn sanitize_preserves_tab_and_newline() {
+        assert_eq!(sanitize_for_display("a\tb\nc"), "a\tb\nc");
+    }
+
+    #[test]
+    fn sanitize_strips_other_c0_controls() {
+        // backspace, bell, form feed, vertical tab
+        assert_eq!(sanitize_for_display("a\x08b\x07c\x0cd\x0be"), "abcde");
+    }
+
+    #[test]
+    fn sanitize_strips_del_and_c1() {
+        assert_eq!(sanitize_for_display("a\x7fb\u{0080}c\u{009f}d"), "abcd");
+    }
+
+    #[test]
+    fn sanitize_strips_csi_color_codes() {
+        assert_eq!(
+            sanitize_for_display("\x1b[31merror\x1b[0m: bad"),
+            "error: bad"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_csi_cursor_moves() {
+        // erase line, cursor up
+        assert_eq!(sanitize_for_display("\x1b[2K\x1b[1Adone"), "done");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_bel_terminated() {
+        // OSC set title, BEL-terminated
+        assert_eq!(
+            sanitize_for_display("\x1b]0;my title\x07after"),
+            "after"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_osc_st_terminated() {
+        // OSC hyperlink, ST-terminated
+        assert_eq!(
+            sanitize_for_display("\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\rest"),
+            "linkrest"
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_trailing_esc() {
+        assert_eq!(sanitize_for_display("text\x1b"), "text");
+    }
+
+    #[test]
+    fn sanitize_plain_text_unchanged() {
+        assert_eq!(sanitize_for_display("hello world"), "hello world");
     }
 }
