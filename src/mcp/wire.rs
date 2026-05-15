@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::execution::{EngineError, GraphSnapshot, KillSignal, SpawnOptions, TaskId};
+use crate::execution::{EngineError, GraphSnapshot, KillSignal, RestartMode, SpawnOptions, TaskId};
 use crate::log::LogEntry;
 use crate::task::TaskInfo;
 
@@ -88,6 +88,13 @@ pub enum Request {
     },
     /// Cancel every direct child of root.
     KillAll,
+    /// Restart a top-level task. `Soft` delivers a cooperative signal
+    /// if the task subscribed via `ctx.restart_handle()`; otherwise
+    /// falls back to `Hard` (kill subtree + respawn).
+    RestartTask {
+        task_id: TaskId,
+        mode: RestartMode,
+    },
     /// Page through historical log entries for a task (and descendants).
     GetLogs {
         task_id: TaskId,
@@ -142,6 +149,12 @@ pub enum Response {
     KillTask,
     KillProcess,
     KillAll,
+    RestartTask {
+        /// `TaskId` after restart. Equal to the request `task_id` for
+        /// soft restarts that hit a subscriber; a fresh id for hard
+        /// restarts (or soft restarts that fell back to hard).
+        task_id: TaskId,
+    },
     GetLogs {
         entries: Vec<LogEntry>,
         next_seq: u64,

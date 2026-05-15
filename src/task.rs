@@ -41,7 +41,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
 use globset::GlobBuilder;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch as tokio_watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
@@ -203,6 +203,13 @@ pub struct TaskContext {
     /// to invoke the cancel ladder, and by the synthetic root body to
     /// reach the control receiver.
     engine: Option<Weak<crate::execution::engine::EngineInternals>>,
+    /// Sender side of the cooperative soft-restart signal for this task.
+    /// Always populated. In the engine runtime,
+    /// `TaskExecution::spawn_body` overwrites this with the execution's
+    /// shared sender so the engine can fire signals; outside the engine
+    /// (tests using `TaskContext::new` directly), the default sender
+    /// has no firer, so subscribers exist but never observe a signal.
+    restart_signal: Arc<tokio_watch::Sender<u64>>,
 }
 
 /// Future returned by [`TaskContext::cancellation_signal`].
@@ -226,6 +233,52 @@ impl<'a> Future for CancellationSignal<'a> {
         match this.inner.as_mut() {
             Some(fut) => unsafe { Pin::new_unchecked(fut) }.poll(cx),
             None => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Subscription to a task's cooperative soft-restart signal.
+///
+/// Obtained via [`TaskContext::restart_handle`]. The task awaits
+/// [`RestartHandle::wait`] (works in `select!`) or polls
+/// [`RestartHandle::should_restart`] in non-async contexts. Each soft
+/// restart request increments a debounced counter — if multiple
+/// requests fire before the task observes them, they collapse into a
+/// single signal.
+///
+/// When no `RestartHandle` exists for a task, the engine transparently
+/// promotes any incoming soft restart to a hard restart.
+pub struct RestartHandle {
+    rx: tokio_watch::Receiver<u64>,
+    seen: u64,
+}
+
+impl RestartHandle {
+    pub(crate) fn new(rx: tokio_watch::Receiver<u64>) -> Self {
+        let seen = *rx.borrow();
+        Self { rx, seen }
+    }
+
+    /// Resolve once a soft restart signal has been delivered since the
+    /// last call to `wait` / `should_restart`. Usable in `tokio::select!`.
+    ///
+    /// If the engine drops the sender (task tearing down), this future
+    /// resolves immediately so callers don't hang.
+    pub async fn wait(&mut self) {
+        let _ = self.rx.changed().await;
+        self.seen = *self.rx.borrow();
+    }
+
+    /// Non-async check: returns `true` if a soft restart signal is
+    /// pending. Consumes the pending signal (subsequent calls return
+    /// `false` until another signal fires).
+    pub fn should_restart(&mut self) -> bool {
+        let cur = *self.rx.borrow();
+        if cur != self.seen {
+            self.seen = cur;
+            true
+        } else {
+            false
         }
     }
 }
@@ -272,6 +325,7 @@ impl TaskContext {
             log_store: None,
             engine: None,
             seq_gen: None,
+            restart_signal: Arc::new(tokio_watch::Sender::new(0u64)),
         }
     }
 
@@ -294,6 +348,7 @@ impl TaskContext {
             log_store: None,
             engine: None,
             seq_gen: None,
+            restart_signal: Arc::new(tokio_watch::Sender::new(0u64)),
         }
     }
 
@@ -706,6 +761,27 @@ impl TaskContext {
     /// `EngineInternals::spawn_child` before the body runs.
     pub fn set_engine(&mut self, engine: Weak<crate::execution::engine::EngineInternals>) {
         self.engine = Some(engine);
+    }
+
+    /// Inject the soft-restart signal sender. Called by
+    /// `TaskExecution::spawn_body` so the engine and the running task
+    /// share the same channel.
+    pub fn set_restart_signal(&mut self, sender: Arc<tokio_watch::Sender<u64>>) {
+        self.restart_signal = sender;
+    }
+
+    /// Subscribe to this task's cooperative soft-restart signal.
+    ///
+    /// Returns a [`RestartHandle`] that the task can use to observe
+    /// soft-restart requests via [`RestartHandle::wait`] (async,
+    /// `select!`-compatible) or [`RestartHandle::should_restart`]
+    /// (non-async poll).
+    ///
+    /// While at least one `RestartHandle` exists for this task, soft
+    /// restarts are delivered cooperatively. With no subscribers, the
+    /// engine promotes a soft restart to a hard restart.
+    pub fn restart_handle(&self) -> RestartHandle {
+        RestartHandle::new(self.restart_signal.subscribe())
     }
 
     /// Upgrade the engine weak reference, if any.

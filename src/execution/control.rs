@@ -143,6 +143,20 @@ pub enum KillSignal {
     Kill,
 }
 
+/// Restart mode passed to `EngineHandle::restart`.
+///
+/// `Soft` delivers a cooperative signal to the task via its
+/// `RestartHandle`. If the task never subscribed to that handle, the
+/// engine transparently falls back to `Hard`.
+///
+/// `Hard` cancels the task subtree and respawns a fresh sibling using
+/// the same `TaskDef` and args.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RestartMode {
+    Soft,
+    Hard,
+}
+
 /// Internal command messages handled by the synthetic root task.
 ///
 /// `pub(crate)` — frontends use `EngineHandle` methods (slice 4), which
@@ -170,11 +184,13 @@ pub(crate) enum Control {
     Quit {
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
-    /// Restart a top-level task: cancel the existing one (subtree stays
-    /// in the graph) and spawn a fresh sibling using the same `TaskDef`
-    /// and args.
+    /// Restart a top-level task. `Hard` cancels the existing subtree
+    /// and spawns a fresh sibling using the same `TaskDef` and args.
+    /// `Soft` fires the task's cooperative restart signal if it has
+    /// subscribed; otherwise falls back to `Hard`.
     RestartTask {
         id: TaskId,
+        mode: RestartMode,
         reply: oneshot::Sender<Result<TaskId, RestartError>>,
     },
 }

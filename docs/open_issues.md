@@ -13,14 +13,6 @@
 
 `ctx.summary` lands in the MCP report path but the TUI doesn't read it — decide if/where to show it.
 
-## Soft vs hard restart
-
-**14:17** — Two restart modes. `r` = soft restart: a cooperative signal the task can opt into. `R` = hard restart: current behavior (kill + respawn). Mechanism: `TaskContext` exposes a restart channel/signal that the task can `take()`. If taken, soft restart sends through that channel and the task decides what to do (e.g., reload config, re-exec a child, drain). If not taken, soft and hard behave identically. CLI mode could map `SIGHUP` to soft restart on the same principle.
-
-- _Effort:_ Moderate — new `TaskContext` API surface, restart routing in the runner, TUI key wiring, and signal handling in CLI mode
-- _Assessment:_ Fits the existing `TaskContext` shape (it already owns process lifecycle plumbing). Restart channel is probably a `oneshot`-per-restart or a `tokio::sync::Notify` the task can `take()` once. "Take" semantics matter: only one consumer, and the runner needs to know whether it was taken so it can decide soft-vs-hard fallback. CLI mode parallel is clean since `SIGHUP` is the conventional cooperative-reload signal anyway
-- _Open questions:_ What does "the task" mean for soft restart — the top-level task fn, or any spawned child it owns? Is the signal one-shot per restart, or a stream the task subscribes to for the lifetime of the run? Does soft restart wait for the task to finish handling, or fire-and-forget? What happens if the task takes the signal but never responds — timeout into hard restart?
-
 ## Speed up runner build time
 
 **15:16** — Build time of the generated runner crate is the dominant contributor to launch time. Already building in debug. Application perf doesn't matter — `rnme` is a supervisor. Look at what Bevy recommends for fast iteration builds and pull what applies.

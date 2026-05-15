@@ -23,7 +23,7 @@ use crate::log::store::LogStore;
 use crate::task::{Registry, TaskDef};
 
 use super::TaskId;
-use super::control::{Control, EngineError, KillSignal, RestartError, SpawnOptions};
+use super::control::{Control, EngineError, KillSignal, RestartError, RestartMode, SpawnOptions};
 use super::execution::{ProcessInfo, ProcessStatus, TaskExecution, TaskStatus};
 use super::handle::TaskHandle;
 use super::root::ROOT_TASK;
@@ -771,15 +771,29 @@ impl EngineHandle {
         Ok(())
     }
 
-    /// Restart a top-level task. Cancels the existing task and subtree
-    /// (the cancelled node stays in the graph snapshot), then spawns a
-    /// fresh sibling using the same `TaskDef` and args. Returns the new
-    /// `TaskId`.
-    pub async fn restart(&self, id: TaskId) -> Result<TaskId, RestartError> {
+    /// Restart a top-level task.
+    ///
+    /// `Hard` cancels the existing task and subtree (the cancelled node
+    /// stays in the graph snapshot) and spawns a fresh sibling using
+    /// the same `TaskDef` and args, returning the new `TaskId`.
+    ///
+    /// `Soft` fires the task's cooperative restart signal if it has
+    /// subscribed via `ctx.restart_handle()`. If no subscriber exists,
+    /// falls back to `Hard`. When the signal is delivered, the existing
+    /// `TaskId` is returned (no respawn occurs).
+    pub async fn restart(
+        &self,
+        id: TaskId,
+        mode: RestartMode,
+    ) -> Result<TaskId, RestartError> {
         let (tx, rx) = oneshot::channel();
         self.internals
             .control_tx
-            .send(Control::RestartTask { id, reply: tx })
+            .send(Control::RestartTask {
+                id,
+                mode,
+                reply: tx,
+            })
             .map_err(|_| RestartError::ShuttingDown)?;
         rx.await.map_err(|_| RestartError::ShuttingDown)?
     }
@@ -1179,6 +1193,37 @@ mod tests {
         })
     }
 
+    static SOFT_RESTART_COUNT: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    fn soft_restart_subscriber<'a>(
+        ctx: &'a TaskContext,
+        _args: &[String],
+    ) -> Pin<Box<dyn Future<Output = TaskResult> + Send + 'a>> {
+        Box::pin(async move {
+            let mut handle = ctx.restart_handle();
+            loop {
+                tokio::select! {
+                    _ = handle.wait() => {
+                        SOFT_RESTART_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ = ctx.cancellation_signal() => break,
+                }
+            }
+            Ok(())
+        })
+    }
+
+    static SOFT_SUBSCRIBER: TaskDef = TaskDef {
+        name: "soft_subscriber",
+        description: None,
+        group: "",
+        func: TaskFnKind::Static(soft_restart_subscriber),
+        arg_metadata: no_args,
+        ui_hint: None,
+    };
+
     static SUMMARY_TWICE: TaskDef = TaskDef {
         name: "summary_twice",
         description: None,
@@ -1470,7 +1515,10 @@ mod tests {
         // Let it actually start.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let new_id = handle.restart(old_id).await.expect("restart should succeed");
+        let new_id = handle
+            .restart(old_id, RestartMode::Hard)
+            .await
+            .expect("restart should succeed");
         assert_ne!(old_id, new_id, "restart must return a fresh TaskId");
 
         // Old must reach Cancelled and remain in the graph.
@@ -1516,7 +1564,7 @@ mod tests {
         let child_id = parent_node.children[0];
 
         let err = handle
-            .restart(child_id)
+            .restart(child_id, RestartMode::Hard)
             .await
             .expect_err("restart on non-top-level must error");
         assert!(
@@ -1529,12 +1577,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn soft_restart_delivers_signal_when_subscribed() {
+        SOFT_RESTART_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+        let registry = build_registry(&[&SOFT_SUBSCRIBER]);
+        let (engine, handle) = Engine::start(registry);
+
+        let id = handle
+            .spawn_task(&SOFT_SUBSCRIBER, vec![])
+            .await
+            .expect("spawn_task should succeed");
+
+        // Wait for the task body to subscribe before we fire.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if let Some(exec) = handle.lookup(id)
+                && exec.restart_signal.receiver_count() > 0
+            {
+                break;
+            }
+        }
+
+        let returned = handle
+            .restart(id, RestartMode::Soft)
+            .await
+            .expect("soft restart should succeed");
+        assert_eq!(
+            returned, id,
+            "soft restart with a subscriber returns the same id"
+        );
+
+        // Give the task a beat to observe and increment.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if SOFT_RESTART_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+                break;
+            }
+        }
+        assert!(
+            SOFT_RESTART_COUNT.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "subscriber should have observed at least one soft restart"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn soft_restart_falls_back_to_hard_without_subscriber() {
+        let registry = build_registry(&[&SLOW]);
+        let (engine, handle) = Engine::start(registry);
+
+        let old_id = handle
+            .spawn_task(&SLOW, vec![])
+            .await
+            .expect("spawn_task should succeed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let new_id = handle
+            .restart(old_id, RestartMode::Soft)
+            .await
+            .expect("soft restart with no subscriber must fall back to hard");
+        assert_ne!(
+            old_id, new_id,
+            "fallback to hard restart returns a fresh TaskId"
+        );
+
+        let status = wait_terminal(&handle, old_id).await;
+        assert!(
+            matches!(status, TaskStatus::Cancelled),
+            "old task must be cancelled by the hard fallback; got {status:?}"
+        );
+
+        let _ = handle.quit().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn restart_unknown_id_errors_not_found() {
         let registry = build_registry(&[]);
         let (engine, handle) = Engine::start(registry);
 
         let err = handle
-            .restart(TaskId(99_999))
+            .restart(TaskId(99_999), RestartMode::Hard)
             .await
             .expect_err("restart on unknown id must error");
         assert!(

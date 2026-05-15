@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 
 use nix::sys::signal;
 use nix::unistd::Pid;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -258,6 +258,13 @@ pub struct TaskExecution {
     /// `None` for the synthetic root.
     pub task_def: Option<&'static TaskDef>,
     pub task_args: Vec<String>,
+    /// Sender side of the cooperative soft-restart signal. Shared with
+    /// the running `TaskContext` (cloned in `spawn_body`). The engine
+    /// fires signals through this; the task subscribes via
+    /// `ctx.restart_handle()`. `receiver_count() > 0` is how the engine
+    /// decides whether a soft restart is deliverable or should fall
+    /// back to hard.
+    pub restart_signal: Arc<watch::Sender<u64>>,
 
     // ── Reporting (timestamps + summary) ──────────────────────────
     /// Timestamp at which the task body began running. Set exactly once
@@ -328,6 +335,7 @@ impl TaskExecution {
             registry: None,
             task_def: None,
             task_args: Vec::new(),
+            restart_signal: Arc::new(watch::Sender::new(0u64)),
             started_at: Arc::new(OnceLock::new()),
             ended_at: Arc::new(OnceLock::new()),
             summary: Arc::new(Mutex::new(None)),
@@ -399,6 +407,7 @@ impl TaskExecution {
         ctx.set_log_store(self.log_store.clone());
         let body_engine = engine.clone();
         ctx.set_engine(engine);
+        ctx.set_restart_signal(self.restart_signal.clone());
 
         // Forward exec() output to LogStore.
         start_buffer_forwarder(ctx.output_buffer(), log_store.clone());

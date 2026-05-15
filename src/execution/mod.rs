@@ -18,7 +18,7 @@ pub mod builder;
 pub mod handle;
 
 pub use builder::TaskBuilder;
-pub use control::{EngineError, KillSignal, RestartError, SpawnOptions};
+pub use control::{EngineError, KillSignal, RestartError, RestartMode, SpawnOptions};
 pub use engine::{
     Engine, EngineHandle, EngineSpawnBuilder, GraphSnapshot, ProcessNodeInfo, TaskNode,
 };

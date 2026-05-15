@@ -11,7 +11,7 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rnme::mcp::supervisor::{InProcessSpawner, Supervisor};
 use rnme::mcp::tools::{
-    GetLogsParams, GetTaskParams, InstallSkillsParams, McpServer, SpawnTaskParams,
+    GetLogsParams, GetTaskParams, InstallSkillsParams, McpServer, RestartParams, SpawnTaskParams,
 };
 use rnme::task::Registry;
 
@@ -205,4 +205,61 @@ async fn kill_all_acks_when_no_tasks_running() {
     let result = server.kill_all().await.expect("kill_all ok");
     let value = result.structured_content.clone().expect("structured");
     assert_eq!(value.get("ok").and_then(|v| v.as_bool()), Some(true));
+}
+
+#[tokio::test]
+async fn restart_task_falls_back_to_hard_without_subscriber() {
+    // `:list` doesn't subscribe via `ctx.restart_handle()`, so a soft
+    // request must transparently promote to a hard restart and return
+    // a fresh task id.
+    let server = boot().await;
+    let spawn = server
+        .spawn_task(Parameters(SpawnTaskParams {
+            name: ":list".into(),
+            args: vec![],
+            timeout_seconds: None,
+        }))
+        .await
+        .expect("spawn ok");
+    let value = spawn.structured_content.clone().unwrap();
+    let task_id = value.get("task_id").unwrap().as_str().unwrap().to_string();
+    let top = task_id
+        .parse::<rnme::mcp::routing::Address>()
+        .unwrap()
+        .top;
+    wait_for_top(&server, top).await;
+
+    let result = server
+        .restart_task(Parameters(RestartParams {
+            id: task_id.clone(),
+            mode: Some("soft".into()),
+        }))
+        .await
+        .expect("restart_task ok");
+    let value = result.structured_content.clone().expect("structured");
+    let new_id = value
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .expect("task_id string");
+    assert_ne!(
+        new_id, task_id,
+        "soft restart with no subscriber must fall back to hard and return a fresh id"
+    );
+}
+
+#[tokio::test]
+async fn restart_task_rejects_unknown_mode() {
+    let server = boot().await;
+    let err = server
+        .restart_task(Parameters(RestartParams {
+            id: "1".into(),
+            mode: Some("warm".into()),
+        }))
+        .await
+        .expect_err("unknown mode must error");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("unknown restart mode"),
+        "error should mention the bad mode: {msg}"
+    );
 }

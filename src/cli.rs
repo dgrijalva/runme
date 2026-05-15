@@ -257,6 +257,10 @@ async fn run_cli(
 
     // Watch graph snapshots for terminal status on `task_id`. Ctrl-C
     // quits the engine cleanly (cancel subtree → root body returns).
+    // SIGHUP triggers a cooperative soft restart on the running task —
+    // if the task subscribed via `ctx.restart_handle()`, the signal is
+    // delivered and the task body decides how to react; otherwise the
+    // engine transparently falls back to hard restart.
     //
     // Two-phase wait, matching legacy CLI behavior:
     //   1. Wait for the task body to reach a terminal status.
@@ -264,7 +268,10 @@ async fn run_cli(
     //      keep waiting until they exit (or Ctrl-C).
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .expect("install SIGHUP handler");
     let mut graph = handle.graph.clone();
+    let mut task_id = task_id;
     let final_status: TaskStatus = loop {
         let snap = graph.borrow().clone();
         if let Some(node) = snap.tasks.get(&task_id) {
@@ -288,6 +295,15 @@ async fn run_cli(
         tokio::select! {
             res = graph.changed() => {
                 if res.is_err() { break TaskStatus::Done; }
+            }
+            _ = sighup.recv() => {
+                match handle
+                    .restart(task_id, crate::execution::RestartMode::Soft)
+                    .await
+                {
+                    Ok(new_id) => task_id = new_id,
+                    Err(e) => eprintln!("rnme: SIGHUP restart failed: {e}"),
+                }
             }
             _ = &mut ctrl_c => {
                 let _ = handle.quit().await;

@@ -492,7 +492,11 @@ fn render_help_overlay(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) 
         ]),
         Line::from(vec![
             Span::raw("  r      "),
-            Span::styled("Restart task", desc),
+            Span::styled("Soft restart (cooperative signal; falls back to hard)", desc),
+        ]),
+        Line::from(vec![
+            Span::raw("  R      "),
+            Span::styled("Hard restart (kill + respawn)", desc),
         ]),
         Line::from(vec![
             Span::raw("  k      "),

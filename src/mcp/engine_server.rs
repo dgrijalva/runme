@@ -322,6 +322,23 @@ async fn handle_request(
             Ok(Response::KillAll)
         }
 
+        Request::RestartTask { task_id, mode } => {
+            use crate::execution::{EngineError, RestartError};
+            let new_id = handle.restart(task_id, mode).await.map_err(|e| match e {
+                RestartError::NotFound(id) => {
+                    RpcError::NotFound(format!("task not found: {id}"))
+                }
+                RestartError::NotTopLevel(id) => {
+                    RpcError::BadRequest(format!("task is not top-level: {id}"))
+                }
+                RestartError::ShuttingDown => {
+                    RpcError::Engine(EngineError::ShuttingDown)
+                }
+                RestartError::Task(err) => RpcError::Engine(EngineError::Task(err)),
+            })?;
+            Ok(Response::RestartTask { task_id: new_id })
+        }
+
         Request::GetLogs {
             task_id,
             since_seq,

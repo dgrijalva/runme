@@ -24,7 +24,7 @@ use crate::error::{TaskError, TaskResult};
 use crate::task::{TaskContext, TaskDef, TaskFnKind};
 
 use super::TaskId;
-use super::control::{Control, KillSignal, RestartError};
+use super::control::{Control, KillSignal, RestartError, RestartMode};
 use super::engine::take_control_rx;
 
 /// Synthetic root `TaskDef`. Library-provided, never registered with
@@ -121,7 +121,7 @@ pub(crate) fn root_body_fn<'a>(
                             });
                         }
 
-                        Control::RestartTask { id, reply } => {
+                        Control::RestartTask { id, mode, reply } => {
                             // Verify the task is top-level (direct child of ROOT).
                             let exec = match engine.lookup(id) {
                                 Some(e) => e,
@@ -132,6 +132,18 @@ pub(crate) fn root_body_fn<'a>(
                             };
                             if exec.parent != Some(TaskId::ROOT) {
                                 let _ = reply.send(Err(RestartError::NotTopLevel(id)));
+                                continue;
+                            }
+                            // Soft restart: if the task has subscribed
+                            // to its restart signal, fire the signal
+                            // and we're done. Existing TaskId is
+                            // returned (no respawn). Otherwise fall
+                            // through to the hard-restart path below.
+                            if mode == RestartMode::Soft
+                                && exec.restart_signal.receiver_count() > 0
+                            {
+                                exec.restart_signal.send_modify(|v| *v += 1);
+                                let _ = reply.send(Ok(id));
                                 continue;
                             }
                             let Some(def) = exec.task_def else {

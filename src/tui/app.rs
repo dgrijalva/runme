@@ -51,8 +51,8 @@ pub enum AppMode {
     KillMenu,
 }
 
-/// A pending `r` request, queued by the sync key handler for the async
-/// loop body to await against `EngineHandle::restart`.
+/// A pending `r` / `R` request, queued by the sync key handler for the
+/// async loop body to await against `EngineHandle::restart`.
 #[derive(Debug, Clone, Copy)]
 pub struct PendingRestart {
     pub top_id: TaskId,
@@ -61,6 +61,8 @@ pub struct PendingRestart {
     /// triggered restart from log focus while a section header was
     /// selected — they want to keep that filter view).
     pub follow: bool,
+    /// Soft (`r`) vs hard (`R`).
+    pub mode: crate::execution::RestartMode,
 }
 
 /// Source-visibility filter driven by the focused sidebar entry.

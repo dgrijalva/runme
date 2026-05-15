@@ -327,6 +327,43 @@ async fn server_ready(ctx: &TaskContext) -> TaskResult {
     Ok(())
 }
 
+/// Demonstrate cooperative soft restart.
+///
+/// Subscribe via `ctx.restart_handle()` and `select!` on the returned
+/// handle alongside whatever else the task is doing. When the user
+/// presses `r` in the TUI, calls the MCP `restart_task` tool with
+/// `mode: "soft"`, or sends `SIGHUP` to a CLI-mode `rnme` process, the
+/// handle fires and the task decides how to react. Here we treat it
+/// like a config-reload — reset the uptime counter and keep going.
+///
+/// If the task hadn't called `restart_handle()`, the engine would
+/// transparently fall back to a hard restart (kill + respawn).
+///
+/// Try it:
+///   rnme soft_restart_demo            # then `kill -HUP <pid>` from another shell
+///   rnme                              # press `r` (soft) or `R` (hard)
+#[rnme::task]
+async fn soft_restart_demo(ctx: &TaskContext) -> TaskResult {
+    use std::time::Duration;
+    let mut restart = ctx.restart_handle();
+    let mut uptime = 0u32;
+    info!("starting; uptime resets on soft restart");
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                uptime += 1;
+                info!("uptime: {}s", uptime);
+            }
+            _ = restart.wait() => {
+                info!("soft restart received — reloading (uptime was {}s)", uptime);
+                uptime = 0;
+            }
+            _ = ctx.cancellation_signal() => break,
+        }
+    }
+    Ok(())
+}
+
 /// Multi-phase pipeline — demonstrates `ctx.begin_step()` for labeled phases.
 ///
 /// Each step is an RAII guard: when the guard is dropped the step is recorded

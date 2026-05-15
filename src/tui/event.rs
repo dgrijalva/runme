@@ -93,18 +93,25 @@ pub async fn run_event_loop(
                         if let Some(req) = state.pending_restart.take()
                             && let Some(handle) = state.engine.clone()
                         {
-                            match handle.restart(req.top_id).await {
+                            match handle.restart(req.top_id, req.mode).await {
                                 Ok(new_id) => {
-                                    if req.follow {
-                                        state.follow_source = Some(new_id);
+                                    // Soft restart returns the same id
+                                    // (no respawn). Only reset follow /
+                                    // viewport state when the id changed
+                                    // — i.e. a hard restart or a soft
+                                    // restart that fell back to hard.
+                                    if new_id != req.top_id {
+                                        if req.follow {
+                                            state.follow_source = Some(new_id);
+                                        }
+                                        state.current_task_id = Some(new_id);
+                                        state.scroll = super::viewport::ScrollState::Tail;
+                                        state.search = super::search::SearchState::new();
+                                        state.detail_scroll = 0;
+                                        state.process_detail_index = None;
+                                        state.process_detail_scroll = 0;
+                                        state.process_detail_sockets = None;
                                     }
-                                    state.current_task_id = Some(new_id);
-                                    state.scroll = super::viewport::ScrollState::Tail;
-                                    state.search = super::search::SearchState::new();
-                                    state.detail_scroll = 0;
-                                    state.process_detail_index = None;
-                                    state.process_detail_scroll = 0;
-                                    state.process_detail_sockets = None;
                                     state.dirty = true;
                                 }
                                 Err(e) => {
@@ -412,7 +419,9 @@ fn handle_key(
             state.dirty = true;
             return;
         }
-        KeyCode::Char('r') => {
+        KeyCode::Char(c @ ('r' | 'R')) => {
+            // `r` = soft (cooperative) restart, `R` = hard (kill + respawn).
+            //
             // Restart the top-level ancestor of the entry the user is
             // currently looking at. Source resolution depends on focus:
             // - Sidebar: the selected sidebar entry (header → no-op).
@@ -448,9 +457,15 @@ fn handle_key(
             };
             let snapshot = handle.graph.borrow().clone();
             if let Some(top_id) = snapshot.top_level_of(source) {
+                let mode = if c == 'R' {
+                    crate::execution::RestartMode::Hard
+                } else {
+                    crate::execution::RestartMode::Soft
+                };
                 state.pending_restart = Some(super::app::PendingRestart {
                     top_id,
                     follow: !header_selected,
+                    mode,
                 });
                 state.dirty = true;
             }

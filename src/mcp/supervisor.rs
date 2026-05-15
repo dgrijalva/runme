@@ -817,6 +817,47 @@ impl Supervisor {
         }
     }
 
+    /// Restart a top-level task by dotted address. `mode` selects
+    /// soft (cooperative) or hard (kill + respawn). On a hard restart
+    /// (or a soft restart that fell back to hard) the new top task is
+    /// registered in `engine_map` so subsequent address lookups route
+    /// to it. Returns the new top task's dotted address.
+    pub async fn restart_task(
+        &mut self,
+        address: &str,
+        mode: crate::execution::RestartMode,
+    ) -> Result<String, RpcError> {
+        let addr = address.parse::<Address>().map_err(|e: AddressError| {
+            RpcError::BadRequest(e.to_string())
+        })?;
+        let gen_ref = self
+            .engine_map
+            .lookup(addr.top)
+            .ok_or_else(|| RpcError::NotFound(format!("top-task {} not live", addr.top)))?;
+        let gen_id = gen_ref.gen_id;
+        let resp = self
+            .request_gen(
+                gen_id,
+                Request::RestartTask {
+                    task_id: TaskId(addr.task),
+                    mode,
+                },
+            )
+            .await?;
+        match resp {
+            Response::RestartTask { task_id } => {
+                if task_id.0 != addr.top {
+                    // Hard path produced a fresh top — register it.
+                    self.engine_map.insert(task_id.0, gen_id, gen_id);
+                }
+                Ok(Address::render_task(task_id.0, task_id.0))
+            }
+            other => Err(RpcError::Internal(format!(
+                "unexpected response to RestartTask: {other:?}"
+            ))),
+        }
+    }
+
     /// Forward `Request::KillAll` to the latest gen.
     pub async fn kill_all(&self) -> Result<(), RpcError> {
         let gen_id = self.latest_gen.ok_or_else(|| {

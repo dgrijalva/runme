@@ -36,7 +36,7 @@ use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::execution::{KillSignal, SpawnOptions, TaskId};
+use crate::execution::{KillSignal, RestartMode, SpawnOptions, TaskId};
 use crate::mcp::routing::Address;
 use crate::mcp::supervisor::Supervisor;
 use crate::mcp::wire::{GrepScope, Request, Response, RpcError};
@@ -110,6 +110,19 @@ pub struct KillParams {
     /// Signal: `term` (default, soft kill) or `kill` (immediate SIGKILL).
     #[serde(default)]
     pub signal: Option<String>,
+}
+
+/// Parameters for [`McpServer::restart_task`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RestartParams {
+    /// Dotted top-level task address (e.g. `42`).
+    pub id: String,
+    /// `soft` (default) delivers a cooperative restart signal that the
+    /// task can observe via `ctx.restart_handle()`. If the task did not
+    /// subscribe, the engine transparently falls back to `hard`.
+    /// `hard` cancels the task subtree and respawns it.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// Parameters for [`McpServer::get_task`].
@@ -297,6 +310,28 @@ impl McpServer {
         }
     }
 
+    /// Restart a top-level task. `mode` is `soft` (default) or `hard`.
+    /// Soft delivers a cooperative restart signal that the task can
+    /// observe via `ctx.restart_handle()`. If the task didn't subscribe,
+    /// the engine transparently falls back to `hard` (kill + respawn).
+    /// Returns the resulting top task's dotted address (same as the
+    /// input id for a soft restart that hit a subscriber; a fresh
+    /// address otherwise).
+    #[tool]
+    pub async fn restart_task(
+        &self,
+        Parameters(params): Parameters<RestartParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mode = parse_restart_mode(params.mode.as_deref())?;
+        let mut sup = self.supervisor.lock().await;
+        let new_addr = sup
+            .restart_task(&params.id, mode)
+            .await
+            .map_err(map_rpc_error)?;
+        let value = serde_json::json!({ "task_id": new_addr });
+        Ok(CallToolResult::structured(value))
+    }
+
     /// Cancel every direct child of the latest engine's root task.
     #[tool]
     pub async fn kill_all(&self) -> Result<CallToolResult, McpError> {
@@ -438,7 +473,7 @@ impl ServerHandler for McpServer {
     }
 }
 
-const INSTRUCTIONS: &str = "rnme MCP server. Tools: list_tasks, spawn_task, run_task, kill_task, kill_process, kill_all, get_graph, get_task, get_logs, grep_logs, get_build_status. To install agent skills (RUNME.rs authoring + tool usage docs), call install_skills(target_dir) where target_dir is your framework's skill location (Claude Code: <project>/.claude/skills/).";
+const INSTRUCTIONS: &str = "rnme MCP server. Tools: list_tasks, spawn_task, run_task, restart_task, kill_task, kill_process, kill_all, get_graph, get_task, get_logs, grep_logs, get_build_status. To install agent skills (RUNME.rs authoring + tool usage docs), call install_skills(target_dir) where target_dir is your framework's skill location (Claude Code: <project>/.claude/skills/).";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -479,6 +514,19 @@ fn parse_signal(s: Option<&str>) -> Result<KillSignal, McpError> {
             "kill" | "sigkill" | "hard" => Ok(KillSignal::Kill),
             other => Err(invalid_params(format!(
                 "unknown signal {other:?}; expected `term` or `kill`"
+            ))),
+        },
+    }
+}
+
+fn parse_restart_mode(s: Option<&str>) -> Result<RestartMode, McpError> {
+    match s {
+        None => Ok(RestartMode::Soft),
+        Some(v) => match v.to_ascii_lowercase().as_str() {
+            "soft" | "" => Ok(RestartMode::Soft),
+            "hard" => Ok(RestartMode::Hard),
+            other => Err(invalid_params(format!(
+                "unknown restart mode {other:?}; expected `soft` or `hard`"
             ))),
         },
     }
