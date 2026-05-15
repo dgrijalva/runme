@@ -24,8 +24,6 @@ pub enum UiMode {
     Tui,
     /// Direct CLI execution with stdio output
     Cli,
-    /// Structured output for machine consumption
-    Agent,
 }
 
 pub use crate::output::OutputFormat;
@@ -38,7 +36,8 @@ pub use crate::output::OutputFormat;
 ///
 /// UI mode is selected by bare flags (`--tui`, `--cli`). At most one may be
 /// passed; if none is set, the mode is resolved from the task hint and terminal
-/// state. (`--mcp` is reserved for the upcoming MCP server mode.)
+/// state. (`--mcp` is handled by the outer driver in `bin/rnme/main.rs` and
+/// never reaches this parser.)
 #[derive(Parser)]
 #[command(name = "runme")]
 pub struct RnmeArgs {
@@ -94,7 +93,7 @@ impl RnmeArgs {
 /// Main dispatch function called by the generated runner binary.
 ///
 /// Parses CLI arguments, resolves the task, and dispatches to the appropriate
-/// UI mode (TUI, CLI, or Agent).
+/// UI mode (TUI or CLI).
 pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) {
     let args = RnmeArgs::parse();
 
@@ -189,11 +188,6 @@ pub async fn run(registry: Arc<Registry>, group_names: HashMap<String, String>) 
         }
         UiMode::Cli => {
             run_cli(task, &task_args, &registry, args.format, timeout).await;
-        }
-        UiMode::Agent => {
-            // Agent mode has no `default_format` story yet; fall back to Text.
-            let fmt = args.format.unwrap_or(OutputFormat::Text);
-            run_agent(task, &task_args, &registry, &fmt, timeout).await;
         }
     }
 }
@@ -393,110 +387,6 @@ async fn forward_output_to_stdio(
                 let _ = writeln!(out, "{}", line);
             }
         }
-    }
-}
-
-/// Run a task in Agent mode: structured output, minimal UI.
-///
-/// Slice 4: routes through `Engine` like `run_cli` but skips stdio
-/// forwarding. Only the final result is reported.
-async fn run_agent(
-    task: &'static crate::task::TaskDef,
-    args: &[String],
-    registry: &Arc<Registry>,
-    format: &OutputFormat,
-    timeout: Option<Duration>,
-) {
-    use crate::execution::{Engine, TaskStatus};
-
-    let (engine, handle) = Engine::start(registry.clone());
-
-    let mut builder = handle.spawn_task(task, args.to_vec());
-    if let Some(d) = timeout {
-        builder = builder.timeout(d);
-    }
-    let task_id = match builder.await {
-        Ok(id) => id,
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    let mut graph = handle.graph.clone();
-    let status: TaskStatus = loop {
-        let snap = graph.borrow().clone();
-        if let Some(node) = snap.tasks.get(&task_id) {
-            match &node.status {
-                TaskStatus::Done
-                | TaskStatus::Failed(_)
-                | TaskStatus::Cancelled
-                | TaskStatus::Timeout => break node.status.clone(),
-                _ => {}
-            }
-        }
-        tokio::select! {
-            res = graph.changed() => {
-                if res.is_err() { break TaskStatus::Done; }
-            }
-            _ = &mut ctrl_c => {
-                let _ = handle.quit().await;
-                engine.shutdown().await;
-                std::process::exit(130);
-            }
-        }
-    };
-
-    let _ = handle.quit().await;
-    engine.shutdown().await;
-
-    match status {
-        TaskStatus::Done => match format {
-            OutputFormat::Json => {
-                println!("{}", serde_json::json!({"status": "ok", "task": task.name}));
-            }
-            OutputFormat::Text | OutputFormat::Raw => {}
-        },
-        TaskStatus::Failed(failure) => {
-            match format {
-                OutputFormat::Json => {
-                    let error_output: serde_json::Value =
-                        serde_json::from_str(&failure.output_json)
-                            .unwrap_or_else(|_| serde_json::json!({"message": failure.message}));
-                    let output = serde_json::json!({
-                        "status": "error",
-                        "task": task.name,
-                        "error": error_output,
-                    });
-                    println!("{}", output);
-                }
-                OutputFormat::Text | OutputFormat::Raw => {
-                    eprintln!("Error: {}", failure.message);
-                }
-            }
-            std::process::exit(failure.exit_code);
-        }
-        TaskStatus::Cancelled => std::process::exit(130),
-        TaskStatus::Timeout => {
-            match format {
-                OutputFormat::Json => {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "status": "timeout",
-                            "task": task.name,
-                        })
-                    );
-                }
-                OutputFormat::Text | OutputFormat::Raw => {
-                    eprintln!("Error: task timed out");
-                }
-            }
-            std::process::exit(124);
-        }
-        _ => {}
     }
 }
 

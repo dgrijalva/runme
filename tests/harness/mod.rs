@@ -16,72 +16,12 @@ pub struct CliOutput {
 }
 
 impl CliOutput {
-    /// Parse stdout as JSON. Panics if stdout is not valid JSON.
-    pub fn json(&self) -> serde_json::Value {
-        serde_json::from_str(&self.stdout).unwrap_or_else(|e| {
-            panic!(
-                "failed to parse stdout as JSON: {}\nstdout: {}\nstderr: {}",
-                e, self.stdout, self.stderr
-            )
-        })
-    }
-
-    /// Parse stdout as JSON, returning None if it's not valid JSON.
-    pub fn try_json(&self) -> Option<serde_json::Value> {
-        serde_json::from_str(&self.stdout).ok()
-    }
-
     /// Assert that the command exited with code 0.
     pub fn assert_success(&self) {
         assert_eq!(
             self.exit_code, 0,
             "expected exit code 0, got {}\nstdout: {}\nstderr: {}",
             self.exit_code, self.stdout, self.stderr
-        );
-    }
-
-    /// Assert a specific exit code.
-    pub fn assert_exit_code(&self, code: i32) {
-        assert_eq!(
-            self.exit_code, code,
-            "expected exit code {}, got {}\nstdout: {}\nstderr: {}",
-            code, self.exit_code, self.stdout, self.stderr
-        );
-    }
-
-    /// Assert stdout JSON has `{"status": "ok"}` and the given task name.
-    pub fn assert_json_ok(&self, task: &str) {
-        let json = self.json();
-        assert_eq!(
-            json.get("status").and_then(|v| v.as_str()),
-            Some("ok"),
-            "expected status 'ok' in JSON output: {}",
-            json
-        );
-        assert_eq!(
-            json.get("task").and_then(|v| v.as_str()),
-            Some(task),
-            "expected task '{}' in JSON output: {}",
-            task,
-            json
-        );
-    }
-
-    /// Assert stdout JSON has `{"status": "error"}` and the given task name.
-    pub fn assert_json_error(&self, task: &str) {
-        let json = self.json();
-        assert_eq!(
-            json.get("status").and_then(|v| v.as_str()),
-            Some("error"),
-            "expected status 'error' in JSON output: {}",
-            json
-        );
-        assert_eq!(
-            json.get("task").and_then(|v| v.as_str()),
-            Some(task),
-            "expected task '{}' in JSON output: {}",
-            task,
-            json
         );
     }
 

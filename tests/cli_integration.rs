@@ -23,62 +23,7 @@ static KITCHEN_SINK: LazyLock<TempDir> = LazyLock::new(|| {
 });
 
 // ---------------------------------------------------------------------------
-// Priority 1: Agent mode JSON output
-//
-// These tests target the internal `UiMode::Agent` (structured JSON output for
-// machine consumption). The `--ui` flag has been removed and `--mcp` has not
-// landed yet, so agent mode is unreachable from the CLI right now. Re-enable
-// these once the MCP entry point exists.
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore = "agent mode flag removed; will be re-enabled when --mcp lands"]
-fn agent_json_success() {
-    let out = harness::run_rnme(
-        KITCHEN_SINK.path(),
-        &["--format", "json", "succeed"],
-    );
-    out.assert_success();
-    out.assert_json_ok("succeed");
-}
-
-#[test]
-#[ignore = "agent mode flag removed; will be re-enabled when --mcp lands"]
-fn agent_json_failure() {
-    let out = harness::run_rnme(
-        KITCHEN_SINK.path(),
-        &["--format", "json", "fail_default"],
-    );
-    // fail_default returns Err("default failure".into()) → exit code 1
-    assert_ne!(out.exit_code, 0, "expected non-zero exit for failing task");
-    out.assert_json_error("fail_default");
-    // The error output should contain the failure message
-    let json = out.json();
-    let error = json.get("error").expect("JSON should have 'error' field");
-    let msg = error
-        .get("message")
-        .and_then(|v| v.as_str())
-        .expect("error should have a 'message' field");
-    assert!(
-        msg.contains("default failure"),
-        "error message should contain 'default failure', got: {}",
-        msg
-    );
-}
-
-#[test]
-#[ignore = "agent mode flag removed; will be re-enabled when --mcp lands"]
-fn agent_json_specific_exit_code() {
-    let out = harness::run_rnme(
-        KITCHEN_SINK.path(),
-        &["--format", "json", "fail_with_code"],
-    );
-    out.assert_exit_code(42);
-    out.assert_json_error("fail_with_code");
-}
-
-// ---------------------------------------------------------------------------
-// Priority 2: CLI mode
+// CLI mode
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -105,7 +50,7 @@ fn ui_flags_conflict() {
 }
 
 // ---------------------------------------------------------------------------
-// Priority 3: Discovery and resolution
+// Discovery and resolution
 // ---------------------------------------------------------------------------
 
 #[test]
