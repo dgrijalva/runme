@@ -30,10 +30,21 @@ No YAML. No DSLs. No config files. Just Rust.
 
 ## Why
 
-- **Code, not config.** Conditional logic, dependency graphs, error handling — use a real language instead of pretending YAML can do it.
-- **Executable documentation.** The RUNME.rs file _is_ the documentation. It runs.
-- **AI-friendly.** Stable command surface (`runme build`, `runme test`) means AI agents get consistent interfaces, structured output, and lower permission friction.
-- **Works where you work.** RUNME.rs files live anywhere in your directory tree — inside projects, above projects, across repos. The tool assembles them automatically.
+I built this for me, based on my preferences. I'm sharing it because why not. It might not be to your taste. That's fine. Thanks for stopping by.
+
+- **Code, not config.** All configuration tools eventually evolve to be turing complete. Any 'real' programming language, even JavaScript, is better than describing logic in YAML.
+- **Useful dev tools** directly paired with the execution environment. The TUI and MCP interfaces offer rich interfaces for tasks you run a thousand times a day: watch files, restart, explore logs, dump data, perform complex workflows.
+- **Agent friendly.** Stable command surface (`runme build`, `runme test`) means AI agents get consistent interfaces, structured output, and lower permission friction. Can also be used as an MCP for direct agent access via `runme --mcp`.
+- **Works where you work.** `cargo` is a phenominal tool, but it demands a specific project layout that's not super nice for dev tooling that lives along side your application code. RUNME.rs files live anywhere in your directory tree — inside projects, above projects, across repos.
+
+## A few things this is not
+
+- **Not a build system** This is not meant to replace cargo, make, maven, whatever. There's currently no in-built dependency graph. This is meant to wrap those tools (and whatever else) to give you a useful surface for common tasks without needing to remember all the complex incantations.
+- **Not a DSL** Just plain Rust code. I _loved_ [`rake`](https://github.com/ruby/rake), and [`cap`](https://github.com/capistrano/capistrano), but gymnastics required to make the DSL nice also made them impossible to reason about for more complex tasks.
+
+## Project Status
+
+This is a hobby project. I made it for myself. It's feature incomplete and the API is still changing rapidly, but it's far enough along to be useful.
 
 ## Install
 
@@ -147,7 +158,10 @@ ctx.exec(cmd).await?;
 
 // cmd! macro — structured args with Rust-expression interpolation.
 let url = format!("http://localhost:{port}/deploy");
-ctx.exec(cmd!(curl -X POST {&url} -H "Content-Type: application/json")).await?;
+ctx.exec(cmd![curl
+                -X POST {&url}
+                -H "Content-Type: application/json"
+        ]).await?;
 ```
 
 In the `cmd!` macro, whitespace separates arguments, `{expr}` interpolates a single argument, and `"..."` literals stay as one argument. No shell is invoked.
@@ -270,84 +284,84 @@ These flow through the same pipeline as child process output.
 
 ### Task Picker
 
-| Key | Action |
-|-----|--------|
-| typing | Fuzzy filter tasks by name, description, or group |
-| `j` / `Down` | Move selection down |
-| `k` / `Up` | Move selection up |
-| `Enter` | Launch selected task |
-| `Backspace` | Delete last character of filter |
-| `Ctrl-u` | Clear filter input |
-| `Esc` / `q` | Quit |
+| Key          | Action                                            |
+| ------------ | ------------------------------------------------- |
+| typing       | Fuzzy filter tasks by name, description, or group |
+| `j` / `Down` | Move selection down                               |
+| `k` / `Up`   | Move selection up                                 |
+| `Enter`      | Launch selected task                              |
+| `Backspace`  | Delete last character of filter                   |
+| `Ctrl-u`     | Clear filter input                                |
+| `Esc` / `q`  | Quit                                              |
 
 ### Global
 
-| Key | Action |
-|-----|--------|
-| `q` | Quit |
-| `Ctrl-c` | Quit |
-| `Tab` | Toggle focus between sidebar and log viewer |
-| `?` | Toggle help overlay |
-| `\` | Toggle sidebar visibility |
+| Key      | Action                                      |
+| -------- | ------------------------------------------- |
+| `q`      | Quit                                        |
+| `Ctrl-c` | Quit                                        |
+| `Tab`    | Toggle focus between sidebar and log viewer |
+| `?`      | Toggle help overlay                         |
+| `\`      | Toggle sidebar visibility                   |
 
 ### Log Viewer
 
-| Key | Action |
-|-----|--------|
-| `j` / `Down` | Next entry |
-| `k` / `Up` | Previous entry |
-| `Ctrl-d` / `]` / `PageDown` | Scroll down half page |
-| `Ctrl-u` / `[` / `PageUp` | Scroll up half page |
-| `g` / `Home` | Jump to first entry |
-| `G` / `End` | Jump to last entry (tail mode) |
-| `v` / `m` | Toggle preview/raw display mode |
-| `w` | Toggle line wrap/truncate |
-| `f` | Open filter bar |
-| `/` | Open search |
-| `Enter` | Open entry detail view |
-| `n` / `N` | Next / previous search match |
-| `a` | Show all sources (clear filter) |
-| `1`-`9` | Toggle visibility of source N |
-| `e` | Export visible log to file |
+| Key                         | Action                          |
+| --------------------------- | ------------------------------- |
+| `j` / `Down`                | Next entry                      |
+| `k` / `Up`                  | Previous entry                  |
+| `Ctrl-d` / `]` / `PageDown` | Scroll down half page           |
+| `Ctrl-u` / `[` / `PageUp`   | Scroll up half page             |
+| `g` / `Home`                | Jump to first entry             |
+| `G` / `End`                 | Jump to last entry (tail mode)  |
+| `v` / `m`                   | Toggle preview/raw display mode |
+| `w`                         | Toggle line wrap/truncate       |
+| `f`                         | Open filter bar                 |
+| `/`                         | Open search                     |
+| `Enter`                     | Open entry detail view          |
+| `n` / `N`                   | Next / previous search match    |
+| `a`                         | Show all sources (clear filter) |
+| `1`-`9`                     | Toggle visibility of source N   |
+| `e`                         | Export visible log to file      |
 
 ### Entry Detail
 
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Scroll within detail |
-| `Esc` / `q` | Close detail view |
-| `n` / `N` | Close and jump to next/previous entry |
-| `y` | Copy raw entry to clipboard (OSC 52) |
+| Key         | Action                                |
+| ----------- | ------------------------------------- |
+| `j` / `k`   | Scroll within detail                  |
+| `Esc` / `q` | Close detail view                     |
+| `n` / `N`   | Close and jump to next/previous entry |
+| `y`         | Copy raw entry to clipboard (OSC 52)  |
 
 ### Filter / Search Input
 
-| Key | Action |
-|-----|--------|
-| typing | Updates filter expression or search pattern |
-| `Enter` | Confirm and return to normal mode |
-| `Esc` | Cancel (revert) and return to normal mode |
-| `Ctrl-u` | Clear input |
-| `Left` / `Right` | Move cursor within input |
-| `Up` / `Down` | Cycle through filter history (filter input only) |
+| Key              | Action                                           |
+| ---------------- | ------------------------------------------------ |
+| typing           | Updates filter expression or search pattern      |
+| `Enter`          | Confirm and return to normal mode                |
+| `Esc`            | Cancel (revert) and return to normal mode        |
+| `Ctrl-u`         | Clear input                                      |
+| `Left` / `Right` | Move cursor within input                         |
+| `Up` / `Down`    | Cycle through filter history (filter input only) |
 
 ### Sidebar
 
-| Key | Action |
-|-----|--------|
-| `j` / `Down` | Move selection down |
-| `k` / `Up` | Move selection up |
-| `Enter` | Open process detail (process) / toggle visibility (task) |
-| `Space` | Toggle source visibility |
-| `s` | Stop selected process (SIGTERM) |
-| `S` | Send SIGHUP to selected process |
-| `a` | Show all sources |
-| `1`-`9` | Toggle visibility of source N |
+| Key          | Action                                                   |
+| ------------ | -------------------------------------------------------- |
+| `j` / `Down` | Move selection down                                      |
+| `k` / `Up`   | Move selection up                                        |
+| `Enter`      | Open process detail (process) / toggle visibility (task) |
+| `Space`      | Toggle source visibility                                 |
+| `s`          | Stop selected process (SIGTERM)                          |
+| `S`          | Send SIGHUP to selected process                          |
+| `a`          | Show all sources                                         |
+| `1`-`9`      | Toggle visibility of source N                            |
 
 ### Process Detail
 
-| Key | Action |
-|-----|--------|
-| `j` / `k` | Scroll within detail |
-| `s` | Stop process (SIGTERM) |
-| `S` | Send SIGHUP |
-| `Esc` / `q` | Close detail view |
+| Key         | Action                 |
+| ----------- | ---------------------- |
+| `j` / `k`   | Scroll within detail   |
+| `s`         | Stop process (SIGTERM) |
+| `S`         | Send SIGHUP            |
+| `Esc` / `q` | Close detail view      |
