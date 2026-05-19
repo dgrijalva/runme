@@ -45,6 +45,7 @@ shell-words = "1"
 # CLI-only deps
 ignore = "0.4"
 sha2 = "0.10"
+heck = "0.5"
 exec = "0.3"
 rmcp = { version = "1.6.0", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"

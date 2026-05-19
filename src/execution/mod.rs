@@ -16,6 +16,7 @@ mod task_id;
 
 pub mod builder;
 pub mod handle;
+pub mod invocation;
 
 pub use builder::TaskBuilder;
 pub use control::{EngineError, KillSignal, RestartError, RestartMode, SpawnOptions};
@@ -24,6 +25,7 @@ pub use engine::{
 };
 pub use execution::{ProcessInfo, ProcessStatus, TaskExecution, TaskFailure, TaskStatus};
 pub use handle::TaskHandle;
+pub use invocation::{FutureFactory, Invocation};
 pub use task_id::TaskId;
 
 #[allow(unused_imports)]

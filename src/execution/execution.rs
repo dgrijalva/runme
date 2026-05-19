@@ -26,6 +26,7 @@ use crate::task::{Registry, SpawnEvent, TaskContext, TaskDef};
 use crate::tracing_layer::{TaskTracingCtx, attach_task_tracing_ctx};
 
 use super::engine::EngineInternals;
+use super::invocation::Invocation;
 use super::task_id::TaskId;
 
 // ============================================================
@@ -360,11 +361,19 @@ impl TaskExecution {
         self_weak: Weak<TaskExecution>,
         engine: Weak<EngineInternals>,
         task: &'static TaskDef,
-        task_args: Vec<String>,
+        invocation: Invocation,
     ) {
         self.task_name = task.name.to_string();
         self.task_def = Some(task);
-        self.task_args = task_args.clone();
+        // `task_args` is populated only for `Invocation::Strings` — that's
+        // the data the hard-restart path needs. Factory invocations
+        // capture their typed args inside the closure (consumed below),
+        // so `task_args` stays empty; a hard restart of a Factory task
+        // would re-spawn through the string path with `&[]` args. The
+        // typed-shim-macro work in Phase 2 may revisit this.
+        if let Invocation::Strings(ref args) = invocation {
+            self.task_args = args.clone();
+        }
 
         let tracing_buffer = self.tracing_buffer.clone();
         let log_store = self.log_store.clone();
@@ -448,9 +457,16 @@ impl TaskExecution {
                 source_id: task_id,
             };
             let span = attach_task_tracing_ctx(tracing_ctx);
-            let result = async move { task.func.call(&body_ctx, &task_args).await }
-                .instrument(span)
-                .await;
+            let result = match invocation {
+                Invocation::Strings(args) => {
+                    async move { task.func.call(&body_ctx, &args).await }
+                        .instrument(span)
+                        .await
+                }
+                Invocation::Factory(factory) => {
+                    async move { factory(&body_ctx).await }.instrument(span).await
+                }
+            };
 
             {
                 let mut s = task_status.lock().await;

@@ -26,6 +26,7 @@ use crate::task::{TaskContext, TaskDef, TaskFnKind};
 use super::TaskId;
 use super::control::{Control, KillSignal, RestartError, RestartMode};
 use super::engine::take_control_rx;
+use super::invocation::Invocation;
 
 /// Synthetic root `TaskDef`. Library-provided, never registered with
 /// `inventory::submit!` — the root must not appear in the user-visible
@@ -90,7 +91,7 @@ pub(crate) fn root_body_fn<'a>(
                             // Engine owns the spawn primitive. Root just
                             // asks the engine to register a child of ROOT
                             // and replies with the id.
-                            match engine.spawn_child(TaskId::ROOT, def, args, opts) {
+                            match engine.spawn_child(TaskId::ROOT, def, Invocation::Strings(args), opts) {
                                 Ok(handle) => {
                                     let id = handle.id();
                                     let _ = reply.send(Ok(id));
@@ -162,7 +163,7 @@ pub(crate) fn root_body_fn<'a>(
                                 engine_cancel
                                     .cancel_subtree_with(id, super::engine::CANCEL_TIMEOUT)
                                     .await;
-                                match engine_spawn.spawn_child(TaskId::ROOT, def, args, opts) {
+                                match engine_spawn.spawn_child(TaskId::ROOT, def, Invocation::Strings(args), opts) {
                                     Ok(handle) => {
                                         let new_id = handle.id();
                                         let _ = reply.send(Ok(new_id));

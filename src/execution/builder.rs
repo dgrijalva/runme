@@ -1,4 +1,5 @@
-//! `TaskBuilder` — lazy configuration value returned by `ctx.run`.
+//! `TaskBuilder` — lazy configuration value returned by `ctx.run` and by
+//! the typed shim emitted by `#[rnme::task]`.
 //!
 //! Mirrors the shape of `SpawnBuilder` for processes. Nothing is spawned
 //! until `.spawn()` is called or the builder is awaited (via
@@ -13,18 +14,22 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use crate::error::{TaskError, TaskResult};
-use crate::task::TaskDef;
+use crate::task::{TaskContext, TaskDef};
 
 use super::TaskId;
 use super::control::SpawnOptions;
 use super::engine::EngineInternals;
 use super::handle::TaskHandle;
+use super::invocation::{FutureFactory, Invocation};
 
-/// Builder returned by [`TaskContext::run`](crate::task::TaskContext::run).
+/// Builder returned by [`TaskContext::run`](crate::task::TaskContext::run)
+/// or by the typed shim emitted by `#[rnme::task]`.
 ///
 /// Lazy: calling `.timeout(d)` mutates configuration; `.spawn()` registers
 /// + launches the task and returns a [`TaskHandle`]; `.await` (via
 ///   `IntoFuture`) does both and waits for completion.
+#[must_use = "task builders do nothing until `.await` or `.spawn()` — \
+              a bare call constructs the builder and drops it"]
 pub struct TaskBuilder {
     inner: Result<TaskBuilderInner, TaskError>,
 }
@@ -38,11 +43,23 @@ struct TaskBuilderInner {
     /// `TaskError::from_display("no engine context")` at `.spawn()`.)
     engine: Weak<EngineInternals>,
     /// Resolved task definition. Resolution happens at `ctx.run` call
-    /// time so name errors surface synchronously.
+    /// time (for the string path) or at shim-emit time (for the typed
+    /// path) so name errors surface synchronously.
     task_def: &'static TaskDef,
-    args: Vec<String>,
+    /// How the body will be dispatched at `spawn_body` time. `Strings`
+    /// comes from `TaskContext::run`; `Factory` comes from the typed
+    /// shim emitted by `#[rnme::task]`.
+    invocation_kind: InvocationKind,
     /// Per-invocation timeout. Wired through `SpawnOptions::timeout`.
     timeout: Option<Duration>,
+}
+
+/// Internal storage of the invocation payload. Kept separate from
+/// `Invocation` so the builder remains symmetric across constructors.
+/// Converted to `Invocation` at `spawn_child` call time.
+enum InvocationKind {
+    Strings(Vec<String>),
+    Factory(FutureFactory),
 }
 
 impl TaskBuilder {
@@ -53,8 +70,8 @@ impl TaskBuilder {
         Self { inner: Err(err) }
     }
 
-    /// Construct a configured builder. Pub(crate) — call sites build via
-    /// `TaskContext::run`.
+    /// Construct a configured builder for the string-args dynamic path.
+    /// Pub(crate) — call sites build via `TaskContext::run`.
     pub(crate) fn new(
         parent_id: Option<TaskId>,
         engine: Weak<EngineInternals>,
@@ -66,7 +83,34 @@ impl TaskBuilder {
                 parent_id,
                 engine,
                 task_def,
-                args,
+                invocation_kind: InvocationKind::Strings(args),
+                timeout: None,
+            }),
+        }
+    }
+
+    /// Construct a configured builder for the typed-factory path. Invoked
+    /// from the shim emitted by `#[rnme::task]`. `pub` because the call
+    /// site lives in macro-expanded user-crate code.
+    ///
+    /// Resolves `parent_id` and `engine` from the caller's `TaskContext`
+    /// the same way `TaskContext::run` does, and stages the factory as
+    /// `Invocation::Factory` so it bypasses `task.func` at `spawn_body`
+    /// time and dispatches directly to the renamed body symbol.
+    pub fn from_factory(
+        ctx: &TaskContext,
+        task_def: &'static TaskDef,
+        factory: FutureFactory,
+    ) -> Self {
+        let Some(engine) = ctx.engine_weak() else {
+            return Self::failed(TaskError::from_display("no engine context"));
+        };
+        Self {
+            inner: Ok(TaskBuilderInner {
+                parent_id: ctx.task_id(),
+                engine,
+                task_def,
+                invocation_kind: InvocationKind::Factory(factory),
                 timeout: None,
             }),
         }
@@ -97,7 +141,11 @@ impl TaskBuilder {
         let opts = SpawnOptions {
             timeout: inner.timeout,
         };
-        engine.spawn_child(parent_id, inner.task_def, inner.args, opts)
+        let invocation = match inner.invocation_kind {
+            InvocationKind::Strings(args) => Invocation::Strings(args),
+            InvocationKind::Factory(f) => Invocation::Factory(f),
+        };
+        engine.spawn_child(parent_id, inner.task_def, invocation, opts)
     }
 }
 

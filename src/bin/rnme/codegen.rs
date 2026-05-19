@@ -10,6 +10,10 @@ pub(crate) struct CrateEntry {
     pub(crate) lib_source: String,
     /// Cargo.toml content for this lib crate.
     pub(crate) cargo_toml: String,
+    /// Transitive descendant crate names this entry depends on through the
+    /// `mod subtasks { ... }` tree. Single source of truth for both the
+    /// Cargo.toml path-deps and the acyclicity guard.
+    pub(crate) descendant_crate_names: Vec<String>,
 }
 
 /// Generate the runner crate's main.rs source.

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use heck::ToSnakeCase;
 
 /// Rust keywords that cannot be used as crate names.
 const RUST_KEYWORDS: &[&str] = &[
@@ -55,6 +57,49 @@ pub fn crate_name_from_path(rel_path: &Path) -> String {
     } else {
         name
     }
+}
+
+/// Compute the rename-resolved **basename** for a child RUNME.rs entry,
+/// applying `[rnme.rename]` if present.
+///
+/// - `child_rel_path` — path to the child RUNME.rs relative to the
+///   discovery root; its `parent()` supplies the original basename.
+/// - `child_source_path` — the same file's path as it appears in the
+///   discovery set; used solely as the lookup key into `renames`.
+/// - `renames` — map from child source path to its raw rename value
+///   (pre-normalization, as parsed from `[rnme.rename]`).
+///
+/// If the file is in the renames map, returns `heck::to_snake_case(value)`.
+/// Otherwise returns the original parent-directory basename.
+///
+/// This is **only ever called for child entries**. The root is assigned
+/// `"root"` directly by the caller; there is no `is_root` check.
+pub fn resolved_basename(
+    child_rel_path: &Path,
+    child_source_path: &Path,
+    renames: &HashMap<PathBuf, String>,
+) -> String {
+    let parent = child_rel_path.parent().unwrap_or(Path::new(""));
+    let original_basename = parent
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    match renames.get(child_source_path) {
+        Some(name) => name.to_snake_case(),
+        None => original_basename,
+    }
+}
+
+/// Compute the Rust crate/module identifier for a child node from its
+/// rename-resolved effective directory path (slashes preserved).
+///
+/// `effective_dir` is the path from root to the child's directory after
+/// rename substitution — e.g. `"services/auth_v2"`. This function flattens
+/// it via the existing path-to-ident normalizer in `crate_name_from_path`
+/// (slashes → underscores, keyword/digit guards), yielding `"services_auth_v2"`.
+pub fn module_name_from_effective_dir(effective_dir: &Path) -> String {
+    crate_name_from_path(&effective_dir.join("RUNME.rs"))
 }
 
 /// Given a list of relative paths to RUNME.rs files, compute a map from path to crate name.
@@ -238,6 +283,105 @@ mod tests {
         assert_eq!(
             crate_name_from_path(Path::new("RUNME.rs")),
             crate_name_from_path(Path::new("./RUNME.rs")),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `resolved_basename` and `module_name_from_effective_dir` tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolved_basename_no_rename() {
+        let renames: HashMap<PathBuf, String> = HashMap::new();
+        let out = resolved_basename(
+            Path::new("foo/bar/RUNME.rs"),
+            Path::new("/abs/foo/bar/RUNME.rs"),
+            &renames,
+        );
+        assert_eq!(out, "bar");
+    }
+
+    #[test]
+    fn test_resolved_basename_with_rename() {
+        let mut renames: HashMap<PathBuf, String> = HashMap::new();
+        renames.insert(PathBuf::from("/abs/foo/bar/RUNME.rs"), "baz".to_string());
+        let out = resolved_basename(
+            Path::new("foo/bar/RUNME.rs"),
+            Path::new("/abs/foo/bar/RUNME.rs"),
+            &renames,
+        );
+        assert_eq!(out, "baz");
+    }
+
+    #[test]
+    fn test_resolved_basename_rename_snake_cases_hello_world() {
+        let mut renames: HashMap<PathBuf, String> = HashMap::new();
+        renames.insert(
+            PathBuf::from("/abs/foo/RUNME.rs"),
+            "Hello World".to_string(),
+        );
+        let out = resolved_basename(
+            Path::new("foo/RUNME.rs"),
+            Path::new("/abs/foo/RUNME.rs"),
+            &renames,
+        );
+        assert_eq!(out, "hello_world");
+    }
+
+    #[test]
+    fn test_resolved_basename_rename_camel_case() {
+        let mut renames: HashMap<PathBuf, String> = HashMap::new();
+        renames.insert(PathBuf::from("/abs/foo/RUNME.rs"), "FooBar".to_string());
+        let out = resolved_basename(
+            Path::new("foo/RUNME.rs"),
+            Path::new("/abs/foo/RUNME.rs"),
+            &renames,
+        );
+        assert_eq!(out, "foo_bar");
+    }
+
+    #[test]
+    fn test_resolved_basename_rename_dashes() {
+        let mut renames: HashMap<PathBuf, String> = HashMap::new();
+        renames.insert(
+            PathBuf::from("/abs/foo/RUNME.rs"),
+            "foo-bar-v2".to_string(),
+        );
+        let out = resolved_basename(
+            Path::new("foo/RUNME.rs"),
+            Path::new("/abs/foo/RUNME.rs"),
+            &renames,
+        );
+        assert_eq!(out, "foo_bar_v2");
+    }
+
+    #[test]
+    fn test_resolved_basename_unmapped_path() {
+        // Map has entries, but not for this child — falls back to original.
+        let mut renames: HashMap<PathBuf, String> = HashMap::new();
+        renames.insert(PathBuf::from("/abs/other/RUNME.rs"), "renamed".to_string());
+        let out = resolved_basename(
+            Path::new("foo/RUNME.rs"),
+            Path::new("/abs/foo/RUNME.rs"),
+            &renames,
+        );
+        assert_eq!(out, "foo");
+    }
+
+    #[test]
+    fn test_module_name_from_effective_dir_single() {
+        assert_eq!(
+            module_name_from_effective_dir(Path::new("foo")),
+            "foo"
+        );
+    }
+
+    #[test]
+    fn test_module_name_from_effective_dir_nested() {
+        // Slashes flatten to underscores via crate_name_from_path
+        assert_eq!(
+            module_name_from_effective_dir(Path::new("services/auth_v2")),
+            "services_auth_v2"
         );
     }
 }

@@ -142,8 +142,19 @@ pub struct TaskDef {
 unsafe impl Send for TaskDef {}
 unsafe impl Sync for TaskDef {}
 
+/// Inventory submission target. Wraps a `&'static TaskDef` so the
+/// `#[rnme::task]` macro can register a reference to a named static
+/// rather than inlining the value at the submit site. The typed shim
+/// (Phase 2) references the same named static directly.
+pub struct TaskDefRef(pub &'static TaskDef);
+
+// Safety: TaskDefRef holds only a &'static TaskDef, which is Send + Sync
+// because TaskDef is.
+unsafe impl Send for TaskDefRef {}
+unsafe impl Sync for TaskDefRef {}
+
 // inventory requires Collect impl
-inventory::collect!(TaskDef);
+inventory::collect!(TaskDefRef);
 
 /// Runtime context passed to task functions.
 ///
@@ -792,6 +803,15 @@ impl TaskContext {
         self.engine.as_ref().and_then(|w| w.upgrade())
     }
 
+    /// Borrow the engine weak reference directly.
+    ///
+    /// Returns `None` outside the engine. Used by the typed-shim path
+    /// emitted by `#[rnme::task]` to construct a `TaskBuilder` that
+    /// resolves the engine lazily at `.spawn()` time.
+    pub fn engine_weak(&self) -> Option<Weak<crate::execution::engine::EngineInternals>> {
+        self.engine.clone()
+    }
+
     /// Identity of the running task (`None` outside the engine, e.g.
     /// tests that build a `TaskContext` directly).
     pub fn task_id(&self) -> Option<TaskId> {
@@ -1153,8 +1173,8 @@ impl Registry {
     /// Build a registry from all inventory-registered tasks.
     pub fn from_inventory() -> Self {
         let mut reg = Self::new();
-        for task in inventory::iter::<TaskDef> {
-            reg.tasks.push(task);
+        for r in inventory::iter::<TaskDefRef> {
+            reg.tasks.push(r.0);
         }
         reg
     }

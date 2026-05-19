@@ -4,25 +4,44 @@ pub struct Frontmatter {
     /// Additional dependencies declared in the frontmatter.
     /// Each entry is `(crate_name, version_or_spec)`.
     pub dependencies: Vec<(String, String)>,
+    /// The `name = "..."` value from a `[rnme.rename]` section, if present.
+    /// Stored raw (pre-normalization); the consumer substitutes this for the
+    /// directory's basename before path-to-ident normalization runs.
+    pub rename: Option<String>,
 }
 
-/// Parse the optional dependency frontmatter from RUNME.rs source code.
+/// Tracks which frontmatter section the line walker is currently inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    None,
+    Dependencies,
+    RnmeRename,
+}
+
+/// Parse the optional frontmatter from RUNME.rs source code.
 ///
-/// Looks for a section like:
+/// Recognizes two sections, in either order:
+///
 /// ```text
 /// //! [dependencies]
 /// //! reqwest = "0.12"
 /// //! serde_json = "1"
+///
+/// //! [rnme.rename]
+/// //! name = "foo_bar_dashed"
 /// ```
 ///
 /// Rules:
-/// - `//! [dependencies]` starts the dependencies section
-/// - Subsequent `//! name = "version"` lines are parsed as dependency declarations
-/// - Parsing stops at the first line that is not a `//!` doc comment
-/// - If no frontmatter is found, returns empty dependencies
+/// - Section headers are `//! [<section>]` on their own line.
+/// - Subsequent `//! key = "value"` lines belong to the most recently entered
+///   section.
+/// - A new section header terminates the previous section.
+/// - Parsing stops at the first line that is not a `//!` doc comment.
+/// - If no frontmatter is found, returns empty dependencies and `rename: None`.
 pub fn parse_frontmatter(source: &str) -> Frontmatter {
     let mut dependencies = Vec::new();
-    let mut in_deps_section = false;
+    let mut rename: Option<String> = None;
+    let mut section = Section::None;
 
     for line in source.lines() {
         let trimmed = line.trim();
@@ -32,30 +51,74 @@ pub fn parse_frontmatter(source: &str) -> Frontmatter {
             let content = content.trim();
 
             if content == "[dependencies]" {
-                in_deps_section = true;
+                section = Section::Dependencies;
+                continue;
+            }
+            if content == "[rnme.rename]" {
+                section = Section::RnmeRename;
                 continue;
             }
 
-            if in_deps_section {
-                // Try to parse as `name = "version"` or `name = { ... }`
-                if let Some(dep) = parse_dependency_line(content) {
-                    dependencies.push(dep);
+            match section {
+                Section::Dependencies => {
+                    // Try to parse as `name = "version"` or `name = { ... }`
+                    if let Some(dep) = parse_dependency_line(content) {
+                        dependencies.push(dep);
+                    }
+                    // Continue even if the line doesn't parse -- might be a comment or blank
                 }
-                // Continue even if the line doesn't parse -- might be a comment or blank
+                Section::RnmeRename => {
+                    // Look for `name = "..."`. Forgiving: malformed lines
+                    // leave `rename` unchanged (so empty section / unknown key /
+                    // non-string value / missing quotes all yield `None`).
+                    // Last valid `name = "..."` wins.
+                    if let Some(value) = parse_rename_name_line(content) {
+                        rename = Some(value);
+                    }
+                }
+                Section::None => {
+                    // Doc comment outside any known section -- ignore.
+                }
             }
-        } else if in_deps_section {
-            // First non-`//!` line after entering deps section: stop parsing
+        } else if section != Section::None {
+            // First non-`//!` line after entering a section: stop parsing
             break;
         } else if trimmed.is_empty() {
             // Allow blank lines before the frontmatter section
             continue;
         } else {
-            // Non-comment, non-blank line before deps section: no frontmatter
+            // Non-comment, non-blank line before any section: no frontmatter
             break;
         }
     }
 
-    Frontmatter { dependencies }
+    Frontmatter {
+        dependencies,
+        rename,
+    }
+}
+
+/// Parse a single `name = "value"` line inside `[rnme.rename]`.
+///
+/// Returns `Some(value)` only when the line has the form `name = "<non-empty>"`
+/// with a properly-closed double-quoted string. Returns `None` for empty
+/// values, unquoted bareword values, non-string values (e.g. `name = 42`),
+/// missing closing quote, or any other key.
+///
+/// The returned string is the *raw* value between the quotes — no
+/// normalization, no validation against identifier rules.
+fn parse_rename_name_line(line: &str) -> Option<String> {
+    let eq_pos = line.find('=')?;
+    let key = line[..eq_pos].trim();
+    if key != "name" {
+        return None;
+    }
+    let value = line[eq_pos + 1..].trim();
+    let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner.to_string())
 }
 
 /// Parse a single dependency line like `reqwest = "0.12"` or
@@ -194,6 +257,7 @@ fn hello(ctx: &TaskContext) {
 "#;
         let fm = parse_frontmatter(source);
         assert!(fm.dependencies.is_empty());
+        assert_eq!(fm.rename, None);
     }
 
     #[test]
@@ -428,5 +492,160 @@ use rnme::prelude::*;
         let original_dir = std::path::Path::new("/home/user/project");
         let result = rewrite_path_deps(&deps, original_dir);
         assert_eq!(result, deps);
+    }
+
+    // --- [rnme.rename] parsing tests ---
+
+    #[test]
+    fn test_rename_absent() {
+        let source = r#"//! [dependencies]
+//! tokio = "1"
+
+use rnme::prelude::*;
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, None);
+    }
+
+    #[test]
+    fn test_rename_present() {
+        let source = r#"//! [rnme.rename]
+//! name = "foo_bar_dashed"
+
+use rnme::prelude::*;
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, Some("foo_bar_dashed".to_string()));
+        assert!(fm.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_rename_alongside_deps_rename_first() {
+        let source = r#"//! [rnme.rename]
+//! name = "renamed_thing"
+//! [dependencies]
+//! tokio = "1"
+
+use rnme::prelude::*;
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, Some("renamed_thing".to_string()));
+        assert_eq!(fm.dependencies.len(), 1);
+        assert_eq!(
+            fm.dependencies[0],
+            ("tokio".to_string(), "\"1\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_alongside_deps_deps_first() {
+        let source = r#"//! [dependencies]
+//! tokio = "1"
+//! [rnme.rename]
+//! name = "renamed_thing"
+
+use rnme::prelude::*;
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, Some("renamed_thing".to_string()));
+        assert_eq!(fm.dependencies.len(), 1);
+        assert_eq!(
+            fm.dependencies[0],
+            ("tokio".to_string(), "\"1\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rename_raw_not_normalized() {
+        // Spaces, uppercase: preserved exactly. Normalization happens downstream.
+        let source = r#"//! [rnme.rename]
+//! name = "Hello World"
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, Some("Hello World".to_string()));
+    }
+
+    #[test]
+    fn test_rename_raw_preserves_dashes() {
+        let source = r#"//! [rnme.rename]
+//! name = "foo-bar"
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, Some("foo-bar".to_string()));
+    }
+
+    #[test]
+    fn test_rename_empty_section() {
+        // [rnme.rename] header with no name = ... line yields None.
+        let source = r#"//! [rnme.rename]
+//! [dependencies]
+//! tokio = "1"
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, None);
+        assert_eq!(fm.dependencies.len(), 1);
+    }
+
+    #[test]
+    fn test_rename_empty_string() {
+        // Empty string treated as absent.
+        let source = r#"//! [rnme.rename]
+//! name = ""
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, None);
+    }
+
+    #[test]
+    fn test_rename_missing_quotes() {
+        // Bareword value: not a string literal -> ignored.
+        let source = r#"//! [rnme.rename]
+//! name = foo_bar
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, None);
+    }
+
+    #[test]
+    fn test_rename_non_string_value() {
+        // Non-string value -> ignored.
+        let source = r#"//! [rnme.rename]
+//! name = 42
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, None);
+    }
+
+    #[test]
+    fn test_rename_unknown_key() {
+        // A non-`name` key in the section -> rename stays None.
+        let source = r#"//! [rnme.rename]
+//! title = "foo"
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, None);
+    }
+
+    #[test]
+    fn test_rename_last_wins() {
+        // Two `name = "..."` lines in the section: last one wins.
+        let source = r#"//! [rnme.rename]
+//! name = "first"
+//! name = "second"
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, Some("second".to_string()));
+    }
+
+    #[test]
+    fn test_rename_stops_at_non_comment() {
+        // Section is terminated by a non-`//!` line; it is NOT resumed by a
+        // subsequent `//!` line. Consistent with test_frontmatter_stops_at_non_comment.
+        let source = r#"//! [rnme.rename]
+use rnme::prelude::*;
+//! name = "should_not_be_seen"
+"#;
+        let fm = parse_frontmatter(source);
+        assert_eq!(fm.rename, None);
     }
 }

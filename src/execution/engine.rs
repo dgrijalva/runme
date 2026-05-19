@@ -26,6 +26,7 @@ use super::TaskId;
 use super::control::{Control, EngineError, KillSignal, RestartError, RestartMode, SpawnOptions};
 use super::execution::{ProcessInfo, ProcessStatus, TaskExecution, TaskStatus};
 use super::handle::TaskHandle;
+use super::invocation::Invocation;
 use super::root::ROOT_TASK;
 
 /// Cancel ladder timeout — used as the per-step grace period in
@@ -391,7 +392,7 @@ impl EngineInternals {
         self: &Arc<Self>,
         parent_id: TaskId,
         def: &'static TaskDef,
-        args: Vec<String>,
+        invocation: Invocation,
         opts: SpawnOptions,
     ) -> Result<TaskHandle, TaskError> {
         let id = TaskId::next();
@@ -416,7 +417,7 @@ impl EngineInternals {
                 // Synchronous registration BEFORE spawn_body, so that any
                 // immediate observation (lookup, snapshot, cancel ladder)
                 // sees a consistent table.
-                e.spawn_body(self_weak.clone(), engine_weak.clone(), def, args);
+                e.spawn_body(self_weak.clone(), engine_weak.clone(), def, invocation);
                 e
             })
         };
@@ -978,7 +979,12 @@ impl Engine {
 
             let root_arc = Arc::new_cyclic(|self_weak: &std::sync::Weak<TaskExecution>| {
                 let mut e = root_exec_inner;
-                e.spawn_body(self_weak.clone(), engine_weak.clone(), &ROOT_TASK, vec![]);
+                e.spawn_body(
+                    self_weak.clone(),
+                    engine_weak.clone(),
+                    &ROOT_TASK,
+                    Invocation::Strings(vec![]),
+                );
                 e
             });
 

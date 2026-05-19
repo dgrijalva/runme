@@ -930,6 +930,8 @@ async fn run_readiness_probe(condition: ReadinessCondition) {
 /// ```
 type OnSpawnCallback = Box<dyn FnOnce(&ProcessHandle) + Send>;
 
+#[must_use = "spawn builders do nothing until `.await` or `.complete()` — \
+              a bare call constructs the builder and drops it"]
 pub struct SpawnBuilder {
     cmd: Cmd,
     task_name: String,

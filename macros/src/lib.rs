@@ -213,9 +213,16 @@ fn extract_typed_param(arg: &FnArg) -> Result<(syn::Ident, syn::Type), syn::Erro
 #[proc_macro_attribute]
 pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut input_fn = parse_macro_input!(item as ItemFn);
-    let fn_name = &input_fn.sig.ident;
+    let fn_name = input_fn.sig.ident.clone();
     let fn_name_str = fn_name.to_string();
     let is_async = input_fn.sig.asyncness.is_some();
+
+    // Renamed body symbol. The user's fn keeps its full signature and
+    // body but is emitted under this private name. The user-facing
+    // identifier is taken over by the typed shim (below) that returns a
+    // `TaskBuilder`. Both the shim and the string-args wrapper call
+    // this symbol.
+    let body_name = syn::Ident::new(&format!("__rnme_body_{}", fn_name), fn_name.span());
 
     // Parse attributes: mode = cli|tui
     let mut ui_hint: Option<proc_macro2::TokenStream> = None;
@@ -367,8 +374,50 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     let arg_metadata_name =
         syn::Ident::new(&format!("__runme_argmeta_{}", fn_name), fn_name.span());
 
+    // Named static holding the TaskDef. Both inventory and the typed shim
+    // (Phase 2) reference this single instance.
+    let taskdef_static_name =
+        syn::Ident::new(&format!("__RNME_TASKDEF_{}", fn_name), fn_name.span());
+
     // Detect whether the function has an explicit return type (Result) or returns ()
     let has_return_type = !matches!(input_fn.sig.output, ReturnType::Default);
+
+    // Capture the typed parameter list (after the `ctx: &TaskContext`
+    // first param) for the public shim. We need both the original `name:
+    // ty` pattern (for the shim signature) and bare idents (for
+    // forwarding into the closure's call to `body_name`). Lifted before
+    // we rename the input fn so they remain in sync with the body's
+    // signature.
+    let typed_params: Vec<(syn::Ident, syn::Type)> = input_fn
+        .sig
+        .inputs
+        .iter()
+        .skip(1)
+        .filter_map(|arg| match arg {
+            FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
+                Pat::Ident(pat_ident) => Some((pat_ident.ident.clone(), (*pat_type.ty).clone())),
+                _ => None,
+            },
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let shim_param_decls: Vec<proc_macro2::TokenStream> = typed_params
+        .iter()
+        .map(|(name, ty)| quote! { #name: #ty })
+        .collect();
+    let shim_param_idents: Vec<syn::Ident> =
+        typed_params.iter().map(|(name, _)| name.clone()).collect();
+
+    // Rename the user's fn to the private body symbol. The shim emitted
+    // below takes over the public ident. The string-args wrapper and the
+    // shim closure both call `body_name` to dispatch to the actual user
+    // code. All other metadata (doc-comment description, mode/ui_hint)
+    // continues to live on the `TaskDef` named static, not the shim.
+    input_fn.sig.ident = body_name.clone();
+    // Strip `pub`/visibility from the renamed body — it's private to the
+    // module. The shim below carries the original visibility (always
+    // `pub fn` so descendant crates can reference it via `subtasks::...`).
+    input_fn.vis = syn::Visibility::Inherited;
 
     // Generate the parse block, function call expression, and arg_metadata function
     // based on argument form.
@@ -382,7 +431,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     let (parse_block, fn_call, arg_metadata_tokens) = match &arg_form {
         ArgForm::ZeroArgs => {
             let parse = quote! {};
-            let call = quote! { #fn_name(ctx) };
+            let call = quote! { #body_name(ctx) };
             let metadata = quote! {
                 fn #arg_metadata_name() -> Option<::rnme::clap::Command> {
                     None
@@ -394,7 +443,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             let (parse_stmts, call_args, cmd_build) =
                 generate_simple_args(fn_name_str.clone(), params);
             let parse = parse_stmts;
-            let call = quote! { #fn_name(ctx, #(#call_args),*) };
+            let call = quote! { #body_name(ctx, #(#call_args),*) };
             let metadata = quote! {
                 fn #arg_metadata_name() -> Option<::rnme::clap::Command> {
                     Some({ #cmd_build })
@@ -417,7 +466,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
                     )),
                 };
             };
-            let call = quote! { #fn_name(ctx, __parsed) };
+            let call = quote! { #body_name(ctx, __parsed) };
             let metadata = quote! {
                 fn #arg_metadata_name() -> Option<::rnme::clap::Command> {
                     Some(<#param_type as ::rnme::clap::CommandFactory>::command())
@@ -478,6 +527,53 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Body expression inside the shim's async block, matching the
+    // (is_async, has_return_type) matrix of the user's fn. The async
+    // block lives inside `Box::pin(async move { ... })`. The async
+    // block captures `body_ctx: &TaskContext` (the closure param) and
+    // the typed args (by `move`), then calls the renamed body symbol.
+    let shim_body_expr = match (is_async, has_return_type) {
+        (true, true) => quote! {
+            #body_name(body_ctx, #(#shim_param_idents),*).await
+        },
+        (true, false) => quote! {
+            #body_name(body_ctx, #(#shim_param_idents),*).await;
+            ::std::result::Result::Ok(())
+        },
+        (false, true) => quote! {
+            #body_name(body_ctx, #(#shim_param_idents),*)
+        },
+        (false, false) => quote! {
+            #body_name(body_ctx, #(#shim_param_idents),*);
+            ::std::result::Result::Ok(())
+        },
+    };
+
+    // Public typed shim at the original fn name. Returns a `TaskBuilder`
+    // configured with `Invocation::Factory` so the engine dispatches to
+    // the renamed body symbol with typed args, bypassing the
+    // string-args parser entirely. `#[must_use]` triggers a warning when
+    // a caller writes `build_wasm(ctx, true, false);` without `.await?`
+    // or `.spawn()?`.
+    let shim = quote! {
+        #[must_use = "task builders do nothing until `.await` or `.spawn()` — \
+                      a bare call constructs the builder and drops it"]
+        pub fn #fn_name(
+            ctx: &::rnme::task::TaskContext,
+            #(#shim_param_decls,)*
+        ) -> ::rnme::execution::builder::TaskBuilder {
+            ::rnme::execution::builder::TaskBuilder::from_factory(
+                ctx,
+                &#taskdef_static_name,
+                ::std::boxed::Box::new(move |body_ctx: &::rnme::task::TaskContext| {
+                    ::std::boxed::Box::pin(async move {
+                        #shim_body_expr
+                    })
+                }),
+            )
+        }
+    };
+
     let expanded = quote! {
         #input_fn
 
@@ -485,16 +581,21 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #arg_metadata_tokens
 
+        #[allow(non_upper_case_globals)]
+        pub static #taskdef_static_name: ::rnme::task::TaskDef = ::rnme::task::TaskDef {
+            name: #fn_name_str,
+            description: #desc_tokens,
+            group: __RNME_GROUP,
+            func: ::rnme::task::TaskFnKind::Static(#wrapper_name),
+            arg_metadata: #arg_metadata_name,
+            ui_hint: #ui_hint_tokens,
+        };
+
         ::rnme::inventory::submit! {
-            ::rnme::task::TaskDef {
-                name: #fn_name_str,
-                description: #desc_tokens,
-                group: __RNME_GROUP,
-                func: ::rnme::task::TaskFnKind::Static(#wrapper_name),
-                arg_metadata: #arg_metadata_name,
-                ui_hint: #ui_hint_tokens,
-            }
+            ::rnme::task::TaskDefRef(&#taskdef_static_name)
         }
+
+        #shim
     };
 
     expanded.into()

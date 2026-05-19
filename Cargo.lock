@@ -1204,6 +1204,7 @@ dependencies = [
  "futures",
  "fuzzy-matcher",
  "globset",
+ "heck",
  "humantime",
  "ignore",
  "inventory",
