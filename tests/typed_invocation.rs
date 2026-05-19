@@ -1,117 +1,459 @@
 //! Integration tests for the typed-task-invocation plan (2026-05-18).
 //!
-//! Drives the fixture trees under `testing/fixtures/`:
-//!   - `typed_invocation/` — positive fixture. In-file typed calls for
-//!     all three arg forms, dynamic-path parity, cross-file typed
-//!     calls into descendants via the auto-injected `subtasks::` tree,
-//!     descendant-type construction in the parent, and reachability
-//!     through a structural-only intermediate dir. Also hosts the
-//!     `services/api/RUNME.rs` (`[rnme.rename] name = "api_v2"`) and
-//!     `HelloWorld/RUNME.rs` (`name = "Hello World"` →
-//!     `hello_world` via heck snake-casing) descendants that exercise
-//!     `apply-rename`.
-//!   - `typed_invocation_must_use/` — fixture whose calling fn carries
-//!     `#[deny(unused_must_use)]`; a bare `worker(ctx);` call must turn
-//!     the `#[must_use]` on `TaskBuilder` into a compile error.
-//!   - `typed_invocation_collision/` — negative fixture; sibling
-//!     normalization collision the build must reject (once
-//!     collision-detection lands).
-//!   - `typed_invocation_collision_resolved/` — same pair as above with
-//!     one sibling renamed; must build cleanly.
+//! Fixtures are generated at test time into OS tempdirs so the live
+//! `runme` binary, when run from the repo root, doesn't discover and
+//! try to compile these fixtures (some of which are intentionally
+//! broken). Each fixture creates its own tempdir; the tempdirs are
+//! leaked (persisted past drop) so the user can `cd` to inspect them
+//! manually when debugging. Tempdir paths are printed to stderr at
+//! creation time — visible under `cargo test -- --nocapture` and on
+//! test panic.
 //!
-//! Each fixture is copied to a `TempDir` per-suite via `LazyLock` to
-//! match the pattern in `tests/cli_integration.rs:18-19`. rnme's
-//! workspace cache lands inside the temp dir and is cleaned at process
-//! exit; parallel `cargo test` runs do not race on a shared cache.
+//! Fixtures:
+//!   - positive fixture — multi-level tree exercising in-file typed
+//!     calls for all three arg forms, dynamic-path parity, cross-file
+//!     typed calls into descendants via the auto-injected `subtasks::`
+//!     tree, descendant-type construction in the parent, reachability
+//!     through a structural-only intermediate dir, and `[rnme.rename]`
+//!     on `services/api/RUNME.rs` and `HelloWorld/RUNME.rs`.
+//!   - must-use fixture — calling fn carries `#[deny(unused_must_use)]`;
+//!     a bare `worker(ctx);` call must turn the `#[must_use]` on
+//!     `TaskBuilder` into a compile error.
+//!   - collision fixture — negative; sibling normalization collision
+//!     the build must reject.
+//!   - collision-resolved fixture — same pair with one sibling renamed;
+//!     must build cleanly.
 
 mod harness;
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use tempfile::TempDir;
 
 // =====================================================================
-// Fixture copying
+// Fixture generation
 // =====================================================================
 
-fn fixtures_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testing/fixtures")
+/// Create a fresh tempdir for a fixture with a descriptive prefix, leak
+/// it so it persists past the test (the user can `cd` to inspect it
+/// when debugging), and print its path to stderr.
+fn make_fixture_dir(name: &str) -> PathBuf {
+    let prefix = format!("rnme-fixture-{}-", name);
+    let tmp = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir()
+        .expect("failed to create temp dir");
+    let path = tmp.keep();
+    eprintln!("fixture {name} at: {}", path.display());
+    path
 }
 
-/// Recursively copy a directory into a fresh `TempDir`. The returned
-/// `TempDir` owns the temp directory's lifetime — drop it to clean up.
-fn copy_fixture_to_tempdir(src_name: &str) -> TempDir {
-    let src = fixtures_root().join(src_name);
-    let tmp = TempDir::new().expect("failed to create temp dir");
-    copy_dir_recursive(&src, tmp.path());
-    tmp
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst)
-        .unwrap_or_else(|e| panic!("failed to create {}: {}", dst.display(), e));
-    for entry in std::fs::read_dir(src)
-        .unwrap_or_else(|e| panic!("failed to read {}: {}", src.display(), e))
-    {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        let file_name = entry.file_name();
-        let dst_path = dst.join(&file_name);
-        if path.is_dir() {
-            copy_dir_recursive(&path, &dst_path);
-        } else {
-            std::fs::copy(&path, &dst_path).unwrap_or_else(|e| {
-                panic!(
-                    "failed to copy {} -> {}: {}",
-                    path.display(),
-                    dst_path.display(),
-                    e
-                )
-            });
-        }
+fn write_file(root: &Path, rel: &str, contents: &str) {
+    let full = root.join(rel);
+    if let Some(parent) = full.parent() {
+        std::fs::create_dir_all(parent)
+            .unwrap_or_else(|e| panic!("failed to create {}: {}", parent.display(), e));
     }
+    std::fs::write(&full, contents)
+        .unwrap_or_else(|e| panic!("failed to write {}: {}", full.display(), e));
 }
 
-// One `TempDir` per fixture, shared across the tests that target it.
+// ---------- typed_invocation (positive) ----------
 
-static POSITIVE_FIXTURE: LazyLock<TempDir> =
-    LazyLock::new(|| copy_fixture_to_tempdir("typed_invocation"));
+const POSITIVE_ROOT: &str = r#"//! Root RUNME for the typed-invocation positive fixture.
 
-static MUST_USE_FIXTURE: LazyLock<TempDir> =
-    LazyLock::new(|| copy_fixture_to_tempdir("typed_invocation_must_use"));
+use rnme::prelude::*;
+use clap::Parser;
 
-static COLLISION_FIXTURE: LazyLock<TempDir> =
-    LazyLock::new(|| copy_fixture_to_tempdir("typed_invocation_collision"));
+// =====================================================================
+// Form-1 (zero args) callee + caller
+// =====================================================================
 
-static COLLISION_RESOLVED_FIXTURE: LazyLock<TempDir> =
-    LazyLock::new(|| copy_fixture_to_tempdir("typed_invocation_collision_resolved"));
+/// Zero-args callee. Logs an identifying line so the test driver can
+/// assert this task ran as a *separate* child of `caller_in_file`.
+#[rnme::task]
+async fn root_noop(_ctx: &TaskContext) -> TaskResult {
+    info!("root_noop ran");
+    Ok(())
+}
+
+/// In-file typed call to a Form-1 task. Exercises plan acceptance §3.
+#[rnme::task]
+async fn caller_in_file(ctx: &TaskContext) -> TaskResult {
+    info!("caller_in_file: about to invoke root_noop");
+    root_noop(ctx).await?;
+    info!("caller_in_file: root_noop completed");
+    Ok(())
+}
+
+// =====================================================================
+// Form-2 (simple primitives) callee + caller
+// =====================================================================
+
+/// Simple-primitives callee. Two bool args.
+#[rnme::task]
+async fn primitives_callee(_ctx: &TaskContext, release: bool, verbose: bool) -> TaskResult {
+    info!(
+        "primitives_callee ran with release={} verbose={}",
+        release, verbose
+    );
+    Ok(())
+}
+
+/// In-file typed call to a Form-2 task with typed positional args.
+#[rnme::task]
+async fn caller_in_file_form2(ctx: &TaskContext) -> TaskResult {
+    info!("caller_in_file_form2: about to invoke primitives_callee");
+    primitives_callee(ctx, true, false).await?;
+    info!("caller_in_file_form2: primitives_callee completed");
+    Ok(())
+}
+
+// =====================================================================
+// Form-3 (parser struct) callee + caller
+// =====================================================================
+
+/// Args struct for the Form-3 callee. `Parser`/`Clone`/`Debug` are
+/// required for the parser-struct convention.
+#[derive(Parser, Clone, Debug)]
+pub struct RootOpts {
+    /// Target name, just to have a string arg in the struct.
+    #[arg(long)]
+    pub target: String,
+
+    /// Whether to dry-run.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Parser-struct callee.
+#[rnme::task]
+async fn struct_arg_callee(_ctx: &TaskContext, opts: RootOpts) -> TaskResult {
+    info!(
+        "struct_arg_callee ran with target={} dry_run={}",
+        opts.target, opts.dry_run
+    );
+    Ok(())
+}
+
+/// In-file typed call to a Form-3 task with a constructed struct.
+#[rnme::task]
+async fn caller_in_file_form3(ctx: &TaskContext) -> TaskResult {
+    info!("caller_in_file_form3: about to invoke struct_arg_callee");
+    let opts = RootOpts {
+        target: "production".to_string(),
+        dry_run: true,
+    };
+    struct_arg_callee(ctx, opts).await?;
+    info!("caller_in_file_form3: struct_arg_callee completed");
+    Ok(())
+}
+
+// =====================================================================
+// Dynamic-path parity
+// =====================================================================
+
+/// Dynamic-path invocation resolving an in-file task by string name.
+#[rnme::task]
+async fn caller_dynamic(ctx: &TaskContext) -> TaskResult {
+    info!("caller_dynamic: about to invoke root_noop via ctx.run");
+    ctx.run("root_noop", &[]).await?;
+    info!("caller_dynamic: root_noop completed via dynamic path");
+    Ok(())
+}
+
+// =====================================================================
+// Cross-file typed calls (Phase 3 — subtasks-injection)
+// =====================================================================
+
+/// Cross-file typed call: parent invokes a descendant task via the
+/// auto-injected `subtasks` module tree.
+#[rnme::task]
+async fn caller_cross_file(ctx: &TaskContext) -> TaskResult {
+    info!("caller_cross_file: about to invoke subtasks::services::api_v2::deploy");
+    let opts = subtasks::services::api_v2::ApiDeployOpts {
+        target: "production".to_string(),
+        canary: false,
+    };
+    subtasks::services::api_v2::deploy(ctx, opts).await?;
+    info!("caller_cross_file: deploy completed");
+    Ok(())
+}
+
+/// Cross-file typed call constructing a descendant-defined struct.
+#[rnme::task]
+async fn caller_uses_child_type(ctx: &TaskContext) -> TaskResult {
+    let opts = subtasks::services::api_v2::ApiDeployOpts {
+        target: "staging".to_string(),
+        canary: true,
+    };
+    info!("caller_uses_child_type: constructed opts={:?}", opts);
+    subtasks::services::api_v2::deploy(ctx, opts).await?;
+    info!("caller_uses_child_type: deploy completed");
+    Ok(())
+}
+
+/// Cross-file typed call into a leaf whose parent dir
+/// (`structural_only/`) has no RUNME.rs of its own.
+#[rnme::task]
+async fn caller_structural_only_leaf(ctx: &TaskContext) -> TaskResult {
+    info!("caller_structural_only_leaf: about to invoke subtasks::structural_only::leaf::leaf_task");
+    subtasks::structural_only::leaf::leaf_task(ctx).await?;
+    info!("caller_structural_only_leaf: leaf_task completed");
+    Ok(())
+}
+"#;
+
+const POSITIVE_HELLOWORLD: &str = r#"//! [rnme.rename]
+//! name = "Hello World"
+
+use rnme::prelude::*;
+
+/// Trivial task whose group key should be `hello_world`.
+#[rnme::task]
+async fn greet(_ctx: &TaskContext) -> TaskResult {
+    info!("hello_world::greet ran");
+    Ok(())
+}
+"#;
+
+const POSITIVE_CHILD_A: &str = r#"//! Simple-primitives (Form-2) leaf task.
+
+use rnme::prelude::*;
+
+/// Build something with primitive bool args.
+#[rnme::task]
+async fn build(_ctx: &TaskContext, release: bool, verbose: bool) -> TaskResult {
+    info!("child_a::build ran with release={} verbose={}", release, verbose);
+    Ok(())
+}
+"#;
+
+const POSITIVE_SERVICES: &str = r#"//! Intermediate-tier RUNME — both has its own tasks and descendants.
+
+use rnme::prelude::*;
+
+/// Logs an overview message. Smoke task for the intermediate tier.
+#[rnme::task]
+async fn services_overview(_ctx: &TaskContext) -> TaskResult {
+    info!("services_overview ran");
+    Ok(())
+}
+"#;
+
+const POSITIVE_SERVICES_API: &str = r#"//! [rnme.rename]
+//! name = "api_v2"
+
+use rnme::prelude::*;
+use clap::Parser;
+
+/// Options for the `deploy` task.
+#[derive(Parser, Clone, Debug)]
+pub struct ApiDeployOpts {
+    /// Deployment target (e.g. "staging", "production").
+    #[arg(long)]
+    pub target: String,
+
+    /// Whether to deploy as a canary first.
+    #[arg(long)]
+    pub canary: bool,
+}
+
+/// Deploy the API. Form-3 task: takes a parsed struct arg.
+#[rnme::task]
+async fn deploy(_ctx: &TaskContext, opts: ApiDeployOpts) -> TaskResult {
+    info!(
+        "api_v2::deploy ran with target={} canary={}",
+        opts.target, opts.canary
+    );
+    Ok(())
+}
+
+/// Health-check the API on a port. Form-2 task: simple primitives.
+#[rnme::task]
+async fn health(_ctx: &TaskContext, port: u16) -> TaskResult {
+    info!("api_v2::health ran on port {}", port);
+    Ok(())
+}
+"#;
+
+const POSITIVE_STRUCTURAL_LEAF: &str = r#"//! Leaf below a structural-only intermediate dir.
+
+use rnme::prelude::*;
+
+/// Trivial task to confirm reachability under a structural-only parent.
+#[rnme::task]
+async fn leaf_task(_ctx: &TaskContext) -> TaskResult {
+    info!("structural_only::leaf::leaf_task ran");
+    Ok(())
+}
+"#;
+
+fn make_positive_fixture() -> PathBuf {
+    let root = make_fixture_dir("typed-invocation");
+    write_file(&root, "RUNME.rs", POSITIVE_ROOT);
+    write_file(&root, "HelloWorld/RUNME.rs", POSITIVE_HELLOWORLD);
+    write_file(&root, "child_a/RUNME.rs", POSITIVE_CHILD_A);
+    write_file(&root, "services/RUNME.rs", POSITIVE_SERVICES);
+    write_file(&root, "services/api/RUNME.rs", POSITIVE_SERVICES_API);
+    write_file(
+        &root,
+        "structural_only/leaf/RUNME.rs",
+        POSITIVE_STRUCTURAL_LEAF,
+    );
+    root
+}
+
+// ---------- typed_invocation_must_use ----------
+
+const MUST_USE_ROOT: &str = r#"//! Verifies that calling a task fn without `.await?` or `.spawn()?`
+//! triggers the `unused_must_use` lint.
+
+use rnme::prelude::*;
+
+/// A trivial task. Used as the callee whose unused builder must trip
+/// the lint.
+#[rnme::task]
+async fn worker(_ctx: &TaskContext) -> TaskResult {
+    info!("worker ran");
+    Ok(())
+}
+
+/// Calls `worker(ctx)` without `.await?` or `.spawn()?`.
+#[deny(unused_must_use)]
+#[rnme::task]
+async fn bare_caller(ctx: &TaskContext) -> TaskResult {
+    worker(ctx);
+    Ok(())
+}
+"#;
+
+fn make_must_use_fixture() -> PathBuf {
+    let root = make_fixture_dir("typed-invocation-must-use");
+    write_file(&root, "RUNME.rs", MUST_USE_ROOT);
+    root
+}
+
+// ---------- typed_invocation_collision (negative) ----------
+
+const COLLISION_ROOT: &str = r#"//! Root for the unresolved-collision negative fixture.
+
+use rnme::prelude::*;
+
+/// Trivial root task — exists so the root RUNME.rs has any task at all.
+#[rnme::task]
+async fn noop(_ctx: &TaskContext) -> TaskResult {
+    info!("collision-root noop ran");
+    Ok(())
+}
+"#;
+
+const COLLISION_FOO_BAR: &str = r#"//! Sibling whose dir name `foo_bar` is already in normalized form — but
+//! collides with `foo-bar/`.
+
+use rnme::prelude::*;
+
+/// Trivial task.
+#[rnme::task]
+async fn from_undered(_ctx: &TaskContext) -> TaskResult {
+    info!("from_undered ran");
+    Ok(())
+}
+"#;
+
+const COLLISION_FOO_DASH_BAR: &str = r#"//! Sibling whose dir name `foo-bar` normalizes to `foo_bar` — collides
+//! with the `foo_bar/` sibling.
+
+use rnme::prelude::*;
+
+/// Trivial task — body is irrelevant; this file exists to trigger the
+/// sibling-normalization collision.
+#[rnme::task]
+async fn from_dashed(_ctx: &TaskContext) -> TaskResult {
+    info!("from_dashed ran");
+    Ok(())
+}
+"#;
+
+fn make_collision_fixture() -> PathBuf {
+    let root = make_fixture_dir("typed-invocation-collision");
+    write_file(&root, "RUNME.rs", COLLISION_ROOT);
+    write_file(&root, "foo_bar/RUNME.rs", COLLISION_FOO_BAR);
+    write_file(&root, "foo-bar/RUNME.rs", COLLISION_FOO_DASH_BAR);
+    root
+}
+
+// ---------- typed_invocation_collision_resolved ----------
+
+const COLLISION_RESOLVED_ROOT: &str = r#"//! Root for the resolved-collision positive fixture.
+
+use rnme::prelude::*;
+
+/// Trivial root task.
+#[rnme::task]
+async fn noop(_ctx: &TaskContext) -> TaskResult {
+    info!("collision-resolved-root noop ran");
+    Ok(())
+}
+"#;
+
+const COLLISION_RESOLVED_FOO_BAR: &str = r#"//! Sibling whose dir name `foo_bar` normalizes to `foo_bar`. No
+//! rename needed — the other sibling (`foo-bar/`) was renamed.
+
+use rnme::prelude::*;
+
+/// Trivial task.
+#[rnme::task]
+async fn from_undered_resolved(_ctx: &TaskContext) -> TaskResult {
+    info!("from_undered_resolved ran (group should be foo_bar)");
+    Ok(())
+}
+"#;
+
+const COLLISION_RESOLVED_FOO_DASH_BAR: &str = r#"//! [rnme.rename]
+//! name = "foo_bar_dashed"
+
+use rnme::prelude::*;
+
+/// Trivial task.
+#[rnme::task]
+async fn from_dashed_resolved(_ctx: &TaskContext) -> TaskResult {
+    info!("from_dashed_resolved ran (group should be foo_bar_dashed)");
+    Ok(())
+}
+"#;
+
+fn make_collision_resolved_fixture() -> PathBuf {
+    let root = make_fixture_dir("typed-invocation-collision-resolved");
+    write_file(&root, "RUNME.rs", COLLISION_RESOLVED_ROOT);
+    write_file(&root, "foo_bar/RUNME.rs", COLLISION_RESOLVED_FOO_BAR);
+    write_file(&root, "foo-bar/RUNME.rs", COLLISION_RESOLVED_FOO_DASH_BAR);
+    root
+}
+
+// One tempdir per fixture, shared across the tests that target it.
+
+static POSITIVE_FIXTURE: LazyLock<PathBuf> = LazyLock::new(make_positive_fixture);
+static MUST_USE_FIXTURE: LazyLock<PathBuf> = LazyLock::new(make_must_use_fixture);
+static COLLISION_FIXTURE: LazyLock<PathBuf> = LazyLock::new(make_collision_fixture);
+static COLLISION_RESOLVED_FIXTURE: LazyLock<PathBuf> =
+    LazyLock::new(make_collision_resolved_fixture);
 
 // =====================================================================
 // Phase 2 — typed-shim-macro tests (live)
 // =====================================================================
 
 /// Test 1: positive fixture builds and a leaf task runs.
-///
-/// Smoke. Verifies the workspace generator handles the fixture tree
-/// (root + intermediate-tier RUNME at `services/` with a descendant +
-/// structural-only-parent leaf + `[rnme.rename]` frontmatter on
-/// `services/api/RUNME.rs`) without errors, and that inventory picks
-/// up the root task.
 #[test]
 fn lists_all_typed_tasks() {
-    let out = harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "root_noop"]);
+    let out = harness::run_rnme(POSITIVE_FIXTURE.as_path(), &["--cli", "root_noop"]);
     out.assert_success();
     out.assert_stdout_contains("root_noop ran");
 }
 
 /// Test 2a: in-file typed call (Form-1, zero-args callee).
-///
-/// Acceptance: plan §3 / brief item 3. `caller_in_file` invokes the
-/// zero-args `root_noop` via the typed shim. The shim must register a
-/// separate child task (distinct log line owner).
 #[test]
 fn in_file_typed_call_form1() {
-    let out = harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "caller_in_file"]);
+    let out = harness::run_rnme(POSITIVE_FIXTURE.as_path(), &["--cli", "caller_in_file"]);
     out.assert_success();
     out.assert_stdout_contains("caller_in_file: about to invoke root_noop");
     out.assert_stdout_contains("root_noop ran");
@@ -119,14 +461,12 @@ fn in_file_typed_call_form1() {
 }
 
 /// Test 2b: in-file typed call (Form-2, simple-primitives callee).
-///
-/// Acceptance: typed shim emits a builder fn that accepts the callee's
-/// typed positional args by value and threads them into the body via
-/// `Invocation::Factory`. Body must observe the exact bool values
-/// passed at the call site.
 #[test]
 fn in_file_typed_call_form2() {
-    let out = harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "caller_in_file_form2"]);
+    let out = harness::run_rnme(
+        POSITIVE_FIXTURE.as_path(),
+        &["--cli", "caller_in_file_form2"],
+    );
     out.assert_success();
     out.assert_stdout_contains("caller_in_file_form2: about to invoke primitives_callee");
     out.assert_stdout_contains("primitives_callee ran with release=true verbose=false");
@@ -134,13 +474,12 @@ fn in_file_typed_call_form2() {
 }
 
 /// Test 2c: in-file typed call (Form-3, parser-struct callee).
-///
-/// Acceptance: typed shim handles a struct arg the same way as
-/// primitives — capture by value, thread into the factory closure,
-/// body receives the struct.
 #[test]
 fn in_file_typed_call_form3() {
-    let out = harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "caller_in_file_form3"]);
+    let out = harness::run_rnme(
+        POSITIVE_FIXTURE.as_path(),
+        &["--cli", "caller_in_file_form3"],
+    );
     out.assert_success();
     out.assert_stdout_contains("caller_in_file_form3: about to invoke struct_arg_callee");
     out.assert_stdout_contains("struct_arg_callee ran with target=production dry_run=true");
@@ -148,36 +487,24 @@ fn in_file_typed_call_form3() {
 }
 
 /// Test 3 (Phase 2): `unused_must_use` triggers on a bare call site.
-///
-/// Acceptance: plan §3 of design / brief item 3. `TaskBuilder` is
-/// `#[must_use]`; a call like `worker(ctx);` without `.await?` /
-/// `.spawn()?` must produce a warning. The fixture's calling fn
-/// carries `#[deny(unused_must_use)]` so the lint becomes a hard
-/// compile error the test can assert on via stderr.
 #[test]
 fn unused_must_use_warning_on_bare_call() {
-    let out = harness::run_rnme(MUST_USE_FIXTURE.path(), &["--cli", "bare_caller"]);
+    let out = harness::run_rnme(MUST_USE_FIXTURE.as_path(), &["--cli", "bare_caller"]);
     assert_ne!(
         out.exit_code, 0,
         "expected non-zero exit when #[deny(unused_must_use)] catches a bare task call; \
          got exit=0\nstdout: {}\nstderr: {}",
         out.stdout, out.stderr
     );
-    // The compile error mentions the must-use lint and the offending fn.
     out.assert_stderr_contains("unused");
     out.assert_stderr_contains("must");
     out.assert_stderr_contains("worker");
 }
 
 /// Test 4: dynamic-path resolves the same task as a typed call.
-///
-/// Acceptance: plan §7 / brief item 7. `caller_dynamic` uses
-/// `ctx.run("root_noop", &[])` and must execute the same body that
-/// `caller_in_file` reaches via the typed shim. Both call shapes
-/// converge on the same registered task.
 #[test]
 fn dynamic_path_agrees_with_typed_path() {
-    let out = harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "caller_dynamic"]);
+    let out = harness::run_rnme(POSITIVE_FIXTURE.as_path(), &["--cli", "caller_dynamic"]);
     out.assert_success();
     out.assert_stdout_contains("caller_dynamic: about to invoke root_noop via ctx.run");
     out.assert_stdout_contains("root_noop ran");
@@ -189,17 +516,10 @@ fn dynamic_path_agrees_with_typed_path() {
 // =====================================================================
 
 /// `[rnme.rename]` propagates to the inventory group key.
-///
-/// Acceptance: plan §7. `services/api/RUNME.rs` carries
-/// `[rnme.rename] name = "api_v2"`; the substituted name must show up
-/// as the resolvable group (`services/api_v2`), and the on-disk dir
-/// name `api` must not leak. Asserts the group-key sink directly via
-/// CLI lookup. The module-path sink will be re-verified once the
-/// cross-file caller is wired (test `cross_file_typed_call_runs_descendant`).
 #[test]
 fn rename_propagates_to_group_and_module() {
     let out = harness::run_rnme(
-        POSITIVE_FIXTURE.path(),
+        POSITIVE_FIXTURE.as_path(),
         &["--cli", "services/api_v2:deploy", "--target", "rename-check"],
     );
     out.assert_success();
@@ -207,38 +527,25 @@ fn rename_propagates_to_group_and_module() {
 }
 
 /// `[rnme.rename]` runs the substituted name through heck snake-casing.
-///
-/// Acceptance: plan §165 of the design doc — "The replacement string
-/// is substituted for the directory name **before normalization**".
-/// `HelloWorld/RUNME.rs` carries `name = "Hello World"`; heck's
-/// `to_snake_case` turns that into `hello_world`. The CLI must
-/// resolve the task under `hello_world:greet`, not `helloworld:` or
-/// `hello world:`.
 #[test]
 fn rename_heck_normalizes_to_snake_case() {
-    let out = harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "hello_world:greet"]);
+    let out = harness::run_rnme(POSITIVE_FIXTURE.as_path(), &["--cli", "hello_world:greet"]);
     out.assert_success();
     out.assert_stdout_contains("hello_world::greet ran");
 }
 
 /// Rename resolves what would otherwise be a sibling collision.
-///
-/// Acceptance: plan §391 — same directory pair as the negative
-/// collision case, with the `foo-bar/` sibling renamed to
-/// `foo_bar_dashed`. The renamed sibling is reachable under
-/// `foo_bar_dashed:from_dashed_resolved`; the unrenamed sibling is
-/// reachable under its natural normalized group `foo_bar`.
 #[test]
 fn rename_resolves_collision() {
     let dashed = harness::run_rnme(
-        COLLISION_RESOLVED_FIXTURE.path(),
+        COLLISION_RESOLVED_FIXTURE.as_path(),
         &["--cli", "foo_bar_dashed:from_dashed_resolved"],
     );
     dashed.assert_success();
     dashed.assert_stdout_contains("from_dashed_resolved ran");
 
     let undered = harness::run_rnme(
-        COLLISION_RESOLVED_FIXTURE.path(),
+        COLLISION_RESOLVED_FIXTURE.as_path(),
         &["--cli", "foo_bar:from_undered_resolved"],
     );
     undered.assert_success();
@@ -250,16 +557,9 @@ fn rename_resolves_collision() {
 // =====================================================================
 
 /// Cross-file typed call invokes a descendant.
-///
-/// Acceptance: plan §4 / brief item 4. `caller_cross_file` in the root
-/// invokes `subtasks::services::api_v2::deploy(ctx, opts)`. The
-/// descendant body must run as a framework-integrated child task (its
-/// own task id, own log source), and the renamed module path
-/// (`api_v2`, from `[rnme.rename] name = "api_v2"`) must reach through
-/// the auto-injected `subtasks` tree.
 #[test]
 fn cross_file_typed_call_runs_descendant() {
-    let out = harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "caller_cross_file"]);
+    let out = harness::run_rnme(POSITIVE_FIXTURE.as_path(), &["--cli", "caller_cross_file"]);
     out.assert_success();
     out.assert_stdout_contains(
         "caller_cross_file: about to invoke subtasks::services::api_v2::deploy",
@@ -269,16 +569,12 @@ fn cross_file_typed_call_runs_descendant() {
 }
 
 /// Descendant types are constructible from a parent.
-///
-/// Acceptance: plan §5 / brief item 6. `caller_uses_child_type`
-/// constructs `subtasks::services::api_v2::ApiDeployOpts { .. }` in
-/// the root, then passes the struct into the descendant's typed shim.
-/// Compilation success alone is most of the proof — the struct path
-/// resolved through the renamed `subtasks::` module path.
 #[test]
 fn descendant_type_constructible_from_parent() {
-    let out =
-        harness::run_rnme(POSITIVE_FIXTURE.path(), &["--cli", "caller_uses_child_type"]);
+    let out = harness::run_rnme(
+        POSITIVE_FIXTURE.as_path(),
+        &["--cli", "caller_uses_child_type"],
+    );
     out.assert_success();
     out.assert_stdout_contains("caller_uses_child_type: constructed opts=");
     out.assert_stdout_contains("api_v2::deploy ran with target=staging canary=true");
@@ -287,37 +583,17 @@ fn descendant_type_constructible_from_parent() {
 
 /// Intermediate-tier and structural-only dirs don't break descendant
 /// paths.
-///
-/// Acceptance: plan §6 / design doc §3. Two properties checked here:
-///   1. `services/RUNME.rs` has its own task body AND descendants; the
-///      renamed `services/api_v2:deploy` must still be reachable via
-///      `subtasks::services::api_v2::deploy` (verified by
-///      `caller_cross_file` above and re-asserted via the CLI group:task
-///      path here for completeness).
-///   2. `structural_only/` has NO RUNME.rs; the leaf at
-///      `structural_only/leaf/RUNME.rs` must still be reachable via
-///      `subtasks::structural_only::leaf::leaf_task` (the parent's
-///      generated `subtasks` tree emits an empty `pub mod structural_only`
-///      along the path).
 #[test]
 fn intermediate_runme_does_not_break_descendants() {
-    // (1) Renamed descendant reachable under `services/api_v2:deploy`
-    // (group-key sink — typed-path sink is exercised by
-    // `cross_file_typed_call_runs_descendant`).
     let api_out = harness::run_rnme(
-        POSITIVE_FIXTURE.path(),
+        POSITIVE_FIXTURE.as_path(),
         &["--cli", "services/api_v2:deploy", "--target", "staging"],
     );
     api_out.assert_success();
     api_out.assert_stdout_contains("api_v2::deploy ran with target=staging");
 
-    // (2) Structural-only intermediate doesn't shadow the descendant.
-    // `caller_structural_only_leaf` uses the typed
-    // `subtasks::structural_only::leaf::leaf_task` path; this asserts
-    // the parent's `subtasks` tree generated an empty `pub mod
-    // structural_only` along the descendant's path.
     let leaf_out = harness::run_rnme(
-        POSITIVE_FIXTURE.path(),
+        POSITIVE_FIXTURE.as_path(),
         &["--cli", "caller_structural_only_leaf"],
     );
     leaf_out.assert_success();
@@ -334,33 +610,16 @@ fn intermediate_runme_does_not_break_descendants() {
 
 /// Unresolved sibling collision is rejected at workspace generation
 /// (negative).
-///
-/// Acceptance: plan §8 / brief item 8 / plan §391.
-/// `typed_invocation_collision/foo-bar/RUNME.rs` and
-/// `.../foo_bar/RUNME.rs` both normalize to the module name `foo_bar`.
-/// Neither carries a `[rnme.rename]`. `impl-collision-detection`
-/// (task #17) raises `CompileError::SiblingNameCollision` at
-/// workspace-generation time (before `cargo build`), and its `Display`
-/// names both colliding paths, the resolved name, and a paste-ready
-/// `[rnme.rename]` snippet with a suggested name
-/// (`foo_bar_dashed` here — one of the two paths has dashes, so the
-/// `_dashed` heuristic fires).
-///
-/// Assertions use loose substring matching so future error
-/// reformatting doesn't churn the test.
 #[test]
 fn rename_collision_is_rejected() {
-    let out = harness::run_rnme(COLLISION_FIXTURE.path(), &["--cli", "noop"]);
+    let out = harness::run_rnme(COLLISION_FIXTURE.as_path(), &["--cli", "noop"]);
     assert_ne!(
         out.exit_code, 0,
         "expected non-zero exit for unresolved collision; got stdout={} stderr={}",
         out.stdout, out.stderr
     );
-    // Both colliding paths appear in the error.
     out.assert_stderr_contains("foo-bar");
     out.assert_stderr_contains("foo_bar");
-    // Paste-ready snippet header.
     out.assert_stderr_contains("[rnme.rename]");
-    // The suggested name flagged by the `_dashed` heuristic.
     out.assert_stderr_contains("foo_bar_dashed");
 }

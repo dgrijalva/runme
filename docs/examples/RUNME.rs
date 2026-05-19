@@ -178,7 +178,7 @@ async fn sequential(ctx: &TaskContext) -> TaskResult {
     info!("running burst");
     burst(ctx).await?;
     info!("running log_levels");
-    log_levels(ctx)?;
+    log_levels(ctx).await?;
     info!("sequential complete");
     Ok(())
 }
