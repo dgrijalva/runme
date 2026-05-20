@@ -460,11 +460,13 @@ impl TaskExecution {
             let result = match invocation {
                 Invocation::Strings(args) => {
                     async move { task.func.call(&body_ctx, &args).await }
-                        .instrument(span)
+                        .instrument(span.clone())
                         .await
                 }
                 Invocation::Factory(factory) => {
-                    async move { factory(&body_ctx).await }.instrument(span).await
+                    async move { factory(&body_ctx).await }
+                        .instrument(span.clone())
+                        .await
                 }
             };
 
@@ -487,7 +489,13 @@ impl TaskExecution {
                                 exit_code: task_err.exit_code(),
                                 output_json: task_err.output().to_string(),
                             };
-                            tracing::error!("task failed: {}", failure.message);
+                            // Re-enter the task's carrier span so the
+                            // tracing layer routes this event to the
+                            // task's log buffer (the body's `.instrument`
+                            // span already ended above).
+                            span.in_scope(|| {
+                                tracing::error!("task failed: {}", failure.message);
+                            });
                             *s = TaskStatus::Failed(failure);
                         }
                     }
