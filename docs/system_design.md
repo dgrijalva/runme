@@ -328,55 +328,87 @@ async fn deploy(ctx: &TaskContext) -> TaskResult {
 
 `begin_step()` returns a `StepGuard`. The step is active until the guard is dropped (or `.fail()` is called). The runtime sees step transitions as tracing events — no pipeline to declare ahead of time.
 
-#### Cross-File Task Invocation
+#### Task Invocation Model
 
-Tasks within the same file can call each other directly — they're just Rust functions. Cross-file invocation goes through the registry:
+Tasks call each other through one of two paths: a **typed path** (the default) and a **dynamic path** (string-keyed). Both converge on the same engine machinery — they are two front-ends to one runtime, not two implementations.
+
+**Typed path.** `#[rnme::task]` rewrites each task into a `#[must_use]` shim at the original fn name that returns a `TaskBuilder` instead of running the body directly. Calling `build(ctx).await?` *looks* like a normal Rust fn call, but it actually constructs a builder configured with an `Invocation::Factory` closure and hands it to the engine; the engine creates the child node and runs the body inside it. Same-file calls use the bare task name; cross-file calls go through `subtasks::path::to::child::task(...)` — a non-`pub` module hierarchy auto-injected at codegen time that mirrors each parent's descendant directory layout (see *Subtasks Tree* below).
 
 ```rust
 #[rnme::task]
-async fn test_all(ctx: &TaskContext) -> TaskResult {
-    // Discover all tasks matching a pattern
-    for task in ctx.tasks().matching("*:test") {
-        ctx.run(&task.name, &[]).await?;
-    }
+async fn release(ctx: &TaskContext) -> TaskResult {
+    build(ctx).await?;                                          // same file
+    subtasks::services::api::deploy(ctx, "prod".into()).await?; // cross-file
     Ok(())
 }
 ```
 
-`ctx.run(name, args)` returns a `TaskBuilder`. By default (via `IntoFuture`), `.await` runs the task to completion and resolves to `TaskResult`. Each invocation materializes as a node in the engine's graph — child of the calling task, with its own `TaskId`, status, log source, and process tracking. Leaf-to-root load ordering guarantees that all child RUNME.rs tasks are registered before root tasks execute.
+**Dynamic path.** `ctx.run(name, args)` resolves the task name through the registry and returns a `TaskBuilder` configured with `Invocation::Strings(args)`. Used for:
 
-Because the builder is async, standard Rust concurrency works:
+- Glob-driven fan-out (`for task in ctx.tasks().matching("*:test") { ctx.run(&task.qualified_name, &[]).await?; }`)
+- Sibling-to-sibling invocation (the typed path doesn't reach across siblings)
+- MCP and CLI re-entry (the caller already has a string)
+- Cross-file calls where the target isn't statically known
+
+The dynamic path stringifies args and re-parses them through the callee's clap parser; the typed path skips that round-trip.
+
+Both paths produce `TaskBuilder`, both go through `EngineInternals::spawn_child`, both yield the same `TaskHandle`. Each invocation materializes as a node in the engine graph — child of the calling task, with its own `TaskId`, status, log source, and process tracking.
+
+By default (via `IntoFuture`), `.await` runs the task to completion and resolves to `TaskResult`. `.spawn()` returns a `TaskHandle` for fire-and-forget. Standard async concurrency works:
 
 ```rust
-// Parallel cross-file invocation
-let a = ctx.run("services:test", &["--integration"]);
-let b = ctx.run("web:test", &[]);
-let (ra, rb) = tokio::join!(a, b);
+let (ra, rb) = tokio::join!(build(ctx), docs(ctx));
 ra?; rb?;
-```
 
-For "set and forget," wrap in `tokio::spawn` so the handle lives in the spawned future:
-
-```rust
 tokio::spawn(async move {
-    let _ = ctx.run("services:server", &["--port", "8080"]).await;
+    let _ = subtasks::services::server(ctx).spawn();
 });
 ```
 
-Dropping a `TaskHandle` without awaiting cancels that one task (RAII, mirrors `ProcessHandle`). Detached tasks are unaffected by the parent's drop because their handle lives in an independent tokio task.
+Dropping a `TaskHandle` without awaiting cancels that one task (RAII, mirrors `ProcessHandle`). The builder itself is `#[must_use]`: a bare `build(ctx);` is a compile-time warning, because that pattern would silently drop the builder without running anything.
+
+#### Subtasks Tree
+
+For each parent RUNME.rs, codegen injects a non-`pub` `mod subtasks { ... }` at the crate root, mirroring the directory layout of its discovered descendants. Each child appears as `pub mod <dir_name> { pub use ::<child_crate>::* }`, so the child's full `pub` surface — task shims, arg structs, helper items — is reachable at `subtasks::path::to::child::*`.
+
+Properties:
+
+- **Each parent materializes its full descendant subtree directly.** Cargo dep graph reflects this: each parent crate has path-deps on every descendant RUNME crate. Authors never write any of this.
+- **Paths mirror directory structure, not the structure of RUNME.rs files.** Intermediate dirs without a RUNME.rs appear as empty structural modules iff they're on the path to a descendant that has one. Dirs with no RUNME.rs descendants don't appear at all.
+- **`subtasks` is non-`pub`.** A child's own `subtasks` module isn't visible from a grandparent, so `subtasks::child::subtasks::grandchild` never happens. Each crate has its own local view of its own descendants.
+- **Adding or removing a middle-tier RUNME.rs is non-breaking.** Existing `subtasks::a::b::c::task` paths keep resolving.
+- **Sibling-to-sibling typed calls are not supported.** If `services/api/RUNME.rs` wants to call into `services/worker/RUNME.rs`, neither file is in the other's discovered descendant set. Either orchestrate from the common parent or fall back to the dynamic path. This is intentional — sibling concerns are better expressed as parent orchestration or a shared lib crate.
+
+#### Collision Strategy
+
+Two failure classes, treated differently:
+
+- **Class 1 — inside RUNME.rs files** (duplicate task names, conflicting `pub` items): cargo errors at build time. The RUNME author owns the file and can rename.
+- **Class 2 — imposed by project file layout** (directory names rnme can't dictate): handled structurally by the `subtasks` wrapper, which keeps child dir names from colliding with parent imports or `rnme::prelude` items.
+
+The one Class-2 case the wrapper doesn't design away: two siblings whose directory names normalize to the same Rust identifier (e.g. `foo-bar/` next to `foo_bar/`, or `Foo/` next to `foo/`). For these, codegen raises a `SiblingNameCollision` error at workspace-generation time, naming both paths and printing the exact frontmatter snippet to paste into one of them:
+
+```rust
+//! [rnme.rename]
+//! name = "foo_bar_dashed"
+```
+
+The replacement string is substituted for the on-disk directory name *before* normalization; the same normalization pass then runs on the new name. `[rnme.rename]` is available to any RUNME.rs for any purpose (clarity, branding, decoupling the exposed name from the on-disk name), not only collision resolution.
 
 #### Unified Invocation Model
 
-Every task that accepts arguments does so through a `clap::Parser` struct (or simple params that the macro wraps into one). This creates a single argument interface used by all invocation paths:
+Every task that accepts arguments does so through a `clap::Parser` struct (or simple params that the macro wraps into one). The typed shim accepts the same params positionally as Rust values; the string path stringifies and re-parses through clap. Same metadata, same `TaskDef`, both routes available:
 
 | Path | How args arrive |
 |---|---|
-| CLI | `rnme deploy --env staging` — parsed from command line |
-| Cross-file | `ctx.run("deploy", &["--env", "staging"])` — parsed from string slice |
+| CLI | `rnme deploy --env staging` — parsed from command line by clap |
+| Dynamic in-task | `ctx.run("deploy", &["--env", "staging"]).await?` — stringified, re-parsed through clap |
 | MCP/Agent (future) | `{"task": "deploy", "args": ["--env", "staging"]}` — parsed from string slice |
-| Same-file | `deploy(ctx, deploy_args).await` — direct Rust call, typed args |
+| Typed in-task | `deploy(ctx, "staging".into()).await?` (same file) or `subtasks::services::deploy(ctx, "staging".into()).await?` (cross-file) — Rust values, no clap round-trip |
 
-The `#[task]` macro generates the parsing wrapper once. All paths except same-file direct calls go through it. Argument metadata (flag names, types, help text) is extractable from the parser for discovery — `ctx.tasks()` can report what arguments each task accepts.
+Argument metadata (flag names, types, help text) is extractable from the parser for discovery — `ctx.tasks()` can report what arguments each task accepts.
+
+For the full design rationale (typed-shim emit, subtasks tree codegen, collision classes), see [`invoking_tasks.md`](invoking_tasks.md).
 
 #### Task Discovery API
 

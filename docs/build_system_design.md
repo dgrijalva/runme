@@ -46,12 +46,13 @@ Each RUNME.rs file becomes a library crate; a runner binary crate depends on all
 
 Each RUNME.rs source is transformed before being written as `src/lib.rs` in its generated crate (see `src/bin/rnme/transform.rs`):
 
-1. **Strip frontmatter** — leading `//!` doc-comment lines (already parsed into Cargo.toml dependencies)
+1. **Strip frontmatter** — leading `//!` doc-comment lines (already parsed into Cargo.toml dependencies and rename data)
 2. **Inject group constant** — a `const` at the top that the `#[task]` macro reads to populate `TaskDef.group`:
    ```rust
    const __RNME_GROUP: &str = "services/auth";
    ```
 3. **Append a link symbol** — `pub fn __rnme_link() {}` so the runner crate can reference it. Without a referenced symbol, the linker would dead-strip the lib crate's object files and `inventory` registrations would silently disappear.
+4. **Inject `mod subtasks` (parents only)** — for each RUNME.rs that has any descendant RUNME.rs files, codegen appends a non-`pub` `mod subtasks { ... }` mirroring the descendant directory layout. See *Subtasks Tree*.
 
 There is no `fn main()` in RUNME.rs files. The runner crate provides the entry point.
 
@@ -152,7 +153,12 @@ pub enum TaskFnKind {
 }
 ```
 
-The `#[task]` macro reads `__RNME_GROUP` (injected by the code generator) and sets `group` at compile time. It emits `TaskFnKind::Static(wrapper_fn)`.
+The `#[task]` macro reads `__RNME_GROUP` (injected by the code generator) and sets `group` at compile time. For each annotated fn, it emits four items:
+
+1. The user body, renamed to `__rnme_body_<fn>` — the actual async body the engine awaits.
+2. A string-args wrapper `__runme_taskfn_<fn>` of type `TaskFn` — used by the dynamic path (`ctx.run`, MCP, CLI) to dispatch through clap and into the body.
+3. A named `pub static __RNME_TASKDEF_<fn>: TaskDef = TaskDef { ..., func: TaskFnKind::Static(__runme_taskfn_<fn>), ... };` plus an `inventory::submit!(TaskDefRef(&__RNME_TASKDEF_<fn>))`. The named static lets the typed shim reference it directly without going through registry lookup.
+4. A public `#[must_use] pub fn <fn>(ctx, args...) -> TaskBuilder` — the typed shim. It captures the typed args in a `FutureFactory` closure, calls `TaskBuilder::from_factory(ctx, &__RNME_TASKDEF_<fn>, factory)`, and returns the builder. At `.spawn()` time the engine awaits the factory's future directly, bypassing the string-args wrapper.
 
 Dynamic tasks are registered at init time via `InitContext::register_task()`, which leaks name/description/group strings to `&'static str` and wraps the closure in `TaskFnKind::Dynamic(Arc::new(closure))`. The runner drains dynamic tasks from each `InitContext` into the `Registry` after init hooks complete.
 
@@ -228,7 +234,74 @@ Each RUNME.rs file needs a unique, valid Rust crate name. Derived from the relat
 - `services/auth/RUNME.rs` → `services_auth`
 - `web-app/RUNME.rs` → `web_app`
 
-Rules: replace `/`, `-`, `.` with `_`. Prefix with `rnme_` if the name would be a Rust keyword or start with a digit. Collision detection if two paths produce the same name.
+Rules: replace `/`, `-`, `.` with `_`; normalize segments to `snake_case` via the `heck` crate. Prefix with `rnme_` if the name would be a Rust keyword or start with a digit. Collision detection if two paths produce the same name.
+
+## `[rnme.rename]` Frontmatter
+
+A RUNME.rs may opt out of directory-derived naming via a `[rnme.rename]` frontmatter section:
+
+```rust
+//! [rnme.rename]
+//! name = "foo_bar_dashed"
+```
+
+Parsed by `src/bin/rnme/frontmatter.rs` into `Frontmatter.rename: Option<String>` (raw, pre-normalization). Consumed during subtasks-tree generation:
+
+- The rename string is substituted for the on-disk directory name *before* normalization. The same normalization pass then runs on the new name. `"foo_bar_dashed"` → `foo_bar_dashed`; `"Hello World"` → `hello_world`.
+- The rename only affects how a child appears in its parent's `subtasks` tree. The crate name itself is unaffected.
+- The root RUNME.rs is structurally never a `subtasks` candidate — its rename, if any, is ignored.
+- Available to any RUNME.rs for any purpose (clarity, branding, decoupling exposed names from on-disk names), not only collision resolution.
+
+## Subtasks Tree
+
+For each parent RUNME.rs, codegen appends a non-`pub` `mod subtasks { ... }` to the generated `src/lib.rs`, mirroring the directory layout of its discovered descendants. Built from a `ModuleNode` tree (recursive walk of the discovered set; see `src/bin/rnme/compile.rs`).
+
+Given:
+
+```
+RUNME.rs
+search_agent/RUNME.rs
+prompts_service/RUNME.rs
+prompts_service/director_client/RUNME.rs
+service_common/api_client/RUNME.rs        (service_common/ has no RUNME.rs)
+```
+
+The root crate's `lib.rs` gets:
+
+```rust
+mod subtasks {                                          // not pub
+    pub mod search_agent {
+        pub use ::search_agent::*;
+    }
+    pub mod prompts_service {
+        pub use ::prompts_service::*;
+        pub mod director_client {
+            pub use ::prompts_service_director_client::*;
+        }
+    }
+    pub mod service_common {                            // structural intermediate
+        pub mod api_client {
+            pub use ::service_common_api_client::*;
+        }
+    }
+}
+```
+
+Properties:
+
+- **Non-`pub` wrapper.** `mod subtasks` is local to the parent's source. A grandparent never sees a child's `subtasks` module, so `subtasks::child::subtasks::grandchild` is structurally impossible.
+- **Each parent materializes its full descendant subtree directly** (`pub use ::descendant_crate::*` at the matching path). No chaining through children. The cargo dep graph reflects this — each parent crate's generated `Cargo.toml` declares path-deps on every descendant RUNME crate in its subtree, not just immediate children.
+- **`pub use ::child_crate::*` re-exports the child's full public surface**, not just task shims. Authors should be deliberate about what they mark `pub` in a RUNME.rs.
+- **Paths mirror directory structure**, not the structure of RUNME.rs files. Intermediate dirs without a RUNME.rs appear as empty structural modules iff they're on the path to a descendant that has one. Dirs without any RUNME.rs descendants don't appear.
+- **Adding or removing a middle-tier RUNME.rs is non-breaking** for existing call paths. Adding `service_common/RUNME.rs` to the example above keeps `subtasks::service_common::api_client::*` resolving; only difference is that `subtasks::service_common::` now also carries the new file's `pub` items.
+
+## Sibling Collision Detection
+
+Two siblings whose directory names normalize to the same Rust identifier — e.g. `foo-bar/` next to `foo_bar/`, or `Foo/` next to `foo/` — would both want the same module name inside `subtasks::parent::`. Codegen detects this when walking each parent's children and raises a `SiblingNameCollision` error at workspace-generation time (before `cargo build` is invoked).
+
+The error names both colliding paths, the identifier they both resolve to, and includes a paste-ready `[rnme.rename]` snippet (with a suggested replacement) for one of them — see `CompileError::SiblingNameCollision` in `src/bin/rnme/compile.rs`.
+
+Class-1 collisions (inside a single RUNME.rs — duplicate task names, conflicting `pub` items) are left to cargo to surface at build time with file:line precision; rnme doesn't pre-scan for them.
 
 ## Resolved Decisions
 

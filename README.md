@@ -214,16 +214,37 @@ For more control, `ctx.watch_with()` takes a filter/map closure that runs on eac
 
 ### Calling other tasks
 
-Tasks can invoke other tasks through `ctx.run()`. Names resolve like the CLI: bare names match a single task (with root-group winning ambiguity), `group:name` is the qualified form, and `:name` finds a built-in.
+Tasks call each other directly as typed Rust functions. `#[rnme::task]` rewrites each task into a shim that returns a `TaskBuilder` — the call looks like an ordinary fn call, but the body runs as a real child task with its own id, logs, cancellation, and ready state.
 
 ```rust,ignore
 /// Full release: build, test, deploy.
 #[rnme::task]
 async fn release(ctx: &TaskContext) -> TaskResult {
-    ctx.run("build", &[]).await?;
-    ctx.run("test", &[]).await?;
-    ctx.run("services/auth:deploy", &["--env", "prod"]).await?;
+    build(ctx).await?;                                                       // same file
+    test(ctx).await?;
+    subtasks::services::auth::deploy(ctx, "prod".to_string(), true).await?;  // cross-file
     Ok(())
+}
+```
+
+For each parent RUNME.rs, the build system auto-injects a `mod subtasks` mirroring the directory layout of its descendants. Calls from a parent into a child use `subtasks::path::to::child::task_fn(...)`; calls inside the same file are just the task name. The builder is `#[must_use]`, so forgetting `.await?` or `.spawn()?` is a compile-time warning, not a silent no-op.
+
+Two siblings whose directory names normalize to the same Rust identifier (e.g. `foo-bar/` and `foo_bar/`) collide inside `subtasks::parent::`. The build fails with a `SiblingNameCollision` error and prints the exact frontmatter snippet to paste into one of the children:
+
+```rust,ignore
+//! [rnme.rename]
+//! name = "foo_bar_dashed"
+```
+
+For glob-driven fan-out, discovery, or sibling-to-sibling calls (which the typed path doesn't reach), the string-keyed dynamic path is still available:
+
+```rust,ignore
+ctx.run("services/auth:deploy", &["--env", "prod"]).await?;
+
+if let Some(query) = ctx.tasks() {
+    for task in query.matching("*:test") {
+        ctx.run(&task.qualified_name, &[]).await?;
+    }
 }
 ```
 

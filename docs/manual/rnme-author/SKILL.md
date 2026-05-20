@@ -38,7 +38,7 @@ The doc comment (`///`) becomes the task's description in `list_tasks` output. *
 
 - rnme finds the nearest ancestor RUNME.rs from the user's cwd, then walks down to find children. `.gitignore` is respected.
 - Each RUNME.rs file is a "group". The root file's tasks have empty group prefix — `qualified_name = "build"`. A file at `services/api/RUNME.rs` produces tasks with `qualified_name = "services/api:build"`.
-- Tasks reference each other across files via `ctx.run("group:name", &[args])`.
+- Tasks call each other directly as Rust functions — same file, just `build(ctx).await?`; cross-file, `subtasks::services::api::build(ctx).await?`. The string-keyed `ctx.run("group:name", &[args])` path is still available for discovery-driven invocation. See *Cross-task invocation* below.
 - Drop new RUNME.rs files anywhere in the tree. The discovery walker picks them up.
 
 ## Task argument forms
@@ -250,16 +250,83 @@ Last-write-wins. The summary appears in the `Summary:` block of `get_task` / `ru
 
 ## Cross-task invocation
 
-Call other tasks from inside a task body:
+There are two paths. Prefer the typed path; reach for the dynamic path when you need it.
+
+### Typed path (default)
+
+`#[rnme::task]` rewrites each task into a thin shim that returns a `TaskBuilder`. Calling the task by name *looks* like an ordinary function call, but it doesn't run the body inline — it constructs a builder that the engine drives, so the call is a real child task (own `TaskId`, own log source, own cancellation/ready state, own optional timeout).
+
+```rust
+// Same-file: just the task's name.
+build(ctx).await?;
+deploy(ctx, "staging".to_string(), 8080, false).await?;        // simple primitives
+greet(ctx, GreetArgs { name: "world".into(), count: 3 }).await?;  // struct arg
+
+// Cross-file: prefixed with the subtasks tree, mirroring the directory layout.
+subtasks::services::api::build(ctx).await?;
+subtasks::services::api::deploy(ctx, "prod".to_string(), 443, true).await?;
+```
+
+Three call shapes, matching the three argument forms:
+- 0-arg tasks: `build(ctx).await?`
+- Simple-primitive tasks: `deploy(ctx, "staging".to_string(), 8080, false).await?` (positional, in declaration order)
+- Struct-arg tasks: `greet(ctx, GreetArgs { ... }).await?`
+
+Both `.await?` and `.spawn()?` work on the returned builder. `.spawn()?` returns a `TaskHandle` for fire-and-forget; `.await?` waits for completion.
+
+The builder is `#[must_use]`: writing `build(ctx);` without `.await?` or `.spawn()?` is a compiler warning, because that pattern silently constructs and drops the builder without running anything.
+
+**Sibling-direction calls don't work.** If `services/api/RUNME.rs` wants to call `services/worker`'s tasks, neither file is in the other's descendant set, so the typed path won't compile. Either orchestrate from the common parent, or factor the shared logic into a regular lib crate. Or fall back to the dynamic path.
+
+### The `subtasks::` tree
+
+For each parent RUNME.rs, the build system auto-injects `mod subtasks` mirroring the directory layout of its descendants. Given:
+
+```
+services/RUNME.rs
+services/api/RUNME.rs
+services/api/worker/RUNME.rs
+services/shared/db/RUNME.rs       (services/shared/ has no RUNME.rs)
+```
+
+`services/RUNME.rs` sees:
+
+```rust
+subtasks::api::*                      // tasks + pub items from services/api/RUNME.rs
+subtasks::api::worker::*              // ditto for services/api/worker/RUNME.rs
+subtasks::shared::db::*               // structural shared/ + real db/
+```
+
+Two practical consequences:
+
+1. **All `pub` items in a child RUNME.rs propagate up.** Task fns are `pub fn`; so are any `pub struct` (e.g. clap arg structs) or `pub fn` helpers the child declares. This is how struct-arg tasks work cross-file — the parent needs to name the type. Be deliberate about what you mark `pub` in a RUNME.rs.
+2. **Adding or removing a middle-tier RUNME.rs doesn't break call paths.** Dropping `services/shared/RUNME.rs` in keeps `subtasks::shared::db::...` resolving exactly as before.
+
+### `[rnme.rename]` — collision escape hatch
+
+Two sibling directories whose names normalize to the same Rust identifier (e.g. `foo-bar/` next to `foo_bar/`, or `Foo/` next to `foo/`) would clash inside `subtasks::parent::`. The build fails with a `SiblingNameCollision` error that names both paths and prints the exact snippet to paste into one of them.
+
+Rename frontmatter goes at the top of the child RUNME.rs:
+
+```rust
+//! [rnme.rename]
+//! name = "foo_bar_dashed"
+```
+
+The replacement string is substituted for the directory name *before* normalization, so `"foo_bar_dashed"` produces the identifier `foo_bar_dashed`; `"Hello World"` would produce `hello_world`. Rename is available for any purpose (clarity, branding, decoupling the exposed name from the on-disk name), not just collision resolution.
+
+### Dynamic path
+
+The string-keyed `ctx.run(name, args)` remains the right tool for:
+
+- Glob-driven fan-out where the name isn't statically known.
+- Sibling-to-sibling calls (typed path doesn't reach across siblings).
+- Forwarding string args received from the CLI / MCP without retyping them.
 
 ```rust
 ctx.run("services/api:build", &[]).await?;
 ctx.run("deploy", &["--env", "staging"]).await?;
-```
 
-Or run a set of tasks discovered via glob:
-
-```rust
 if let Some(query) = ctx.tasks() {
     for task in query.matching("*:test") {
         info!("Running {}", task.qualified_name);
@@ -267,6 +334,8 @@ if let Some(query) = ctx.tasks() {
     }
 }
 ```
+
+Both paths converge on the same engine machinery and produce the same `TaskHandle`. The dynamic path stringifies args and re-parses them through the callee's clap parser; the typed path skips that round-trip.
 
 `ctx.tasks()` returns `Option<TaskQuery>` — `None` only when running outside the full registry (rare; defensively guard if you care).
 
@@ -376,15 +445,14 @@ async fn watch_build(ctx: &TaskContext) -> TaskResult {
 ```rust
 #[rnme::task]
 async fn parallel(ctx: &TaskContext) -> TaskResult {
-    let (a, b) = tokio::join!(
-        ctx.run("build", &[]),
-        ctx.run("docs", &[]),
-    );
+    let (a, b) = tokio::join!(build(ctx), docs(ctx));
     a?;
     b?;
     Ok(())
 }
 ```
+
+Each typed call materializes as a separate child task in the engine graph, so the join above runs `build` and `docs` concurrently with independent log sources and status.
 
 ## Anti-patterns
 
@@ -392,7 +460,8 @@ async fn parallel(ctx: &TaskContext) -> TaskResult {
 - **Don't `tokio::spawn` task body work.** The engine manages the body's lifetime; spawned background work escapes cancellation. Keep work in the body's future, or use `ctx.spawn` for processes.
 - **Don't build a manual wait loop around `ctx.exec`.** `.await?.ok()?` already blocks until exit and propagates failure. Polling on top of it is redundant.
 - **Don't use `desc = "..."` on `#[rnme::task]`.** Descriptions come from doc comments only.
-- **Don't put non-task `pub fn` exports in a RUNME.rs expecting them visible elsewhere.** Each RUNME.rs is an isolated lib crate. Only `#[rnme::task]` and `#[rnme::init]` items participate in the registry.
+- **Be deliberate about `pub` in a RUNME.rs.** Each RUNME.rs is a lib crate, and a parent's auto-generated `mod subtasks` re-exports the full `pub` surface of every descendant. `pub fn`, `pub struct`, `pub use` items propagate up — which is exactly how struct-arg tasks work cross-file (`subtasks::child::WebOpts { ... }`), but it also means anything you accidentally mark `pub` will appear in the parent's namespace too.
+- **Don't drop a builder without `.await?` or `.spawn()?`.** Both `ctx.spawn(...)` and the typed task shim (`build(ctx).await?`) return `#[must_use]` builders. Writing `build(ctx);` constructs a builder and drops it — nothing runs. The compiler warns; treat the warning as an error.
 - **Don't shell out via `bash -c '...'` when `cmd!` works.** Quoting bugs are silent and dangerous; `cmd!` arg-splits cleanly.
 - **Don't forget `.ok()?` on `exec` calls that must succeed.** A bare `.await?` only fails on spawn errors, not exit code.
 
