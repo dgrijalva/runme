@@ -187,6 +187,7 @@ async fn test_shared_task_arg_metadata() {
 // ============================================================
 
 const __RNME_GROUP: &str = "";
+const __RNME_DIR: &str = "";
 
 /// A local task in the test binary
 #[rnme::task]

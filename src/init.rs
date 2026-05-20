@@ -52,6 +52,9 @@ inventory::collect!(GroupDef);
 /// to the file's own configuration.
 pub struct InitDef {
     pub group: &'static str,
+    /// Absolute path of the originating RUNME.rs directory (mirrors
+    /// `TaskDef::dir`). Empty for non-codegen contexts.
+    pub dir: &'static str,
     pub func: fn(&mut InitContext),
 }
 
@@ -69,14 +72,26 @@ inventory::collect!(InitDef);
 /// other per-file settings.
 pub struct InitContext {
     group_name: String,
+    /// Originating RUNME.rs directory, propagated to dynamic tasks
+    /// registered via `register_task` so their subprocesses default to
+    /// the same cwd as macro-generated tasks in the same file.
+    dir: &'static str,
     dynamic_tasks: Vec<&'static crate::task::TaskDef>,
 }
 
 impl InitContext {
-    /// Create a new InitContext with the default group name.
+    /// Create a new InitContext with the default group name and no
+    /// originating dir.
     pub fn new(default_group: &str) -> Self {
+        Self::with_dir(default_group, "")
+    }
+
+    /// Create a new InitContext with both the default group name and the
+    /// originating RUNME.rs directory.
+    pub fn with_dir(default_group: &str, dir: &'static str) -> Self {
         Self {
             group_name: default_group.to_string(),
+            dir,
             dynamic_tasks: Vec::new(),
         }
     }
@@ -138,6 +153,7 @@ impl InitContext {
             name: leaked_name,
             description: leaked_desc,
             group: leaked_group,
+            dir: self.dir,
             func: crate::task::TaskFnKind::Dynamic(std::sync::Arc::new(func)),
             arg_metadata: || None,
             ui_hint: None,

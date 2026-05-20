@@ -324,7 +324,9 @@ fn is_strict_descendant(desc: &Path, ancestor: &Path) -> bool {
 fn node_to_crate_entry(node: &ModuleNode, rnme_lib_path: &Path) -> Result<CrateEntry, CompileError> {
     let crate_name = node.module_name.clone();
     let group_key = group_key_from_dir(&node.effective_dir);
-    let mut lib_source = transform_source(&node.source, &group_key);
+    let original_dir = node.path.parent().unwrap_or(Path::new("."));
+    let dir_str = original_dir.to_string_lossy();
+    let mut lib_source = transform_source(&node.source, &group_key, &dir_str);
 
     // Subtasks block: only emitted when this node has descendants.
     let subtasks_block = emit_subtasks_block(node)?;
@@ -332,7 +334,6 @@ fn node_to_crate_entry(node: &ModuleNode, rnme_lib_path: &Path) -> Result<CrateE
         lib_source.push_str(&subtasks_block);
     }
 
-    let original_dir = node.path.parent().unwrap_or(Path::new("."));
     let rewritten_deps = rewrite_path_deps(&node.frontmatter.dependencies, original_dir);
 
     let descendant_crate_names = collect_descendant_crate_names(node);

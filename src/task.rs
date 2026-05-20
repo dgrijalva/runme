@@ -36,7 +36,7 @@
 //! pipeline as subprocess output.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
@@ -130,6 +130,13 @@ pub struct TaskDef {
     pub name: &'static str,
     pub description: Option<&'static str>,
     pub group: &'static str,
+    /// Absolute path of the directory containing the originating RUNME.rs.
+    /// Populated by codegen via the `__RNME_DIR` constant injected into
+    /// each lib crate (see `transform.rs`). Empty string for task literals
+    /// constructed outside the codegen path (built-ins, tests, dynamic
+    /// tasks registered via `InitContext::register_task`) — in which case
+    /// `ctx.spawn` falls back to the rnme process's cwd.
+    pub dir: &'static str,
     pub func: TaskFnKind,
     pub arg_metadata: ArgMetadataFn,
     /// Optional UI mode override. When set, the CLI dispatch uses this
@@ -221,6 +228,12 @@ pub struct TaskContext {
     /// (tests using `TaskContext::new` directly), the default sender
     /// has no firer, so subscribers exist but never observe a signal.
     restart_signal: Arc<tokio_watch::Sender<u64>>,
+    /// Directory of the originating RUNME.rs. When set, `ctx.spawn`
+    /// defaults subprocess cwd to this directory, and a relative
+    /// `Cmd::cwd(...)` is resolved against it. `None` outside the engine
+    /// runtime (tests using `TaskContext::new` directly) and for built-in
+    /// / dynamic tasks that have no originating file.
+    task_dir: Option<PathBuf>,
 }
 
 /// Future returned by [`TaskContext::cancellation_signal`].
@@ -337,6 +350,7 @@ impl TaskContext {
             engine: None,
             seq_gen: None,
             restart_signal: Arc::new(tokio_watch::Sender::new(0u64)),
+            task_dir: None,
         }
     }
 
@@ -360,6 +374,7 @@ impl TaskContext {
             engine: None,
             seq_gen: None,
             restart_signal: Arc::new(tokio_watch::Sender::new(0u64)),
+            task_dir: None,
         }
     }
 
@@ -376,6 +391,19 @@ impl TaskContext {
     /// output buffers for display.
     pub fn set_spawn_notifier(&mut self, tx: mpsc::UnboundedSender<SpawnEvent>) {
         self.spawn_tx = Some(tx);
+    }
+
+    /// Set the originating RUNME.rs directory for this task. When set,
+    /// `ctx.spawn` defaults subprocess cwd to this directory and resolves
+    /// relative `Cmd::cwd(...)` against it.
+    pub fn set_task_dir(&mut self, dir: Option<PathBuf>) {
+        self.task_dir = dir;
+    }
+
+    /// Absolute directory of the originating RUNME.rs, if known. Tasks
+    /// reading files via relative paths should join from here.
+    pub fn task_dir(&self) -> Option<&Path> {
+        self.task_dir.as_deref()
     }
 
     /// Access the task's output buffer (contains output from `exec()` calls).
@@ -503,7 +531,25 @@ impl TaskContext {
     /// ctx.bind_ready(&server);
     /// ```
     pub fn spawn(&self, command: impl Into<Cmd>) -> process::SpawnBuilder {
-        let cmd: Cmd = command.into();
+        let mut cmd: Cmd = command.into();
+        // Resolve subprocess cwd against the task's originating directory.
+        // - No `.cwd(...)`            → default to task_dir.
+        // - `.cwd(relative)`          → join under task_dir.
+        // - `.cwd(absolute)`          → leave as-is.
+        // When `task_dir` is unset (built-in / dynamic / tests), behavior
+        // is unchanged: `.cwd(...)` wins, otherwise inherit process cwd.
+        if let Some(task_dir) = &self.task_dir {
+            match cmd.get_cwd() {
+                Some(p) if p.is_absolute() => {}
+                Some(p) => {
+                    let resolved = task_dir.join(p);
+                    cmd = cmd.cwd(resolved);
+                }
+                None => {
+                    cmd = cmd.cwd(task_dir.clone());
+                }
+            }
+        }
         let command_label = cmd.display_label();
         // Use the engine-global SeqGen if injected (production path), so
         // subprocess output stamps with engine-wide seqs. Tests using
@@ -1366,6 +1412,7 @@ mod tests {
         name: "alpha",
         description: Some("The alpha task"),
         group: "",
+        dir: "",
         func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -1375,6 +1422,7 @@ mod tests {
         name: "beta",
         description: None,
         group: "",
+        dir: "",
         func: TaskFnKind::Static(another_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -1474,6 +1522,7 @@ mod tests {
             name: "para_a",
             description: Some("Parallel A"),
             group: "",
+            dir: "",
             func: TaskFnKind::Static(task_a),
             arg_metadata: no_arg_metadata,
             ui_hint: None,
@@ -1483,6 +1532,7 @@ mod tests {
             name: "para_b",
             description: Some("Parallel B"),
             group: "",
+            dir: "",
             func: TaskFnKind::Static(task_b),
             arg_metadata: no_arg_metadata,
             ui_hint: None,
@@ -1524,7 +1574,7 @@ mod tests {
         name: "build",
         description: Some("Root build"),
         group: "",
-
+        dir: "",
         func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -1534,7 +1584,7 @@ mod tests {
         name: "build",
         description: Some("Services build"),
         group: "services",
-
+        dir: "",
         func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -1544,7 +1594,7 @@ mod tests {
         name: "deploy",
         description: Some("Auth deploy"),
         group: "services/auth",
-
+        dir: "",
         func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -1554,7 +1604,7 @@ mod tests {
         name: "deploy",
         description: Some("Web deploy"),
         group: "web",
-
+        dir: "",
         func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,
@@ -1564,7 +1614,7 @@ mod tests {
         name: "list",
         description: Some("List tasks"),
         group: "builtin",
-
+        dir: "",
         func: TaskFnKind::Static(dummy_task),
         arg_metadata: no_arg_metadata,
         ui_hint: None,

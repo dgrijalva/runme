@@ -417,6 +417,9 @@ impl TaskExecution {
         let body_engine = engine.clone();
         ctx.set_engine(engine);
         ctx.set_restart_signal(self.restart_signal.clone());
+        if !task.dir.is_empty() {
+            ctx.set_task_dir(Some(std::path::PathBuf::from(task.dir)));
+        }
 
         // Forward exec() output to LogStore.
         start_buffer_forwarder(ctx.output_buffer(), log_store.clone());

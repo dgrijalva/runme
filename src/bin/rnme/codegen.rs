@@ -58,7 +58,7 @@ pub(crate) fn generate_runner_main(entries: &[CrateEntry]) -> String {
             let mut dynamic_tasks: Vec<&'static rnme::task::TaskDef> = Vec::new();
             for init in &inits {
                 let default_name = group_names.get(init.group).cloned().unwrap_or_else(|| init.group.to_string());
-                let mut ctx = rnme::init::InitContext::new(&default_name);
+                let mut ctx = rnme::init::InitContext::with_dir(&default_name, init.dir);
                 (init.func)(&mut ctx);
                 group_names.insert(init.group, ctx.group_name().to_string());
                 dynamic_tasks.extend(ctx.drain_tasks());

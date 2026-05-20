@@ -8,6 +8,7 @@
 use rnme::prelude::*;
 
 const __RNME_GROUP: &str = "";
+const __RNME_DIR: &str = "";
 
 // ============================================================
 // Form 1: Zero args

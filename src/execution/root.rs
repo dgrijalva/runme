@@ -35,6 +35,7 @@ pub(crate) static ROOT_TASK: TaskDef = TaskDef {
     name: "__root",
     description: None,
     group: "__engine",
+    dir: "",
     func: TaskFnKind::Static(root_body_fn),
     arg_metadata: root_arg_metadata,
     ui_hint: None,

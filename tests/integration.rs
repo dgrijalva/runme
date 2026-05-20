@@ -15,6 +15,7 @@ mod common;
 mod fixtures;
 
 const __RNME_GROUP: &str = "";
+const __RNME_DIR: &str = "";
 
 // ============================================================
 // Priority 1: Task error propagation

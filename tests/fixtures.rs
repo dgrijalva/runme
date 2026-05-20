@@ -10,6 +10,7 @@
 use rnme::prelude::*;
 
 const __RNME_GROUP: &str = "";
+const __RNME_DIR: &str = "";
 
 // ============================================================
 // Basic success / failure

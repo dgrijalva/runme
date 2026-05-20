@@ -168,9 +168,12 @@ fn extract_typed_param(arg: &FnArg) -> Result<(syn::Ident, syn::Type), syn::Erro
 /// Supports both sync and async task functions. The function is wrapped
 /// to produce the `TaskFn` signature: `fn(&TaskContext, &[String]) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>`.
 ///
-/// The generated `TaskDef` includes `group: __RNME_GROUP`. This constant is
-/// injected by the code generator at compile time. For standalone usage (tests,
-/// examples), define `const __RNME_GROUP: &str = "";` manually.
+/// The generated `TaskDef` includes `group: __RNME_GROUP` and
+/// `dir: __RNME_DIR`. Both constants are injected by the code generator at
+/// compile time. For standalone usage (tests, examples), define
+/// `const __RNME_GROUP: &str = "";` and `const __RNME_DIR: &str = "";`
+/// manually — the empty `__RNME_DIR` makes `ctx.spawn` inherit the
+/// process cwd as before.
 ///
 /// The task description is taken from the function's `///` doc comments.
 ///
@@ -586,6 +589,7 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             name: #fn_name_str,
             description: #desc_tokens,
             group: __RNME_GROUP,
+            dir: __RNME_DIR,
             func: ::rnme::task::TaskFnKind::Static(#wrapper_name),
             arg_metadata: #arg_metadata_name,
             ui_hint: #ui_hint_tokens,
@@ -753,9 +757,11 @@ fn generate_simple_args(
 /// Registers an `InitDef` via `inventory`. The function can accept either
 /// `&mut InitContext` or no arguments.
 ///
-/// The generated `InitDef` includes `group: __RNME_GROUP`. This constant is
-/// injected by the code generator at compile time. For standalone usage (tests,
-/// examples), define `const __RNME_GROUP: &str = "";` manually.
+/// The generated `InitDef` includes `group: __RNME_GROUP` and
+/// `dir: __RNME_DIR`. Both constants are injected by the code generator at
+/// compile time. For standalone usage (tests, examples), define
+/// `const __RNME_GROUP: &str = "";` and `const __RNME_DIR: &str = "";`
+/// manually.
 ///
 /// Usage:
 /// ```ignore
@@ -808,6 +814,7 @@ pub fn init(_attr: TokenStream, item: TokenStream) -> TokenStream {
         ::rnme::inventory::submit! {
             ::rnme::init::InitDef {
                 group: __RNME_GROUP,
+                dir: __RNME_DIR,
                 func: #wrapper_name,
             }
         }

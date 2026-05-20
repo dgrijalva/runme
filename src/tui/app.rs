@@ -798,6 +798,7 @@ mod tests {
             name: "ok_focus_test",
             description: None,
             group: "",
+            dir: "",
             func: TaskFnKind::Static(ok_task),
             arg_metadata: no_args,
             ui_hint: None,

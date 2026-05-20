@@ -9,7 +9,8 @@
 //!
 //! # Pattern for shared task libraries
 //!
-//! 1. Define `const __RNME_GROUP: &str = "your_group";`
+//! 1. Define `const __RNME_GROUP: &str = "your_group";` and
+//!    `const __RNME_DIR: &str = "";` (empty = inherit process cwd)
 //! 2. Use `#[rnme::task]` on async functions as usual
 //! 3. Export `pub fn __rnme_link() {}` — a no-op the consumer must call
 //! 4. In the consuming crate, add this as a dependency and call
@@ -19,6 +20,8 @@ use rnme::prelude::*;
 
 /// Group name for tasks in this shared crate.
 const __RNME_GROUP: &str = "shared";
+/// Originating dir is unused for these test tasks.
+const __RNME_DIR: &str = "";
 
 /// A shared task that greets
 #[rnme::task]

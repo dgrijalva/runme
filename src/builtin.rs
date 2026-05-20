@@ -8,6 +8,7 @@
 use crate::prelude::*;
 
 const __RNME_GROUP: &str = "builtin";
+const __RNME_DIR: &str = "";
 
 /// List available tasks
 #[rnme::task(mode = cli)]
