@@ -664,6 +664,20 @@ let cmd = Cmd::from(std_cmd)
     .env("EXTRA", "yes");
 ```
 
+### Working directory
+
+Each task runs with its cwd defaulting to the directory of the RUNME.rs that defines it — not wherever `rnme` was launched from. This is the load-bearing invariant for cross-file invocation: a task in `services/api/RUNME.rs` keeps running with cwd = `services/api/`, whether the user typed `rnme build` from there, from the repo root, or from a parent task that called it.
+
+Codegen records the originating directory in `TaskDef::dir` (via a `const __RNME_DIR` injected next to `__RNME_GROUP`). At task launch, the engine writes that path onto the `TaskContext`. `ctx.spawn(cmd)` then resolves the subprocess cwd:
+
+| `Cmd::cwd(...)` value | Effective subprocess cwd |
+|-----------------------|--------------------------|
+| not set               | `task_dir`               |
+| relative path         | `task_dir.join(path)`    |
+| absolute path         | unchanged                |
+
+Process-global `chdir` is intentionally avoided so concurrent tasks from different RUNME.rs files don't fight over a shared cwd. For Rust code in the task body that needs the dir, `TaskContext::task_dir() -> Option<&Path>` exposes it. Built-in tasks (group `"builtin"`) and tasks defined outside the codegen path (tests, library users wiring `TaskContext` by hand) have `dir = ""` and fall back to the rnme process's cwd, preserving prior behavior.
+
 ### Process Output
 
 All process output flows through the log pipeline (`RecordParser` → `LogEntry` → `OutputBuffer`). The `Output` type provides a unified handle to this data, used by both `exec()` (completed process) and `spawn()` (running process):

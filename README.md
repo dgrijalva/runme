@@ -150,6 +150,8 @@ Three ways to describe a command:
 ctx.exec("cargo build && cargo test").await?;
 
 // Structured builder (no shell, no escaping issues).
+// .cwd is resolved against the task's RUNME.rs directory (see below),
+// so "./crates/server" works regardless of where rnme was launched from.
 let cmd = Cmd::new("cargo")
     .args(["build", "--release"])
     .env("RUSTFLAGS", "-C target-cpu=native")
@@ -165,6 +167,10 @@ ctx.exec(cmd![curl
 ```
 
 In the `cmd!` macro, whitespace separates arguments, `{expr}` interpolates a single argument, and `"..."` literals stay as one argument. No shell is invoked.
+
+### Working directory
+
+Every task runs with its cwd defaulting to the directory of the RUNME.rs that defines it — independent of where `rnme` was launched from or which other task invoked it. `.cwd(relative)` on a `Cmd` is joined under that directory; `.cwd(absolute)` is used verbatim. Task code that needs the path can read it via `ctx.task_dir()`.
 
 ### Background processes
 

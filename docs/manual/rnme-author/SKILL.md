@@ -147,6 +147,33 @@ let cmd = cmd!(env)
 ctx.exec(cmd).await?;
 ```
 
+## Working directory
+
+Every task runs with its cwd defaulting to the directory of the RUNME.rs that defines it. Write your tasks as if you were standing in that directory — `./scripts/foo`, `target/release/bin`, `client_web/Cargo.toml` all resolve the way you'd expect, regardless of where the user invoked `rnme` from.
+
+```rust
+// In services/api/RUNME.rs — these always work.
+ctx.exec(cmd!(cargo build --release)).await?.ok()?;
+ctx.exec("./scripts/deploy.sh").await?.ok()?;
+```
+
+`.cwd(...)` on a `Cmd` is resolved against the task's directory too:
+
+| `.cwd(...)` argument | Effective cwd                          |
+|----------------------|----------------------------------------|
+| omitted              | `<task dir>`                           |
+| relative path        | `<task dir>/<path>` (joined)           |
+| absolute path        | the absolute path verbatim             |
+
+```rust
+// In monorepo/RUNME.rs — runs `wasm-pack` in monorepo/client_web/.
+let action = cmd![wasm-pack build --target web -d ./target/wasmpack --no-typescript]
+    .cwd("client_web");
+ctx.exec(action).await?.ok()?;
+```
+
+For Rust code in the task body that needs to read files relative to the RUNME.rs, use `ctx.task_dir() -> Option<&Path>`. Join from there — don't rely on `std::env::current_dir()`, which reflects the rnme process's launch directory, not the task's.
+
 ## Long-running processes
 
 For a service that should die when the task ends:

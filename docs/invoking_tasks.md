@@ -141,7 +141,13 @@ This is intentional. Every concrete sibling-to-sibling case we considered was be
 
 `rnme` continues to walk up from cwd to find the nearest RUNME.rs as the root, then walks down to find descendants. The materialized module tree is rooted at the discovered root. Invoking from a leaf shows only that leaf's view; invoking from a parent shows the whole subtree. No global scope, no walking up past the discovered root, no change to the meaning of `rnme foo` from any directory.
 
-### 6. Collision strategy
+### 6. Working directory follows the task, not the caller
+
+Each task runs with its cwd defaulting to the directory of the RUNME.rs that defines it. This is essential for cross-file invocation: when a parent RUNME.rs calls into `subtasks::child::foo`, `foo` still runs as if invoked from `child/`. Relative paths in the child task's body (`./scripts/x`, `Cargo.toml`, `client_web/`) keep working without the child author having to think about whether they're being called from a parent.
+
+Codegen records the originating directory in `TaskDef::dir` (a `const __RNME_DIR` injected next to `__RNME_GROUP`). At task launch, the engine writes it onto the `TaskContext`. `ctx.spawn(cmd)` resolves the subprocess cwd before launch: no `.cwd()` defaults to `task_dir`, a relative `.cwd(p)` becomes `task_dir.join(p)`, and an absolute `.cwd(p)` is left alone. The `rnme` process never `chdir`s, so concurrent tasks from different RUNME.rs files don't fight over a shared cwd. `ctx.task_dir() -> Option<&Path>` exposes the path for body-side Rust code that needs to join from it.
+
+### 7. Collision strategy
 
 Collisions split into two classes that demand different treatment:
 

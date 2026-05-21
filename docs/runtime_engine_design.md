@@ -442,11 +442,12 @@ The canonical shutdown is `engine_handle.quit().await`. The CLI signal handler (
 
 All processes are spawned through `TaskContext::spawn()` / `exec()` (sugar for `spawn().complete()`). Every spawn:
 
-1. Builds a `Cmd`, spawns a `tokio::process::Child` in its own process group.
-2. Starts a **per-process reaper task** that owns the `Child`, calls `wait()` on it, and publishes the exit status on a oneshot.
-3. Emits a `SpawnEvent` so the engine registers the new process in the owning task's `ProcessInfo` list.
-4. Runs the readiness probe if configured (`ready_on_port`, `ready_on_http`, `ready_when`); on success, sets `ready: true` on the `ProcessInfo`.
-5. Forwards stdout/stderr lines through the parser pipeline into the engine's `LogStore`, tagged with the process's `TaskId`.
+1. Resolves the subprocess cwd against the task's `task_dir` (the originating RUNME.rs's directory, written onto `TaskContext` at body launch from `TaskDef::dir`). No `.cwd()` defaults to `task_dir`; a relative `.cwd(p)` becomes `task_dir.join(p)`; an absolute `.cwd(p)` is left untouched. Process-global `chdir` is avoided so concurrent tasks from different RUNME.rs files don't share state. Tasks with `dir = ""` (built-ins, dynamic, hand-built test contexts) inherit the rnme process's cwd.
+2. Builds a `Cmd`, spawns a `tokio::process::Child` in its own process group.
+3. Starts a **per-process reaper task** that owns the `Child`, calls `wait()` on it, and publishes the exit status on a oneshot.
+4. Emits a `SpawnEvent` so the engine registers the new process in the owning task's `ProcessInfo` list.
+5. Runs the readiness probe if configured (`ready_on_port`, `ready_on_http`, `ready_when`); on success, sets `ready: true` on the `ProcessInfo`.
+6. Forwards stdout/stderr lines through the parser pipeline into the engine's `LogStore`, tagged with the process's `TaskId`.
 
 The reaper task ensures **zombies don't accumulate** even when task code never awaits its `ProcessHandle` — the kernel can collect the exit status as soon as the process dies because the reaper called `wait()`. The reaper publishes the exit status; `ProcessHandle::wait()` / `complete()` consume it from the oneshot.
 
