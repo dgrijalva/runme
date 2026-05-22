@@ -1215,6 +1215,7 @@ dependencies = [
  "regex",
  "rmcp",
  "rnme-macros",
+ "rnme-test-task-template-spike",
  "rnme-test-tasks",
  "schemars",
  "serde",
@@ -1239,6 +1240,13 @@ dependencies = [
  "quote",
  "syn",
  "zyn",
+]
+
+[[package]]
+name = "rnme-test-task-template-spike"
+version = "0.1.0"
+dependencies = [
+ "rnme",
 ]
 
 [[package]]
