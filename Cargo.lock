@@ -1216,6 +1216,7 @@ dependencies = [
  "rmcp",
  "rnme-macros",
  "rnme-test-task-template-spike",
+ "rnme-test-task-templates",
  "rnme-test-tasks",
  "schemars",
  "serde",

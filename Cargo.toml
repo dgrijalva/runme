@@ -54,6 +54,7 @@ schemars = "1"
 tokio = { version = "1", features = ["full", "test-util"] }
 rnme-test-tasks = { path = "testing/test-tasks" }
 rnme-test-task-template-spike = { path = "testing/test-task-template-spike" }
+rnme-test-task-templates = { path = "testing/test-task-templates" }
 tempfile = "3"
 serde_json = "1"
 rmcp = { version = "1.6.0", features = ["client", "transport-child-process"] }

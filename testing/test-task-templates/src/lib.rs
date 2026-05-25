@@ -51,3 +51,17 @@ async fn build(ctx: &TaskContext, args: BuildArgs) -> TaskResult {
 /// anchor doesn't actually pull in any inventory items from this crate.
 pub fn __rnme_link() {}
 
+/// Bulk-import all three templates in one consumer-site invocation.
+///
+/// Demonstrates the design's "bulk import is just a library-provided helper"
+/// claim: this is a plain `#[macro_export] macro_rules!` written in the
+/// library crate, expanding to one `rnme::import_task!` per task.
+#[macro_export]
+macro_rules! import_all_test_templates {
+    () => {
+        ::rnme::import_task!($crate::noop);
+        ::rnme::import_task!($crate::echo);
+        ::rnme::import_task!($crate::build);
+    };
+}
+

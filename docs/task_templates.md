@@ -127,11 +127,9 @@ After expansion, the consumer's RUNME.rs has, for each `import_task!` invocation
 
 To prevent footguns where a library author reaches for `#[rnme::task]` (thinking it's the right tool) and produces a crate that pollutes any consumer's `inventory` with tasks carrying garbage `__RNME_GROUP`/`__RNME_DIR`:
 
-`#[rnme::task]` will fail to compile unless `__RNME_GROUP` and `__RNME_DIR` are defined as `const` items in scope. They always are inside RUNME.rs files (the codegen injects them), and never in regular library crates. The error message names the correct macro for library use:
+`#[rnme::task]` requires `__RNME_GROUP` and `__RNME_DIR` to be defined as `const` items in scope. They always are inside RUNME.rs files (the codegen injects them), and never in regular library crates. A library author who reaches for `#[rnme::task]` therefore gets a compile error.
 
-> `#[rnme::task]` requires `__RNME_GROUP` and `__RNME_DIR` constants in scope — these are injected automatically inside RUNME.rs files. To declare a task in a regular Rust library, use `#[rnme::task_template]` instead and have the consumer site re-stamp it with `rnme::import_task!`.
-
-This guardrail is small but load-bearing: it makes the "wrong macro" failure mode self-correcting.
+As shipped, that error is rustc's bare `E0425` ("cannot find value `__RNME_GROUP` in this scope") pointing at the `#[rnme::task]` attribute — no custom message, because proc macros can't introspect surrounding scope to decide whether to emit a pointed diagnostic. The user-facing pointer at `#[rnme::task_template]` lives in the `#[rnme::task]` rustdoc instead. The build still fails, which is the load-bearing property.
 
 ### The dynamic path is unchanged
 
@@ -163,5 +161,15 @@ None at time of writing — see "Settled decisions" below for the questions that
 - `#[rnme::task_template]` is a new, separate macro from `#[rnme::task]`. Not a flag or attribute on the existing macro.
 - Consumer-side import shape is `rnme::import_task!(path::to::task);` — explicit path, one per task. Bulk import is achieved via library-provided helper macros, not via a built-in.
 - Bulk import macros are written by the library author using `macro_rules!` and exported with `#[macro_export]`.
-- `#[rnme::task]` is hardened to fail at compile time when `__RNME_GROUP`/`__RNME_DIR` aren't in scope, with an error pointing the author at `#[rnme::task_template]`.
+- `#[rnme::task]` fails to compile when `__RNME_GROUP`/`__RNME_DIR` aren't in scope. The diagnostic is rustc's native `E0425`; the pointer at `#[rnme::task_template]` lives in `#[rnme::task]`'s rustdoc rather than the error itself (proc macros can't introspect surrounding scope to customize the message).
 - The `InitContext::register_task` dynamic API is unchanged and remains the path for truly-dynamic registration.
+
+## Implementation status
+
+Implementation landed via plan `docs/plans/2026-05-22-task-templates.md` (T1 spike, T2 `#[rnme::task_template]`, T3 `rnme::import_task!` + `#[rnme::task]` hardening).
+
+- Library-side proc macro `#[rnme::task_template]` lives in `macros/src/lib.rs` and emits the renamed body, string-args wrapper, arg-metadata fn, and a per-task `#[macro_export] macro_rules! __rnme_stamp_<name>!`. No `TaskDef` static / `inventory::submit!` / typed shim are emitted at the library site.
+- Consumer-side function-like proc macro `rnme::import_task!(lib::task)` parses a `syn::Path`, splits library-prefix + task ident, and expands to `<lib>::__rnme_stamp_<task>!()`. Declarative `macro_rules!` was ruled out at T1 (no token-paste in `macro_rules!`).
+- `#[rnme::task]` hardening: no explicit probe added. The emitted `TaskDef` static already references `__RNME_GROUP` / `__RNME_DIR` as bare idents, so missing constants produce rustc's `E0425` "cannot find value `__RNME_GROUP` in this scope" pointing at the `#[rnme::task]` attribute. The bare error does not name `#[rnme::task_template]` because proc macros can't detect surrounding scope; the user-facing mitigation is the doc-comment on `#[rnme::task]` pointing at `#[rnme::task_template]` for library crates.
+- Reference fixture: `testing/test-task-templates/` (templates: `noop`, `echo`, `build`) plus a library-author bulk-import macro `import_all_test_templates!`.
+- Integration test: `tests/task_templates.rs` covers consumer-local execution, ancestor invocation via `subtasks::child::name`, `--help` arg-metadata reachability, and the bulk-import path.

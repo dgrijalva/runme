@@ -175,6 +175,12 @@ fn extract_typed_param(arg: &FnArg) -> Result<(syn::Ident, syn::Type), syn::Erro
 /// manually — the empty `__RNME_DIR` makes `ctx.spawn` inherit the
 /// process cwd as before.
 ///
+/// If `__RNME_GROUP` / `__RNME_DIR` aren't in scope at the expansion site,
+/// the macro fails to compile with `cannot find value `__RNME_GROUP` in
+/// this scope`. To declare reusable tasks in a regular library crate
+/// (one without a RUNME.rs), use [`macro@task_template`] instead and have
+/// the consumer site stamp it with [`macro@import_task`].
+///
 /// The task description is taken from the function's `///` doc comments.
 ///
 /// # Three argument forms
@@ -460,33 +466,13 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
-    // Hardening probes. `#[rnme::task]` is only meaningful inside a scope
-    // that has `__RNME_GROUP` / `__RNME_DIR` `const &str` items — these
-    // are auto-injected inside `RUNME.rs` files and may be defined
-    // manually in shared library crates that intend to register tasks
-    // directly. If either constant is missing, the probes below produce
-    // a hard compile error pointing at this macro invocation.
-    //
-    // The probes are bare const references rather than a wrapped
-    // `compile_error!`-with-message because proc macros can't detect
-    // surrounding scope at expand time. The resulting error is rustc's
-    // E0425 "cannot find value `__RNME_GROUP` in this scope". For library
-    // crates, the alternative is `#[rnme::task_template]` —
-    // documented at the `#[rnme::task]` doc-comment.
-    let group_probe_name =
-        syn::Ident::new(&format!("__rnme_task_requires_group_{}", fn_name), fn_name.span());
-    let dir_probe_name =
-        syn::Ident::new(&format!("__rnme_task_requires_dir_{}", fn_name), fn_name.span());
-    let hardening_probes = quote! {
-        #[allow(dead_code, non_upper_case_globals)]
-        const #group_probe_name: &str = __RNME_GROUP;
-        #[allow(dead_code, non_upper_case_globals)]
-        const #dir_probe_name: &str = __RNME_DIR;
-    };
-
+    // No explicit hardening probe is needed: the emitted `TaskDef` static
+    // below references `__RNME_GROUP` / `__RNME_DIR` as bare idents, so
+    // the macro already fails to compile when they're not in scope
+    // (rustc E0425 pointing at the `#[rnme::task]` attribute). The
+    // user-facing mitigation is the doc-comment on `#[rnme::task]`
+    // pointing at `#[rnme::task_template]` for library crates.
     let expanded = quote! {
-        #hardening_probes
-
         #input_fn
 
         #wrapper
