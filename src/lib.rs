@@ -71,6 +71,22 @@ pub use rnme_macros::init;
 /// argument forms (zero-arg, simple flags, clap parser struct).
 pub use rnme_macros::task;
 
+/// Define a reusable task *template* in a regular Rust crate.
+///
+/// Unlike `#[rnme::task]`, a template does not self-register. It produces the
+/// building blocks a consumer RUNME.rs can re-stamp into a local typed task
+/// registration via `rnme::import_task!`. See `docs/task_templates.md`.
+pub use rnme_macros::task_template;
+
+/// Stamp a task template into the current scope as a typed task registration.
+///
+/// `rnme::import_task!(lib_crate::name);` produces all the artifacts a local
+/// `#[rnme::task]` would emit (typed shim, string-args wrapper, `TaskDef`
+/// static, `inventory::submit!`), using the consumer's `__RNME_GROUP` /
+/// `__RNME_DIR`. The template body / argmeta live in the library crate.
+/// See `docs/task_templates.md`.
+pub use rnme_macros::import_task;
+
 /// Spawn a future on the tokio runtime with the current `tracing` span
 /// re-entered inside it. Use this from inside a task body whenever you'd
 /// reach for `tokio::spawn(...)` — events emitted from the spawned future

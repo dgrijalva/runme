@@ -9,7 +9,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [workspace]
 resolver = "3"
-members = ["macros", "testing/test-tasks", "testing/test-task-template-spike"]
+members = ["macros", "testing/test-tasks", "testing/test-task-template-spike", "testing/test-task-templates"]
 
 [[bin]]
 name = "runme"

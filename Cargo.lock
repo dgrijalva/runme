@@ -1250,6 +1250,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rnme-test-task-templates"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rnme",
+]
+
+[[package]]
 name = "rnme-test-tasks"
 version = "0.1.0"
 dependencies = [

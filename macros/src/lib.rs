@@ -227,129 +227,12 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     // this symbol.
     let body_name = syn::Ident::new(&format!("__rnme_body_{}", fn_name), fn_name.span());
 
-    // Parse attributes: mode = cli|tui
-    let mut ui_hint: Option<proc_macro2::TokenStream> = None;
-
-    // Parse the attribute as a comma-separated list of name = value pairs
-    let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
-    let parsed_attrs = match syn::parse::Parser::parse(attr_parser, attr) {
-        Ok(attrs) => attrs,
-        Err(e) => return e.to_compile_error().into(),
-    };
-
-    for meta in parsed_attrs {
-        match meta {
-            Meta::NameValue(MetaNameValue { path, value, .. }) => {
-                let key = path.get_ident().map(|i| i.to_string()).unwrap_or_default();
-                match key.as_str() {
-                    "mode" => {
-                        let mode_str = match &value {
-                            Expr::Path(p) => match p.path.get_ident() {
-                                Some(i) => i.to_string(),
-                                None => {
-                                    return syn::Error::new_spanned(
-                                        value,
-                                        "expected `cli` or `tui`",
-                                    )
-                                    .to_compile_error()
-                                    .into();
-                                }
-                            },
-                            Expr::Lit(ExprLit {
-                                lit: Lit::Str(s), ..
-                            }) => s.value(),
-                            _ => {
-                                return syn::Error::new_spanned(
-                                    value,
-                                    "expected `cli` or `tui` (bare ident or string literal)",
-                                )
-                                .to_compile_error()
-                                .into();
-                            }
-                        };
-                        ui_hint = Some(match mode_str.as_str() {
-                            "cli" | "Cli" | "CLI" => {
-                                quote! { Some(::rnme::task::UiHint::Cli) }
-                            }
-                            "tui" | "Tui" | "TUI" => {
-                                quote! { Some(::rnme::task::UiHint::Tui) }
-                            }
-                            other => {
-                                return syn::Error::new_spanned(
-                                    value,
-                                    format!(
-                                        "unknown mode `{}` — expected `cli` or `tui`",
-                                        other
-                                    ),
-                                )
-                                .to_compile_error()
-                                .into();
-                            }
-                        });
-                    }
-                    "desc" | "description" => {
-                        return syn::Error::new_spanned(
-                            path,
-                            "task descriptions come from `///` doc comments — \
-                             remove this attribute and write a `///` line above the fn",
-                        )
-                        .to_compile_error()
-                        .into();
-                    }
-                    other => {
-                        return syn::Error::new_spanned(
-                            path,
-                            format!("unknown attribute: {}", other),
-                        )
-                        .to_compile_error()
-                        .into();
-                    }
-                }
-            }
-            other => {
-                return syn::Error::new_spanned(other, "expected `key = value` format")
-                    .to_compile_error()
-                    .into();
-            }
-        }
-    }
-
-    let ui_hint_tokens = ui_hint.unwrap_or_else(|| quote! { None });
-
-    // Description is taken from `///` doc comments on the fn.
-    let doc_lines: Vec<String> = input_fn
-        .attrs
-        .iter()
-        .filter_map(|attr| {
-            if attr.path().is_ident("doc")
-                && let Meta::NameValue(MetaNameValue {
-                    value:
-                        Expr::Lit(ExprLit {
-                            lit: Lit::Str(s), ..
-                        }),
-                    ..
-                }) = &attr.meta
-            {
-                return Some(s.value().trim().to_string());
-            }
-            None
-        })
-        .collect();
-    let description: Option<String> = if doc_lines.is_empty() {
-        None
-    } else {
-        Some(doc_lines.join(" "))
-    };
-
-    // Generate the description token
-    let desc_tokens = match &description {
-        Some(d) => quote! { Some(#d) },
-        None => quote! { None },
-    };
-
-    // Detect argument form
-    let arg_form = match detect_arg_form(&input_fn) {
-        Ok(form) => form,
+    let TaskFnMeta {
+        desc_tokens,
+        ui_hint_tokens,
+        arg_form,
+    } = match parse_task_attrs_and_meta(attr, &input_fn) {
+        Ok(m) => m,
         Err(e) => return e.to_compile_error().into(),
     };
 
@@ -577,7 +460,33 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     };
 
+    // Hardening probes. `#[rnme::task]` is only meaningful inside a scope
+    // that has `__RNME_GROUP` / `__RNME_DIR` `const &str` items — these
+    // are auto-injected inside `RUNME.rs` files and may be defined
+    // manually in shared library crates that intend to register tasks
+    // directly. If either constant is missing, the probes below produce
+    // a hard compile error pointing at this macro invocation.
+    //
+    // The probes are bare const references rather than a wrapped
+    // `compile_error!`-with-message because proc macros can't detect
+    // surrounding scope at expand time. The resulting error is rustc's
+    // E0425 "cannot find value `__RNME_GROUP` in this scope". For library
+    // crates, the alternative is `#[rnme::task_template]` —
+    // documented at the `#[rnme::task]` doc-comment.
+    let group_probe_name =
+        syn::Ident::new(&format!("__rnme_task_requires_group_{}", fn_name), fn_name.span());
+    let dir_probe_name =
+        syn::Ident::new(&format!("__rnme_task_requires_dir_{}", fn_name), fn_name.span());
+    let hardening_probes = quote! {
+        #[allow(dead_code, non_upper_case_globals)]
+        const #group_probe_name: &str = __RNME_GROUP;
+        #[allow(dead_code, non_upper_case_globals)]
+        const #dir_probe_name: &str = __RNME_DIR;
+    };
+
     let expanded = quote! {
+        #hardening_probes
+
         #input_fn
 
         #wrapper
@@ -603,6 +512,405 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Attribute macro for declaring a reusable task **template** in a regular Rust crate.
+///
+/// Distinct from `#[rnme::task]`: a template is *not* a self-registering task. It
+/// produces the building blocks (renamed body, string-args wrapper, arg-metadata
+/// fn, and a per-task `macro_rules!` helper) that a *consumer* RUNME.rs can
+/// re-stamp into a fully-local typed task registration via `rnme::import_task!`.
+///
+/// The library site emits **no** `TaskDef` static, **no** `inventory::submit!`, and
+/// **no** typed shim. All three are stamped at the consumer site by the per-task
+/// helper macro, using the consumer's `__RNME_GROUP` and `__RNME_DIR` constants.
+///
+/// Accepts the same three argument forms as `#[rnme::task]`. The captured signature,
+/// description (from doc comments), and `ui_hint` are baked into the helper macro
+/// at proc-macro time.
+///
+/// See `docs/task_templates.md` for the design.
+#[proc_macro_attribute]
+pub fn task_template(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut input_fn = parse_macro_input!(item as ItemFn);
+    let fn_name = input_fn.sig.ident.clone();
+    let fn_name_str = fn_name.to_string();
+    let is_async = input_fn.sig.asyncness.is_some();
+
+    // Per-task symbol names. The body, string-args wrapper, and argmeta fn
+    // live in the library crate and are reached from the consumer site via
+    // `$crate::...` inside the stamp macro_rules expansion.
+    let body_name = syn::Ident::new(&format!("__rnme_body_{}", fn_name), fn_name.span());
+    let wrapper_name = syn::Ident::new(&format!("__runme_taskfn_{}", fn_name), fn_name.span());
+    let arg_metadata_name =
+        syn::Ident::new(&format!("__runme_argmeta_{}", fn_name), fn_name.span());
+    let stamp_macro_name =
+        syn::Ident::new(&format!("__rnme_stamp_{}", fn_name), fn_name.span());
+
+    let TaskFnMeta {
+        desc_tokens,
+        ui_hint_tokens,
+        arg_form,
+    } = match parse_task_attrs_and_meta(attr, &input_fn) {
+        Ok(m) => m,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    let has_return_type = !matches!(input_fn.sig.output, ReturnType::Default);
+
+    // Capture the typed parameter list (after `ctx: &TaskContext`) for the
+    // stamped-out typed shim. We embed the original `name: ty` token shapes
+    // verbatim into the macro_rules arm — the consumer is responsible for
+    // having the types in scope (e.g. via `use rnme_cargo::BuildOpts;`).
+    let typed_params: Vec<(syn::Ident, syn::Type)> = input_fn
+        .sig
+        .inputs
+        .iter()
+        .skip(1)
+        .filter_map(|arg| match arg {
+            FnArg::Typed(pat_type) => match pat_type.pat.as_ref() {
+                Pat::Ident(pat_ident) => Some((pat_ident.ident.clone(), (*pat_type.ty).clone())),
+                _ => None,
+            },
+            FnArg::Receiver(_) => None,
+        })
+        .collect();
+    let shim_param_decls: Vec<proc_macro2::TokenStream> = typed_params
+        .iter()
+        .map(|(name, ty)| quote! { #name: #ty })
+        .collect();
+    let shim_param_idents: Vec<syn::Ident> =
+        typed_params.iter().map(|(name, _)| name.clone()).collect();
+
+    // Rename the user's fn to the private body symbol and make it `pub` so
+    // the stamp expansion can reach it as `$crate::__rnme_body_<name>`.
+    //
+    // **No `start_task` injection here.** The runtime tracing span is opened
+    // at the consumer site (with the consumer-stamped name) by the stamp
+    // expansion below.
+    input_fn.sig.ident = body_name.clone();
+    input_fn.vis = syn::Visibility::Public(syn::Token![pub](fn_name.span()));
+
+    // Build the string-args wrapper for the library site. Same shape as
+    // `#[rnme::task]` emits, but `pub` so the consumer-stamped wrapper can
+    // delegate to it via `$crate::__runme_taskfn_<name>`. The wrapper does
+    // not open a tracing span — that happens at the consumer site.
+    let (parse_block, fn_call, arg_metadata_tokens) = match &arg_form {
+        ArgForm::ZeroArgs => {
+            let parse = quote! {};
+            let call = quote! { #body_name(ctx) };
+            let metadata = quote! {
+                pub fn #arg_metadata_name() -> Option<::rnme::clap::Command> {
+                    None
+                }
+            };
+            (parse, call, metadata)
+        }
+        ArgForm::SimpleArgs(params) => {
+            let (parse_stmts, call_args, cmd_build) =
+                generate_simple_args(fn_name_str.clone(), params);
+            let parse = parse_stmts;
+            let call = quote! { #body_name(ctx, #(#call_args),*) };
+            let metadata = quote! {
+                pub fn #arg_metadata_name() -> Option<::rnme::clap::Command> {
+                    Some({ #cmd_build })
+                }
+            };
+            (parse, call, metadata)
+        }
+        ArgForm::ParserStruct {
+            param_name: _,
+            param_type,
+        } => {
+            let parse = quote! {
+                let __parsed = match <#param_type as ::rnme::clap::Parser>::try_parse_from(
+                    ::std::iter::once(::std::string::String::from(#fn_name_str))
+                        .chain(__args.iter().cloned())
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return ::std::boxed::Box::pin(::std::future::ready(
+                        Err(::rnme::error::TaskError::from_display(e))
+                    )),
+                };
+            };
+            let call = quote! { #body_name(ctx, __parsed) };
+            let metadata = quote! {
+                pub fn #arg_metadata_name() -> Option<::rnme::clap::Command> {
+                    Some(<#param_type as ::rnme::clap::CommandFactory>::command())
+                }
+            };
+            (parse, call, metadata)
+        }
+    };
+
+    let wrapper = match (is_async, has_return_type) {
+        (true, true) => quote! {
+            pub fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::rnme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::rnme::error::TaskError>> + Send + '__runme_lt>> {
+                #parse_block
+                ::std::boxed::Box::pin(async move { #fn_call .await })
+            }
+        },
+        (true, false) => quote! {
+            pub fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::rnme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::rnme::error::TaskError>> + Send + '__runme_lt>> {
+                #parse_block
+                ::std::boxed::Box::pin(async move {
+                    #fn_call .await;
+                    Ok(())
+                })
+            }
+        },
+        (false, true) => quote! {
+            pub fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::rnme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::rnme::error::TaskError>> + Send + '__runme_lt>> {
+                #parse_block
+                let result = #fn_call;
+                ::std::boxed::Box::pin(::std::future::ready(result))
+            }
+        },
+        (false, false) => quote! {
+            pub fn #wrapper_name<'__runme_lt>(ctx: &'__runme_lt ::rnme::task::TaskContext, __args: &[String]) -> ::std::pin::Pin<::std::boxed::Box<dyn ::std::future::Future<Output = ::std::result::Result<(), ::rnme::error::TaskError>> + Send + '__runme_lt>> {
+                #parse_block
+                #fn_call;
+                ::std::boxed::Box::pin(::std::future::ready(Ok(())))
+            }
+        },
+    };
+
+    // Shim body expression — what the factory closure does at the consumer
+    // site to dispatch to the library body. Matches the (is_async,
+    // has_return_type) matrix of the user's fn.
+    let shim_body_expr = match (is_async, has_return_type) {
+        (true, true) => quote! {
+            $crate::#body_name(body_ctx, #(#shim_param_idents),*).await
+        },
+        (true, false) => quote! {
+            $crate::#body_name(body_ctx, #(#shim_param_idents),*).await;
+            ::std::result::Result::Ok(())
+        },
+        (false, true) => quote! {
+            $crate::#body_name(body_ctx, #(#shim_param_idents),*)
+        },
+        (false, false) => quote! {
+            $crate::#body_name(body_ctx, #(#shim_param_idents),*);
+            ::std::result::Result::Ok(())
+        },
+    };
+
+    // Per-task stamp helper. `#[macro_export]` makes it reachable as
+    // `<library_crate>::__rnme_stamp_<name>!` from the consumer site.
+    //
+    // The arm:
+    //
+    // - Reads `__RNME_GROUP` / `__RNME_DIR` as bare identifiers — they bind
+    //   to the consumer's `const __RNME_GROUP: &str = ...;` /
+    //   `const __RNME_DIR: &str = ...;` (call-site scope in macro_rules).
+    //
+    // - Refers to library fns via `$crate::...` so they resolve back to the
+    //   defining crate regardless of how the consumer imports it.
+    //
+    // - Emits a consumer-local string-args wrapper that opens the tracing
+    //   span with the consumer's stamped name, then delegates to the library
+    //   wrapper. This way `start_task` fires for both the typed path (via
+    //   the factory closure) and the string-args path (via this wrapper)
+    //   with the consumer-visible name.
+    //
+    // - Emits `pub static __RNME_TASKDEF_<name>`, the `inventory::submit!`,
+    //   and the `pub fn <name>(...) -> TaskBuilder` typed shim.
+    let stamp_wrapper_name =
+        syn::Ident::new(&format!("__runme_taskfn_{}", fn_name), fn_name.span());
+    let stamp_taskdef_name =
+        syn::Ident::new(&format!("__RNME_TASKDEF_{}", fn_name), fn_name.span());
+
+    let stamp_macro = quote! {
+        #[macro_export]
+        #[doc(hidden)]
+        macro_rules! #stamp_macro_name {
+            () => {
+                // Consumer-local string-args wrapper that opens the tracing
+                // span with the consumer-stamped name (here baked in as the
+                // template's fn name — `rnme::import_task!` does not allow
+                // renaming today).
+                #[allow(non_snake_case)]
+                fn #stamp_wrapper_name<'__runme_lt>(
+                    ctx: &'__runme_lt ::rnme::task::TaskContext,
+                    __args: &[::std::string::String],
+                ) -> ::std::pin::Pin<::std::boxed::Box<
+                    dyn ::std::future::Future<
+                        Output = ::std::result::Result<(), ::rnme::error::TaskError>,
+                    > + ::std::marker::Send + '__runme_lt,
+                >> {
+                    let __inner = $crate::#wrapper_name(ctx, __args);
+                    ::std::boxed::Box::pin(async move {
+                        let _task = ctx.start_task(#fn_name_str);
+                        __inner.await
+                    })
+                }
+
+                #[allow(non_upper_case_globals)]
+                pub static #stamp_taskdef_name: ::rnme::task::TaskDef = ::rnme::task::TaskDef {
+                    name: #fn_name_str,
+                    description: #desc_tokens,
+                    group: __RNME_GROUP,
+                    dir: __RNME_DIR,
+                    func: ::rnme::task::TaskFnKind::Static(#stamp_wrapper_name),
+                    arg_metadata: $crate::#arg_metadata_name,
+                    ui_hint: #ui_hint_tokens,
+                };
+
+                ::rnme::inventory::submit! {
+                    ::rnme::task::TaskDefRef(&#stamp_taskdef_name)
+                }
+
+                #[must_use = "task builders do nothing until `.await` or `.spawn()` — \
+                              a bare call constructs the builder and drops it"]
+                pub fn #fn_name(
+                    ctx: &::rnme::task::TaskContext,
+                    #(#shim_param_decls,)*
+                ) -> ::rnme::execution::builder::TaskBuilder {
+                    ::rnme::execution::builder::TaskBuilder::from_factory(
+                        ctx,
+                        &#stamp_taskdef_name,
+                        ::std::boxed::Box::new(move |body_ctx: &::rnme::task::TaskContext| {
+                            ::std::boxed::Box::pin(async move {
+                                let _task = body_ctx.start_task(#fn_name_str);
+                                #shim_body_expr
+                            })
+                        }),
+                    )
+                }
+            };
+        }
+    };
+
+    let expanded = quote! {
+        #input_fn
+
+        #wrapper
+
+        #arg_metadata_tokens
+
+        #stamp_macro
+    };
+
+    expanded.into()
+}
+
+/// Shared front-matter parser for `#[rnme::task]` and `#[rnme::task_template]`.
+///
+/// Pulls the doc-comment description, the optional `mode = cli|tui`
+/// attribute, and detects the argument form from the function signature.
+/// Returns the assembled token bits the two macros both need.
+struct TaskFnMeta {
+    desc_tokens: proc_macro2::TokenStream,
+    ui_hint_tokens: proc_macro2::TokenStream,
+    arg_form: ArgForm,
+}
+
+fn parse_task_attrs_and_meta(
+    attr: TokenStream,
+    input_fn: &ItemFn,
+) -> Result<TaskFnMeta, syn::Error> {
+    // Parse the attribute as a comma-separated list of name = value pairs.
+    let attr_parser = syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated;
+    let parsed_attrs = syn::parse::Parser::parse(attr_parser, attr)?;
+
+    let mut ui_hint: Option<proc_macro2::TokenStream> = None;
+    for meta in parsed_attrs {
+        match meta {
+            Meta::NameValue(MetaNameValue { path, value, .. }) => {
+                let key = path.get_ident().map(|i| i.to_string()).unwrap_or_default();
+                match key.as_str() {
+                    "mode" => {
+                        let mode_str = match &value {
+                            Expr::Path(p) => match p.path.get_ident() {
+                                Some(i) => i.to_string(),
+                                None => {
+                                    return Err(syn::Error::new_spanned(
+                                        value,
+                                        "expected `cli` or `tui`",
+                                    ));
+                                }
+                            },
+                            Expr::Lit(ExprLit {
+                                lit: Lit::Str(s), ..
+                            }) => s.value(),
+                            _ => {
+                                return Err(syn::Error::new_spanned(
+                                    value,
+                                    "expected `cli` or `tui` (bare ident or string literal)",
+                                ));
+                            }
+                        };
+                        ui_hint = Some(match mode_str.as_str() {
+                            "cli" | "Cli" | "CLI" => {
+                                quote! { Some(::rnme::task::UiHint::Cli) }
+                            }
+                            "tui" | "Tui" | "TUI" => {
+                                quote! { Some(::rnme::task::UiHint::Tui) }
+                            }
+                            other => {
+                                return Err(syn::Error::new_spanned(
+                                    value,
+                                    format!("unknown mode `{}` — expected `cli` or `tui`", other),
+                                ));
+                            }
+                        });
+                    }
+                    "desc" | "description" => {
+                        return Err(syn::Error::new_spanned(
+                            path,
+                            "task descriptions come from `///` doc comments — \
+                             remove this attribute and write a `///` line above the fn",
+                        ));
+                    }
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            path,
+                            format!("unknown attribute: {}", other),
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(syn::Error::new_spanned(other, "expected `key = value` format"));
+            }
+        }
+    }
+
+    let ui_hint_tokens = ui_hint.unwrap_or_else(|| quote! { None });
+
+    // Description from `///` doc comments.
+    let doc_lines: Vec<String> = input_fn
+        .attrs
+        .iter()
+        .filter_map(|attr| {
+            if attr.path().is_ident("doc")
+                && let Meta::NameValue(MetaNameValue {
+                    value:
+                        Expr::Lit(ExprLit {
+                            lit: Lit::Str(s), ..
+                        }),
+                    ..
+                }) = &attr.meta
+            {
+                return Some(s.value().trim().to_string());
+            }
+            None
+        })
+        .collect();
+    let desc_tokens = if doc_lines.is_empty() {
+        quote! { None }
+    } else {
+        let joined = doc_lines.join(" ");
+        quote! { Some(#joined) }
+    };
+
+    let arg_form = detect_arg_form(input_fn)?;
+
+    Ok(TaskFnMeta {
+        desc_tokens,
+        ui_hint_tokens,
+        arg_form,
+    })
 }
 
 /// Generate the parsing block, call arguments, and clap::Command builder
@@ -750,6 +1058,81 @@ fn generate_simple_args(
 
     let parse_block = quote! { #(#parse_stmts)* };
     (parse_block, call_args, cmd_build)
+}
+
+/// Import a task template from a library crate into the current scope.
+///
+/// `rnme::import_task!(lib_crate::task_name);` expands to
+/// `lib_crate::__rnme_stamp_task_name!();`, invoking the per-task stamp
+/// helper that `#[rnme::task_template]` generated at the library site.
+/// The expansion produces a fully-local typed task registration at the
+/// consumer site — `pub static __RNME_TASKDEF_<name>`, an
+/// `inventory::submit!`, and a `#[must_use] pub fn <name>(...) -> TaskBuilder`
+/// shim — using the consumer's `__RNME_GROUP` / `__RNME_DIR`.
+///
+/// A function-like proc macro (not `macro_rules!`) because synthesizing
+/// the identifier `__rnme_stamp_<task>` from a captured `$task:ident`
+/// requires token pasting, which declarative macros can't do.
+///
+/// ```ignore
+/// // In a RUNME.rs:
+/// rnme::import_task!(rnme_test_task_templates::build);
+/// ```
+///
+/// A typo in the task name produces a compile error pointing at the
+/// library path (the missing `__rnme_stamp_<typo>!` macro).
+#[proc_macro]
+pub fn import_task(input: TokenStream) -> TokenStream {
+    let path: syn::Path = match syn::parse(input) {
+        Ok(p) => p,
+        Err(e) => return e.to_compile_error().into(),
+    };
+
+    if path.segments.is_empty() {
+        return syn::Error::new_spanned(&path, "expected a path like `lib_crate::task_name`")
+            .to_compile_error()
+            .into();
+    }
+
+    let mut lib_path = path.clone();
+    // Pop the final segment — that's the task ident. Everything before is
+    // the library path used to reach the stamp macro.
+    let task_seg = lib_path
+        .segments
+        .pop()
+        .expect("at least one segment, checked above")
+        .into_value();
+
+    if !task_seg.arguments.is_empty() {
+        return syn::Error::new_spanned(
+            &task_seg.arguments,
+            "task name must not carry generic arguments",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    if lib_path.segments.is_empty() {
+        return syn::Error::new_spanned(
+            &path,
+            "expected `lib_crate::task_name` — a library path followed by the task name",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // Drop the trailing `::` separator left over from popping the final segment.
+    lib_path.segments.pop_punct();
+
+    let task_ident = &task_seg.ident;
+    let stamp_ident = syn::Ident::new(
+        &format!("__rnme_stamp_{}", task_ident),
+        task_ident.span(),
+    );
+
+    let expanded = quote! {
+        #lib_path :: #stamp_ident !();
+    };
+    expanded.into()
 }
 
 /// Attribute macro for per-file initialization hooks.

@@ -46,6 +46,8 @@ pub use crate::spawn;
 pub use rnme_macros::cmd;
 pub use rnme_macros::init;
 pub use rnme_macros::task;
+pub use rnme_macros::task_template;
+pub use rnme_macros::import_task;
 
 // Tracing macros for task function logging
 pub use tracing::{debug, error, info, trace, warn};
