@@ -4,7 +4,7 @@
 //! virtual "current edit" slot that lets the user navigate Up/Down through
 //! history without losing what they were typing.
 //!
-//! Design: see `docs/plans/2026-05-10-filter-search-redesign.md`.
+//! Design: see `docs/dev_artifacts/2026-05-10-filter-search-redesign.md`.
 
 use ratatui::{
     Frame,

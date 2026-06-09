@@ -3,6 +3,8 @@ name = "rnme-macros"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+description = "Proc macros for rnme — the #[rnme::task] attribute and cmd! macro"
+repository = "https://github.com/dgrijalva/runme"
 
 [lib]
 proc-macro = true
