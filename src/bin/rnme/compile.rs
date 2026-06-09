@@ -33,8 +33,6 @@ pub enum CompileError {
     CargoBuild(String),
     /// Could not determine the home directory for cache placement.
     NoHomeDir,
-    /// Could not determine the rnme library crate path.
-    NoLibPath,
     /// Discovery result has no nearest RUNME.rs.
     NoRunmeFile,
     /// Two sibling RUNME.rs files normalize to the same module name.
@@ -53,7 +51,6 @@ impl fmt::Display for CompileError {
             CompileError::Io(e) => write!(f, "I/O error: {}", e),
             CompileError::CargoBuild(msg) => write!(f, "cargo build failed: {}", msg),
             CompileError::NoHomeDir => write!(f, "could not determine home directory"),
-            CompileError::NoLibPath => write!(f, "could not determine rnme library path"),
             CompileError::NoRunmeFile => write!(f, "no RUNME.rs file in discovery result"),
             CompileError::SiblingNameCollision { path_a, path_b, resolved_name, suggestion } => {
                 write!(
@@ -89,8 +86,10 @@ pub fn compile_workspace(discovery: &DiscoveryResult) -> Result<CompileResult, C
         .as_ref()
         .ok_or(CompileError::NoRunmeFile)?;
 
-    // Find the rnme library crate path
-    let rnme_lib_path = find_rnme_lib_path(root_rnme)?;
+    // Resolve the rnme dependency spec: a TOML-value fragment that follows the
+    // `rnme = ` key. `RNME_LIB_PATH` (set during local development) selects a
+    // path dep; otherwise the binary asks for its own version from crates.io.
+    let rnme_dep = rnme_dep_spec();
 
     // Compute cache directory from hash of root RUNME.rs absolute path
     let root_abs = fs::canonicalize(root_rnme).map_err(CompileError::Io)?;
@@ -107,10 +106,10 @@ pub fn compile_workspace(discovery: &DiscoveryResult) -> Result<CompileResult, C
     // Flatten depth-first into the existing CrateEntry shape that the
     // generators consume. Collision detection fires here — before cargo build.
     let mut entries: Vec<CrateEntry> = Vec::new();
-    flatten_tree_into_entries(&tree, &rnme_lib_path, &mut entries)?;
+    flatten_tree_into_entries(&tree, &rnme_dep, &mut entries)?;
 
     // Generate the workspace
-    generate_workspace(&cache_dir, &entries, &rnme_lib_path)?;
+    generate_workspace(&cache_dir, &entries, &rnme_dep)?;
 
     eprintln!("runme: compiling...");
 
@@ -321,7 +320,7 @@ fn is_strict_descendant(desc: &Path, ancestor: &Path) -> bool {
 }
 
 /// Build a `CrateEntry` from a `ModuleNode` — the per-node projection step.
-fn node_to_crate_entry(node: &ModuleNode, rnme_lib_path: &Path) -> Result<CrateEntry, CompileError> {
+fn node_to_crate_entry(node: &ModuleNode, rnme_dep: &str) -> Result<CrateEntry, CompileError> {
     let crate_name = node.module_name.clone();
     let group_key = group_key_from_dir(&node.effective_dir);
     let original_dir = node.path.parent().unwrap_or(Path::new("."));
@@ -349,10 +348,10 @@ name = "{crate_name}"
 path = "src/lib.rs"
 
 [dependencies]
-rnme = {{ path = "{rnme_lib}" }}
+rnme = {rnme_dep}
 "#,
         crate_name = crate_name,
-        rnme_lib = rnme_lib_path.display(),
+        rnme_dep = rnme_dep,
     );
 
     for (name, version_spec) in &rewritten_deps {
@@ -382,12 +381,12 @@ rnme = {{ path = "{rnme_lib}" }}
 /// existing generators consume. Root is emitted first, then each subtree.
 fn flatten_tree_into_entries(
     node: &ModuleNode,
-    rnme_lib_path: &Path,
+    rnme_dep: &str,
     out: &mut Vec<CrateEntry>,
 ) -> Result<(), CompileError> {
-    out.push(node_to_crate_entry(node, rnme_lib_path)?);
+    out.push(node_to_crate_entry(node, rnme_dep)?);
     for child in &node.children {
-        flatten_tree_into_entries(child, rnme_lib_path, out)?;
+        flatten_tree_into_entries(child, rnme_dep, out)?;
     }
     debug_assert!(
         subtasks_dep_graph_is_acyclic(out),
@@ -720,7 +719,7 @@ fn group_key_from_dir(dir: &Path) -> String {
 fn generate_workspace(
     cache_dir: &Path,
     entries: &[CrateEntry],
-    rnme_lib_path: &Path,
+    rnme_dep: &str,
 ) -> Result<(), CompileError> {
     // Write each lib crate
     for entry in entries {
@@ -748,9 +747,9 @@ name = "runner"
 path = "src/main.rs"
 
 [dependencies]
-rnme = {{ path = "{}" }}
+rnme = {rnme_dep}
 "#,
-        rnme_lib_path.display(),
+        rnme_dep = rnme_dep,
     );
 
     for entry in entries {
@@ -797,57 +796,15 @@ fn cache_dir_for_root(root_abs: &Path) -> Result<PathBuf, CompileError> {
     Ok(home.join(".cache").join("rnme").join(hash_prefix))
 }
 
-/// Find the absolute path to the `rnme` library crate.
-///
-/// Strategy: walk up from the binary's location or the RUNME.rs file's directory
-/// looking for a Cargo.toml with `name = "rnme"`. With the merged crate layout,
-/// the library is at the workspace root.
-fn find_rnme_lib_path(rnme_file: &Path) -> Result<PathBuf, CompileError> {
-    // First, try to find it relative to the rnme binary's location.
-    if let Ok(exe_path) = std::env::current_exe()
-        && let Some(exe_dir) = exe_path.parent()
-    {
-        let mut search = exe_dir.to_path_buf();
-        loop {
-            if looks_like_rnme_root(&search) {
-                return Ok(search);
-            }
-            if !search.pop() {
-                break;
-            }
-        }
-    }
-
-    // Fallback: walk up from the RUNME.rs file location
-    let start_dir = rnme_file.parent().ok_or(CompileError::NoLibPath)?;
-    let mut search = start_dir.to_path_buf();
-    loop {
-        if looks_like_rnme_root(&search) {
-            return Ok(search);
-        }
-        if !search.pop() {
-            break;
-        }
-    }
-
-    // Last resort: check if RNME_LIB_PATH env var is set
-    if let Ok(path) = std::env::var("RNME_LIB_PATH") {
-        let p = PathBuf::from(path);
-        if p.join("Cargo.toml").is_file() {
-            return Ok(p);
-        }
-    }
-
-    Err(CompileError::NoLibPath)
-}
-
-/// Check if a directory looks like the rnme workspace root.
-fn looks_like_rnme_root(dir: &Path) -> bool {
-    let cargo = dir.join("Cargo.toml");
-    if let Ok(content) = fs::read_to_string(&cargo) {
-        content.contains("name = \"rnme\"") && dir.join("src").join("lib.rs").is_file()
-    } else {
-        false
+/// Resolve the `rnme = ` dependency spec to emit into generated Cargo.toml
+/// files. Set `RNME_LIB_PATH` to use a path dep against a local checkout
+/// (the only supported workflow for hacking on rnme itself); otherwise the
+/// binary pins the lib to its own `CARGO_PKG_VERSION` from crates.io, so a
+/// `cargo install rnme` user gets a matching lib without any setup.
+fn rnme_dep_spec() -> String {
+    match std::env::var("RNME_LIB_PATH") {
+        Ok(path) => format!("{{ path = \"{}\" }}", path),
+        Err(_) => format!("\"{}\"", env!("CARGO_PKG_VERSION")),
     }
 }
 
@@ -926,7 +883,7 @@ mod tests {
     fn process_files_via_tree(
         root_rnme: &Path,
         children: &[PathBuf],
-        rnme_lib: &Path,
+        rnme_lib: &str,
     ) -> Vec<CrateEntry> {
         let discovery = DiscoveryResult {
             nearest: Some(root_rnme.to_path_buf()),
@@ -1766,7 +1723,7 @@ mod tests {
         let cache_dir = tmp.path().join("workspace");
         fs::create_dir_all(&cache_dir).unwrap();
 
-        let rnme_lib = PathBuf::from("/fake/path/to/rnme");
+        let rnme_lib = "{ path = \"/fake/path/to/rnme\" }".to_string();
 
         let entries = vec![
             CrateEntry {
@@ -1817,9 +1774,11 @@ mod tests {
     // Integration tests: full pipeline from RUNME.rs files → workspace
     // -----------------------------------------------------------------------
 
-    /// Helper: resolve the rnme library path (the workspace root).
-    fn rnme_lib_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    /// Helper: build a path-dep spec pointing at the in-tree rnme workspace.
+    /// Tests compile generated crates against the live source, not against
+    /// crates.io, so they always use a path dep regardless of `RNME_LIB_PATH`.
+    fn rnme_lib_path() -> String {
+        format!("{{ path = \"{}\" }}", env!("CARGO_MANIFEST_DIR"))
     }
 
     /// Test 1: Single-file workspace generation.

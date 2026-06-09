@@ -55,6 +55,7 @@ pub fn run_rnme(dir: &Path, args: &[&str]) -> CliOutput {
     let output = Command::new(bin)
         .args(args)
         .current_dir(dir)
+        .env("RNME_LIB_PATH", env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap_or_else(|e| panic!("failed to run rnme binary at {}: {}", bin, e));
 

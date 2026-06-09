@@ -50,6 +50,7 @@ async fn mcp_full_smoke() {
         .arg("--mcp")
         .current_dir(tempdir.path())
         .env("RNME_CACHE_DIR", &cache_dir)
+        .env("RNME_LIB_PATH", env!("CARGO_MANIFEST_DIR"))
         // Make the supervisor noisy on stderr so --nocapture is useful.
         .env("RUST_LOG", "warn,rnme=info");
 
