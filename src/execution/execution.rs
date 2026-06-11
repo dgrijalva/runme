@@ -670,7 +670,13 @@ impl TaskExecution {
                 let processes_inner = processes.clone();
                 let engine_ready = engine.clone();
                 tokio::spawn(async move {
-                    let _ = readiness_rx.wait_for(|&ready| ready).await;
+                    // Err means the readiness sender dropped without success
+                    // (ready_timeout fired). Don't flip ready — the exit
+                    // watcher will publish a snapshot once the killed process
+                    // is reaped.
+                    if readiness_rx.wait_for(|&ready| ready).await.is_err() {
+                        return;
+                    }
                     if let Some(proc) = processes_inner.lock().await.get_mut(process_index) {
                         proc.ready = true;
                     }

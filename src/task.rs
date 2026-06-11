@@ -905,7 +905,13 @@ impl TaskContext {
             let task_status = task_status.clone();
             let engine_weak = self.engine.clone();
             tokio::spawn(async move {
-                let _ = rx.wait_for(|&ready| ready).await;
+                // `wait_for` returns Err when the sender drops without the
+                // predicate becoming true — that's the ready_timeout path.
+                // Skip the transition in that case; the process kill will
+                // route the task to Failed via the exit watcher.
+                if rx.wait_for(|&ready| ready).await.is_err() {
+                    return;
+                }
                 let transitioned = {
                     let mut status = task_status.lock().await;
                     if matches!(*status, crate::execution::TaskStatus::Setup) {

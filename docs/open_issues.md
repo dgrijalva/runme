@@ -55,6 +55,13 @@ Possible approaches:
 - _Assessment:_ Worth treating as a family of features unified by "give the user lenses on log data." The field extraction pipeline (`src/log/extract.rs`) and store (`src/log/store.rs`) probably need extension to carry structured field maps per entry, which all three variants would build on
 - _Open questions:_ Is grouping a view-time concern (TUI re-renders the same store with a different lens) or a store-time concern (entries are tagged on ingest)? View-time is more flexible; store-time is cheaper at render. Does task-authored grouping run synchronously in the parsing pipeline, or async over the store?
 
+## `SpawnBuilder::.await` returns post-spawn, not post-ready
+
+**13:42** — `SpawnBuilder::.await` at `src/execution/engine.rs:914` returns post-spawn, not post-ready. Naive code like `spawn().ready_on_port(...).ready_timeout(...).await` looks like a complete readiness protocol but actually races — the await returns before the probe runs. Worth considering a `.ready().await` builder terminator that spawns + waits for ready + propagates the timeout error.
+
+- _Effort:_ Small — new method on `SpawnBuilder` that composes `.await` + `handle.wait_ready()`
+- _Context:_ Surfaced alongside the `ready_timeout` bug (now fixed). The timeout fix means readiness failures propagate correctly when callers do call `wait_ready`, but the footgun of forgetting to await it remains
+
 ## Built-in cargo task helpers
 
 **Feature idea:** Library-side support for the common cargo workflows (check / build / test, maybe clippy / fmt / doc). Users register them during `#[rnme::init]` with a single fn call and get smart summaries + optional watch behavior for free.

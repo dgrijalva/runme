@@ -73,7 +73,7 @@ impl std::fmt::Display for ProcessError {
             ProcessError::Spawn(e) => write!(f, "failed to spawn process: {}", e),
             ProcessError::Signal(e) => write!(f, "failed to send signal: {}", e),
             ProcessError::Wait(e) => write!(f, "failed to wait for process: {}", e),
-            ProcessError::Timeout => write!(f, "process did not exit within timeout"),
+            ProcessError::Timeout => write!(f, "process timed out"),
         }
     }
 }
@@ -535,11 +535,15 @@ impl ProcessHandle {
     /// Wait until the readiness probe succeeds.
     ///
     /// Returns immediately if no readiness condition was configured (always ready)
-    /// or if the probe has already succeeded.
-    pub async fn wait_ready(&self) {
+    /// or if the probe has already succeeded. Returns `ProcessError::Timeout` if
+    /// the readiness probe was bounded by a `ready_timeout` that expired before
+    /// the probe completed (in which case the process has also been killed).
+    pub async fn wait_ready(&self) -> Result<(), ProcessError> {
         let mut rx = self.readiness_rx.clone();
-        // wait_for returns when the predicate is true (or the sender is dropped)
-        let _ = rx.wait_for(|&ready| ready).await;
+        match rx.wait_for(|&ready| ready).await {
+            Ok(_) => Ok(()),
+            Err(_) => Err(ProcessError::Timeout),
+        }
     }
 
     /// Get a clone of the readiness watch receiver.
@@ -1026,12 +1030,27 @@ impl SpawnBuilder {
         if let Some(condition) = self.readiness {
             let (readiness_tx, readiness_rx) = tokio::sync::watch::channel(false);
             let ready_timeout = self.ready_timeout;
+            let pgid = handle.pgid();
+            let pid = handle.pid();
 
             let readiness_task = tokio::spawn(async move {
                 let probe = run_readiness_probe(condition);
                 if let Some(timeout) = ready_timeout {
                     if tokio::time::timeout(timeout, probe).await.is_err() {
-                        // Timed out — probe failed, don't set ready
+                        // Probe didn't succeed in time. Kill the process group
+                        // so the task surfaces as Failed via the exit watcher;
+                        // dropping readiness_tx signals wait_ready callers and
+                        // prevents bind_ready / monitor_spawns from falsely
+                        // transitioning to Ready.
+                        if let Some(pgid) = pgid {
+                            let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGTERM));
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            let _ = killpg(Pid::from_raw(pgid), Some(Signal::SIGKILL));
+                        } else if let Some(pid) = pid {
+                            let _ = killpg(Pid::from_raw(pid as i32), Some(Signal::SIGTERM));
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            let _ = killpg(Pid::from_raw(pid as i32), Some(Signal::SIGKILL));
+                        }
                         return;
                     }
                 } else {
@@ -1275,6 +1294,32 @@ mod tests {
         let entry = &buf.lines()[0];
         assert_eq!(entry.raw, "spawned_output");
         assert!(matches!(&entry.parsed, ParsedContent::PlainText));
+    }
+
+    #[tokio::test]
+    async fn ready_timeout_kills_process_and_errors_wait_ready() {
+        // ready_timeout firing must (1) kill the process group and
+        // (2) cause wait_ready to return ProcessError::Timeout — not
+        // silently succeed and leave the process running.
+        let buffer = std::sync::Arc::new(tokio::sync::Mutex::new(OutputBuffer::new(100)));
+        let builder = SpawnBuilder::new(Cmd::shell("sleep 60"), "test".to_string(), buffer)
+            // A readiness probe that never completes.
+            .ready_when(|| async { std::future::pending::<()>().await })
+            .ready_timeout(Duration::from_millis(100));
+
+        let mut handle = builder.await.expect("spawn");
+        assert!(handle.is_running());
+
+        let result = handle.wait_ready().await;
+        assert!(
+            matches!(result, Err(ProcessError::Timeout)),
+            "expected Timeout, got {result:?}"
+        );
+
+        // The kill path sends SIGTERM first; `sleep` exits on SIGTERM, so the
+        // process should be gone well before the SIGKILL fallback fires.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!handle.is_running(), "process should have been killed");
     }
 
     #[tokio::test]
