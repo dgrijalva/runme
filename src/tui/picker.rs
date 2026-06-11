@@ -307,42 +307,61 @@ impl PickerState {
         items
     }
 
-    /// Search mode: fuzzy match across qualified names and descriptions,
-    /// return a flat ranked list.
+    /// Search mode: fuzzy match across qualified names and descriptions, then
+    /// regroup the results so each match still appears under its group header
+    /// (the browse-mode visual). Groups are ordered by their best in-group
+    /// score; tasks within a group are also ordered by score.
     fn search_items(&self) -> Vec<PickerItem> {
-        let mut scored: Vec<(i64, &PickerTask)> = self
-            .tasks
+        // Score and bucket by group.
+        let mut by_group: HashMap<String, Vec<(i64, PickerTask)>> = HashMap::new();
+        for pt in &self.tasks {
+            // Match against qualified name and description. Name matches get a
+            // large bonus so task names win over incidental description hits.
+            let name_score = self
+                .matcher
+                .fuzzy_match(&pt.qualified_name, &self.input)
+                .map(|s| s + 1000);
+            let desc_score = pt
+                .task
+                .description
+                .and_then(|d| self.matcher.fuzzy_match(d, &self.input));
+            let best = match (name_score, desc_score) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(score) = best {
+                by_group
+                    .entry(pt.group_display.clone())
+                    .or_default()
+                    .push((score, pt.clone()));
+            }
+        }
+
+        // Sort tasks within each group by score desc.
+        for v in by_group.values_mut() {
+            v.sort_by(|a, b| b.0.cmp(&a.0));
+        }
+
+        // Order groups by best in-group score desc (the first task after the
+        // per-group sort above carries the max).
+        let mut groups: Vec<(i64, String)> = by_group
             .iter()
-            .filter_map(|pt| {
-                // Match against qualified name and description.
-                // Name matches get a large bonus so task names win over
-                // incidental matches in descriptions.
-                let name_score = self
-                    .matcher
-                    .fuzzy_match(&pt.qualified_name, &self.input)
-                    .map(|s| s + 1000);
-                let desc_score = pt
-                    .task
-                    .description
-                    .and_then(|d| self.matcher.fuzzy_match(d, &self.input));
-                // Take the best score
-                let best = match (name_score, desc_score) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (Some(a), None) => Some(a),
-                    (None, Some(b)) => Some(b),
-                    (None, None) => None,
-                };
-                best.map(|score| (score, pt))
-            })
+            .map(|(name, tasks)| (tasks[0].0, name.clone()))
             .collect();
+        groups.sort_by(|a, b| b.0.cmp(&a.0));
 
-        // Sort by score descending
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
-
-        scored
-            .into_iter()
-            .map(|(_, pt)| PickerItem::Task(pt.clone()))
-            .collect()
+        let mut items = Vec::new();
+        for (_, group_name) in groups {
+            items.push(PickerItem::GroupHeader(group_name.clone()));
+            if let Some(tasks) = by_group.remove(&group_name) {
+                for (_, pt) in tasks {
+                    items.push(PickerItem::Task(pt));
+                }
+            }
+        }
+        items
     }
 
     /// Get the selected task, if any.
@@ -965,11 +984,15 @@ mod tests {
 
         let items = picker.visible_items();
         // Top-ranked result should be the auth-group build task, not the
-        // root-group build (whose qualified name is just "build" with no colon).
-        let top = match items.first() {
-            Some(PickerItem::Task(pt)) => pt,
-            _ => panic!("expected at least one matching task"),
-        };
+        // root-group build (whose qualified name is just "build" with no
+        // colon). Skip past group headers — search mode renders headers too.
+        let top = items
+            .iter()
+            .find_map(|i| match i {
+                PickerItem::Task(pt) => Some(pt),
+                _ => None,
+            })
+            .expect("expected at least one matching task");
         assert_eq!(top.task.name, "build");
         assert_eq!(top.task.group, "services/auth");
     }
