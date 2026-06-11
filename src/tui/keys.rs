@@ -339,7 +339,13 @@ pub(super) fn handle_picker_key(key: KeyEvent, state: &mut AppState) {
         KeyCode::Esc => {
             // Persist current input to memory before closing.
             save_picker_input(state);
-            state.close_picker();
+            // Fresh session with nothing to look at: quit instead of leaving
+            // the user in an empty TUI shell with no log history.
+            if state.current_task_id.is_none() && state.log_lines.is_empty() {
+                state.running = false;
+            } else {
+                state.close_picker();
+            }
             return;
         }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2089,12 +2095,29 @@ mod tests {
         let mut state = AppState::new();
         state.picker_open = true;
         state.picker = Some(super::super::picker::PickerState::new(&[], &HashMap::new()));
+        // Simulate "user opened picker via `t` after running something" — a task
+        // has been launched in this session, so Esc should just close the overlay.
+        state.current_task_id = Some(TaskId(1));
         assert!(state.running);
 
         handle_picker_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
         assert!(!state.picker_open);
         assert!(state.picker.is_none());
         assert!(state.running, "Esc on picker must not quit the TUI");
+    }
+
+    #[test]
+    fn picker_esc_on_empty_session_quits() {
+        // Fresh launch with no args lands directly in the picker over an empty
+        // TUI. Esc here has no useful destination — it should quit.
+        let mut state = AppState::new();
+        state.picker_open = true;
+        state.picker = Some(super::super::picker::PickerState::new(&[], &HashMap::new()));
+        assert!(state.current_task_id.is_none());
+        assert!(state.log_lines.is_empty());
+
+        handle_picker_key(make_key_event(KeyCode::Esc, KeyModifiers::NONE), &mut state);
+        assert!(!state.running, "Esc on empty initial picker must quit");
     }
 
     #[test]

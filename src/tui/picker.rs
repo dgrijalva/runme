@@ -116,11 +116,15 @@ impl PickerState {
             })
             .collect();
 
-        // Sort by group, then by name within group
+        // Sort: root group first, user groups alphabetical, `builtin` last.
+        // Matches `:list` ordering (src/builtin.rs).
         picker_tasks.sort_by(|a, b| {
-            a.group_display
-                .cmp(&b.group_display)
-                .then(a.task.name.cmp(b.task.name))
+            let key = |t: &PickerTask| match t.task.group {
+                "" => (0u8, ""),
+                "builtin" => (2, ""),
+                other => (1, other),
+            };
+            key(a).cmp(&key(b)).then(a.task.name.cmp(b.task.name))
         });
 
         let mut picker = Self {
