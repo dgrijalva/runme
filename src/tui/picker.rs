@@ -25,7 +25,9 @@ pub struct PickerTask {
     pub task: &'static TaskDef,
     /// Display name for the task's group.
     pub group_display: String,
-    /// Fully qualified name for fuzzy matching: "group > name" or just "name" for root.
+    /// Fully qualified name for fuzzy matching: "group:name" or just "name" for
+    /// root. Matches the CLI's `group:task` form so users can type the same
+    /// shape they'd type at the command line (e.g. `cf:b` → `config_service:build`).
     pub qualified_name: String,
 }
 
@@ -105,7 +107,7 @@ impl PickerState {
                 let qualified_name = if task.group.is_empty() {
                     task.name.to_string()
                 } else {
-                    format!("{} > {}", group_display, task.name)
+                    format!("{}:{}", group_display, task.name)
                 };
 
                 PickerTask {
@@ -949,6 +951,27 @@ mod tests {
             "expected auth group tasks in results: {:?}",
             tasks
         );
+    }
+
+    #[test]
+    fn test_colon_separator_matches_group_task_shape() {
+        // The CLI uses `group:task` — typing `:` in the picker should align
+        // with the qualified name's separator so `au:b` finds the build task
+        // in services/auth without needing to type out the full group name.
+        let mut picker = make_picker();
+        for ch in "au:b".chars() {
+            picker.insert_char(ch);
+        }
+
+        let items = picker.visible_items();
+        // Top-ranked result should be the auth-group build task, not the
+        // root-group build (whose qualified name is just "build" with no colon).
+        let top = match items.first() {
+            Some(PickerItem::Task(pt)) => pt,
+            _ => panic!("expected at least one matching task"),
+        };
+        assert_eq!(top.task.name, "build");
+        assert_eq!(top.task.group, "services/auth");
     }
 
     #[test]
