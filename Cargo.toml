@@ -1,6 +1,6 @@
 [package]
 name = "rnme"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "A Rust-native task runner — tasks are plain Rust in RUNME.rs files"
@@ -18,7 +18,7 @@ name = "runme"
 path = "src/bin/rnme/main.rs"
 
 [dependencies]
-rnme-macros = { path = "macros", version = "0.1.0" }
+rnme-macros = { path = "macros", version = "0.2.0" }
 inventory = "0.3"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
