@@ -344,13 +344,15 @@ impl PickerState {
             v.sort_by(|a, b| b.0.cmp(&a.0));
         }
 
-        // Order groups by best in-group score desc (the first task after the
-        // per-group sort above carries the max).
+        // Order groups by best in-group score desc, with group name as a
+        // tiebreaker so the order is fully deterministic. HashMap iteration
+        // is randomized, and a stable sort on tied scores would otherwise
+        // preserve that random order across re-renders.
         let mut groups: Vec<(i64, String)> = by_group
             .iter()
             .map(|(name, tasks)| (tasks[0].0, name.clone()))
             .collect();
-        groups.sort_by(|a, b| b.0.cmp(&a.0));
+        groups.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
 
         let mut items = Vec::new();
         for (_, group_name) in groups {
@@ -1132,6 +1134,35 @@ mod tests {
         picker.args_cursor = picker.args_input.len();
         let argv = picker.parsed_argv();
         assert_eq!(argv, vec!["--name", "world", "--count", "3"]);
+    }
+
+    #[test]
+    fn search_items_ordering_is_stable_across_calls() {
+        // Regression: HashMap iteration order is randomized, and the group
+        // ordering used a stable sort on score with no tiebreaker. When many
+        // groups had a task with the same name (e.g. "build" across services),
+        // every call to visible_items() rebuilt the HashMap with a different
+        // random order, reshuffling the list on every keystroke.
+        let mut picker = make_picker();
+        for ch in "build".chars() {
+            picker.insert_char(ch);
+        }
+
+        let first = picker.visible_items();
+        let collect_names = |items: &[PickerItem]| -> Vec<String> {
+            items
+                .iter()
+                .map(|i| match i {
+                    PickerItem::GroupHeader(name) => format!("H:{name}"),
+                    PickerItem::Task(pt) => format!("T:{}", pt.qualified_name),
+                })
+                .collect()
+        };
+        let first_names = collect_names(&first);
+        for _ in 0..20 {
+            let next = picker.visible_items();
+            assert_eq!(collect_names(&next), first_names);
+        }
     }
 
     #[test]
