@@ -619,9 +619,10 @@ fn handle_mouse(
         }
         MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
             if mouse.column < sidebar_width && state.mode == AppMode::Normal {
-                let row = mouse.row as usize;
-                if row < state.sidebar_entries.len() {
-                    state.sidebar.selection = row;
+                let visual_row = mouse.row as usize + state.sidebar.scroll_offset;
+                let (positions, _) = sidebar::entry_line_positions(&state.sidebar_entries);
+                if let Some(idx) = positions.iter().position(|&pos| pos == visual_row) {
+                    state.sidebar.selection = idx;
                     state.sidebar.focused = true;
                     state.dirty = true;
                 }
