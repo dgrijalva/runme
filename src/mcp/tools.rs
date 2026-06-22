@@ -181,6 +181,17 @@ pub struct WaitForReadyParams {
     pub timeout_seconds: Option<u64>,
 }
 
+/// Parameters for [`McpServer::list_tasks`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTasksParams {
+    /// Optional fuzzy filter query. When provided, tasks are matched against
+    /// their qualified name and description using the same algorithm as the
+    /// TUI task picker, and results are returned ranked by score descending.
+    /// Omit to return all tasks in registration order.
+    #[serde(default)]
+    pub filter: Option<String>,
+}
+
 /// Parameters for [`McpServer::install_skills`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct InstallSkillsParams {
@@ -194,18 +205,23 @@ pub struct InstallSkillsParams {
 
 #[tool_router]
 impl McpServer {
-    /// List every registered task across the latest engine generation.
+    /// List registered tasks across the latest engine generation.
     /// Returns task name, group, description, and rendered argument help.
+    /// Pass `filter` to fuzzy-search by name and description.
     #[tool]
-    pub async fn list_tasks(&self) -> Result<CallToolResult, McpError> {
+    pub async fn list_tasks(
+        &self,
+        Parameters(params): Parameters<ListTasksParams>,
+    ) -> Result<CallToolResult, McpError> {
         let sup = self.supervisor.lock().await;
-        let resp = sup
-            .list_tasks()
-            .await
-            .map_err(map_rpc_error)?;
+        let tasks = sup.list_tasks().await.map_err(map_rpc_error)?;
+        let tasks = match params.filter.as_deref() {
+            Some(q) if !q.is_empty() => crate::task::fuzzy_filter(tasks, q),
+            _ => tasks,
+        };
         // MCP `structuredContent` requires a JSON object at the top level —
         // not a bare array — so we wrap the Vec in `{ "tasks": [...] }`.
-        let value = serde_json::json!({ "tasks": resp });
+        let value = serde_json::json!({ "tasks": tasks });
         Ok(CallToolResult::structured(value))
     }
 

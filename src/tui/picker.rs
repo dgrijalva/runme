@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use fuzzy_matcher::FuzzyMatcher;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -315,23 +314,12 @@ impl PickerState {
         // Score and bucket by group.
         let mut by_group: HashMap<String, Vec<(i64, PickerTask)>> = HashMap::new();
         for pt in &self.tasks {
-            // Match against qualified name and description. Name matches get a
-            // large bonus so task names win over incidental description hits.
-            let name_score = self
-                .matcher
-                .fuzzy_match(&pt.qualified_name, &self.input)
-                .map(|s| s + 1000);
-            let desc_score = pt
-                .task
-                .description
-                .and_then(|d| self.matcher.fuzzy_match(d, &self.input));
-            let best = match (name_score, desc_score) {
-                (Some(a), Some(b)) => Some(a.max(b)),
-                (Some(a), None) => Some(a),
-                (None, Some(b)) => Some(b),
-                (None, None) => None,
-            };
-            if let Some(score) = best {
+            if let Some(score) = crate::task::fuzzy_score(
+                &pt.qualified_name,
+                pt.task.description,
+                &self.input,
+                &self.matcher,
+            ) {
                 by_group
                     .entry(pt.group_display.clone())
                     .or_default()

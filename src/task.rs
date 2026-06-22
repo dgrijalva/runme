@@ -1094,6 +1094,49 @@ impl TaskInfo {
     }
 }
 
+/// Compute the fuzzy match score for a single task against `query`.
+///
+/// Name matches get a +1000 bonus so task name hits beat incidental
+/// description hits. Returns `None` if neither field matches.
+pub fn fuzzy_score(
+    qualified_name: &str,
+    description: Option<&str>,
+    query: &str,
+    matcher: &impl fuzzy_matcher::FuzzyMatcher,
+) -> Option<i64> {
+    let name_score = matcher
+        .fuzzy_match(qualified_name, query)
+        .map(|s| s + 1000);
+    let desc_score = description.and_then(|d| matcher.fuzzy_match(d, query));
+    match (name_score, desc_score) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Fuzzy-filter and rank a list of [`TaskInfo`] against a query string.
+///
+/// Matches against `qualified_name` and `description` via [`fuzzy_score`].
+/// Tasks with no match are dropped; survivors are returned sorted by best
+/// score descending.
+pub fn fuzzy_filter(tasks: Vec<TaskInfo>, query: &str) -> Vec<TaskInfo> {
+    if query.is_empty() {
+        return tasks;
+    }
+    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+    let mut scored: Vec<(i64, TaskInfo)> = tasks
+        .into_iter()
+        .filter_map(|t| {
+            fuzzy_score(&t.qualified_name, t.description.as_deref(), query, &matcher)
+                .map(|score| (score, t))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, t)| t).collect()
+}
+
 /// Query handle for discovering tasks in the registry.
 ///
 /// Obtained via `ctx.tasks()`. Supports listing all tasks or matching
