@@ -398,14 +398,7 @@ impl McpServer {
                 .iter()
                 .find(|t| t.id.parse::<Address>().map(|a| a.top == addr.top).unwrap_or(false))
             else {
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(internal(format!(
-                        "task {} not found before timeout ({}s)",
-                        params.id, timeout_secs
-                    )));
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
+                return Err(internal(format!("task {} not found", params.id)));
             };
 
             if matches!(node.status, TaskStatus::Ready) || is_terminal(&node.status) {
