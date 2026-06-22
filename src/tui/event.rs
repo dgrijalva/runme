@@ -650,14 +650,11 @@ fn handle_mouse(
                         let entry_start = ve.y as usize;
                         let entry_end = entry_start + ve.lines.len();
                         if log_y >= entry_start && log_y < entry_end {
-                            let top_idx = match state.scroll.resolve(&filtered_entries) {
-                                Some(r) => r.top,
-                                None => vp_layout
-                                    .entries
-                                    .first()
-                                    .map(|e| e.entry_index)
-                                    .unwrap_or(0),
-                            };
+                            let top_idx = vp_layout
+                                .entries
+                                .first()
+                                .map(|e| e.entry_index)
+                                .unwrap_or(0);
                             state.scroll = viewport::ScrollState::pinned(
                                 &filtered_entries,
                                 ve.entry_index,
