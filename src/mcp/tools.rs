@@ -37,6 +37,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::execution::{KillSignal, RestartMode, SpawnOptions, TaskId};
+use crate::execution::execution::TaskStatus;
 use crate::mcp::routing::Address;
 use crate::mcp::supervisor::Supervisor;
 use crate::mcp::wire::{GrepScope, Request, Response, RpcError};
@@ -167,6 +168,17 @@ pub struct GrepLogsParams {
     /// `descendants` (default) or `self_only`.
     #[serde(default)]
     pub scope: Option<String>,
+}
+
+/// Parameters for [`McpServer::wait_for_ready`].
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WaitForReadyParams {
+    /// Dotted task address returned by `spawn_task`.
+    pub id: String,
+    /// Maximum seconds to wait. Defaults to 60.
+    /// Returns an error if elapsed before the task becomes ready or terminal.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Parameters for [`McpServer::install_skills`].
@@ -362,6 +374,56 @@ impl McpServer {
         render_task_report(&self.supervisor, &params.id, tail_n).await
     }
 
+    /// Block until a spawned task becomes ready or reaches a terminal state.
+    /// Returns the task report (same format as `get_task`).
+    ///
+    /// Use this after `spawn_task` for long-running services that declare
+    /// readiness via `.ready_on_port()`, `.ready_on_http()`, `.ready_when()`,
+    /// or `ctx.mark_ready()` — rather than polling an external port yourself.
+    /// Errors with a descriptive message if `timeout_seconds` elapses without
+    /// the task becoming ready.
+    #[tool]
+    pub async fn wait_for_ready(
+        &self,
+        Parameters(params): Parameters<WaitForReadyParams>,
+    ) -> Result<String, McpError> {
+        let addr = parse_address(&params.id)?;
+        let timeout_secs = params.timeout_seconds.unwrap_or(60);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+
+        loop {
+            let snapshot = self.supervisor.lock().await.graph().await;
+            let Some(node) = snapshot
+                .top_tasks
+                .iter()
+                .find(|t| t.id.parse::<Address>().map(|a| a.top == addr.top).unwrap_or(false))
+            else {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(internal(format!(
+                        "task {} not found before timeout ({}s)",
+                        params.id, timeout_secs
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            };
+
+            if matches!(node.status, TaskStatus::Ready) || is_terminal(&node.status) {
+                break;
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(internal(format!(
+                    "task {} did not become ready within {}s (status: setup)",
+                    params.id, timeout_secs
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        render_task_report(&self.supervisor, &params.id, crate::mcp::report::DEFAULT_TAIL_N).await
+    }
+
     /// Cursor-paged log entries for the given task (and its descendants).
     /// Returns `{ entries, next_seq, has_more }`.
     #[tool]
@@ -473,7 +535,7 @@ impl ServerHandler for McpServer {
     }
 }
 
-const INSTRUCTIONS: &str = "rnme MCP server. Tools: list_tasks, spawn_task, run_task, restart_task, kill_task, kill_process, kill_all, get_graph, get_task, get_logs, grep_logs, get_build_status. To install agent skills (RUNME.rs authoring + tool usage docs), call install_skills(target_dir) where target_dir is your framework's skill location (Claude Code: <project>/.claude/skills/).";
+const INSTRUCTIONS: &str = "rnme MCP server. Tools: list_tasks, spawn_task, run_task, restart_task, kill_task, kill_process, kill_all, get_graph, get_task, wait_for_ready, get_logs, grep_logs, get_build_status. To start a long-running service and wait for it to be up: spawn_task → wait_for_ready (blocks until the task's readiness probe passes — do NOT poll a port yourself). To install agent skills (RUNME.rs authoring + tool usage docs), call install_skills(target_dir) where target_dir is your framework's skill location (Claude Code: <project>/.claude/skills/).";
 
 // ---------------------------------------------------------------------------
 // Helpers

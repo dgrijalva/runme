@@ -327,6 +327,41 @@ async fn server_ready(ctx: &TaskContext) -> TaskResult {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// wait_for_ready test fixtures
+// ---------------------------------------------------------------------------
+
+/// Mock service: becomes ready after a short delay, then runs until cancelled.
+///
+/// Use this to test the MCP `wait_for_ready` tool:
+///   1. spawn_task { name: "mock_service" }   → get task_id
+///   2. wait_for_ready { id: task_id }        → should return with "running (ready)"
+#[rnme::task]
+async fn mock_service(ctx: &TaskContext) -> TaskResult {
+    use std::time::Duration;
+    info!("mock_service starting up");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    ctx.mark_ready();
+    info!("mock_service ready");
+    ctx.cancellation_signal().await;
+    Ok(())
+}
+
+/// Mock service that crashes before becoming ready.
+///
+/// Use this to test the terminal-state exit path of `wait_for_ready`:
+///   1. spawn_task { name: "mock_service_fail" }  → get task_id
+///   2. wait_for_ready { id: task_id }            → should return immediately with failed status
+#[rnme::task]
+async fn mock_service_fail(ctx: &TaskContext) -> TaskResult {
+    use std::time::Duration;
+    info!("mock_service_fail starting up");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    info!("mock_service_fail crashing before ready");
+    ctx.exec("bash -c 'exit 1'").await?.ok()?;
+    Ok(())
+}
+
 /// Demonstrate cooperative soft restart.
 ///
 /// Subscribe via `ctx.restart_handle()` and `select!` on the returned
