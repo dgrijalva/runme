@@ -11,7 +11,8 @@ use std::sync::Arc;
 use rmcp::handler::server::wrapper::Parameters;
 use rnme::mcp::supervisor::{InProcessSpawner, Supervisor};
 use rnme::mcp::tools::{
-    GetLogsParams, GetTaskParams, InstallSkillsParams, McpServer, RestartParams, SpawnTaskParams,
+    GetLogsParams, GetTaskParams, InstallSkillsParams, ListTasksParams, McpServer, RestartParams,
+    SpawnTaskParams,
 };
 use rnme::task::Registry;
 
@@ -52,7 +53,10 @@ async fn wait_for_top(server: &McpServer, top: u64) {
 #[tokio::test]
 async fn list_tasks_returns_structured_payload() {
     let server = boot().await;
-    let result = server.list_tasks().await.expect("list_tasks ok");
+    let result = server
+        .list_tasks(Parameters(ListTasksParams { filter: None }))
+        .await
+        .expect("list_tasks ok");
     let value = result
         .structured_content
         .clone()
