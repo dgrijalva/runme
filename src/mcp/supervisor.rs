@@ -217,7 +217,13 @@ impl EngineSpawner for ProcessEngineSpawner {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true)
+                // false: the engine has its own TCP-disconnect cleanup path
+                // (kill_all → shutdown → process::exit). SIGKILL would bypass
+                // that and orphan every task the engine spawned. When the
+                // supervisor exits, the OS closes the TCP socket; the engine
+                // detects EOF, kills its tasks, and self-exits within
+                // SHUTDOWN_GRACE.
+                .kill_on_drop(false)
                 .spawn()?;
 
             let stdout = child.stdout.take().ok_or(SpawnError::NoStdout)?;
