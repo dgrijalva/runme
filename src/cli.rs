@@ -250,7 +250,9 @@ async fn run_cli(
     };
 
     // Watch graph snapshots for terminal status on `task_id`. Ctrl-C
-    // quits the engine cleanly (cancel subtree → root body returns).
+    // and SIGTERM quit the engine cleanly (cancel subtree → root body
+    // returns). Without the SIGTERM arm, the default action kills the
+    // runner outright and orphans every child process group.
     // SIGHUP triggers a cooperative soft restart on the running task —
     // if the task subscribed via `ctx.restart_handle()`, the signal is
     // delivered and the task body decides how to react; otherwise the
@@ -264,6 +266,8 @@ async fn run_cli(
     tokio::pin!(ctrl_c);
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("install SIGHUP handler");
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("install SIGTERM handler");
     let mut graph = handle.graph.clone();
     let mut task_id = task_id;
     let final_status: TaskStatus = loop {
@@ -303,6 +307,11 @@ async fn run_cli(
                 let _ = handle.quit().await;
                 engine.shutdown().await;
                 std::process::exit(130);
+            }
+            _ = sigterm.recv() => {
+                let _ = handle.quit().await;
+                engine.shutdown().await;
+                std::process::exit(143);
             }
         }
     };
